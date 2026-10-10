@@ -1,0 +1,10 @@
+#ifndef _SYS_MMAN_H
+#define _SYS_MMAN_H
+
+#include <stddef.h>
+#include <uapi/syscall.h>
+
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off);
+int munmap(void *addr, size_t len);
+
+#endif

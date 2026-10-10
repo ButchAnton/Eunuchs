@@ -1,0 +1,3 @@
+Welcome to Eunuchs. Type 'help' for shell builtins and programs.
+Ctrl-] enters the kernel debug monitor; try also: ps, top, cat /proc/meminfo, strace ls.
+Network: ping gateway, ifconfig, netstat; `httpd &` then open http://localhost:8080 on the Mac.
