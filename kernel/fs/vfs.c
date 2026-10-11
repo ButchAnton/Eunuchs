@@ -6,6 +6,8 @@
 #include <debug.h>
 #include <fmt.h>
 #include <fs.h>
+#include <riscv.h>
+#include <platform.h>
 #include <kstring.h>
 #include <mm.h>
 #include <printk.h>
@@ -364,6 +366,18 @@ struct inode *nameiparent(const char *path, char *name, int *err)
     return walk(path, true, name, err);
 }
 
+/* Wall-clock time of boot, for files of filesystems that keep no times. */
+static u64 boot_time_ns(void)
+{
+    static u64 boot;
+    if (!boot) {
+        u64 tb = platform.timebase ? platform.timebase : 1;
+        u64 up = rdtime();
+        boot = rtc_time_ns() - (up / tb) * 1000000000ull - (up % tb) * 1000000000ull / tb;
+    }
+    return boot;
+}
+
 void vfs_stat(struct inode *ip, struct stat *st)
 {
     memset(st, 0, sizeof(*st));
@@ -373,9 +387,11 @@ void vfs_stat(struct inode *ip, struct stat *st)
     st->st_uid = ip->uid;
     st->st_gid = ip->gid;
     st->st_size = ip->size;
-    st->st_blocks = (ip->size + 511) / 512;
+    st->st_blocks = ip->type == I_CHR ? 0 : (ip->size + 511) / 512;
     st->st_mtime = ip->mtime;
     st->st_ctime = ip->ctime;
+    if (!ip->mtime && !ip->ctime)               /* devfs, procfs */
+        st->st_mtime = st->st_ctime = boot_time_ns();
     st->st_rdev = ip->rdev;
 }
 

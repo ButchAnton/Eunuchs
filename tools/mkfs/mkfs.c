@@ -243,6 +243,9 @@ static int do_mkfs(const char *path, int size_mb, int nspecs, char **specs)
         if (!f)
             die("%s: %s", eq + 1, strerror(errno));
         uint32_t ino = alloc_inode(EFS_T_FILE);
+        struct stat hst;                        /* programs 0755, data files 0644, as on the host */
+        if (fstat(fileno(f), &hst) == 0 && !(hst.st_mode & 0111))
+            dinode(ino)->mode = 0644;
         uint8_t buf[65536];
         size_t n;
         while ((n = fread(buf, 1, sizeof(buf), f)) > 0)

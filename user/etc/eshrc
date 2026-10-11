@@ -8,7 +8,9 @@ setopt histignoredups histignorespace
 PROMPT='%F{green}%n@%m%f:%F{blue}%~%f%# '
 RPROMPT='%(?..%F{red}%?%f)'
 
+alias ls='ls --color=auto'
 alias ll='ls -l'
+alias la='ls -A'
 alias l='ls'
 alias ..='cd ..'
 alias ...='cd ../..'

@@ -477,7 +477,7 @@ All of these take `sb->ns_lock` and run as one transaction, so each is atomic ac
   - procfs files and `/dev/kmsg` (`priv` set) are seekable; `SEEK_END` uses the snapshot length.
   - Seeking past EOF is allowed, and a later write leaves a hole.
 - **`fstat` / `fstatat`**: `vfs_stat` fills `struct stat`.
-  - `st_mode` = mode | `S_IFDIR`/`S_IFCHR`/`S_IFREG`; `st_blocks` = ⌈size/512⌉; `st_dev` is always 0.
+  - `st_mode` = mode | `S_IFDIR`/`S_IFCHR`/`S_IFREG`; `st_blocks` = ⌈size/512⌉ (0 for devices); `st_dev` is always 0. Filesystems that keep no times (devfs, procfs) report the boot time as `st_mtime` and `st_ctime` (`boot_time_ns`, from the RTC minus the uptime).
   - A pipe gets `S_IFIFO|0600`. For a procfs snapshot, `st_size` is the snapshot's length.
 - **`getdents64`**: fills fixed 64-byte `struct dirent` records (`d_ino`, `d_type`, `d_name[59]`) and advances `f->off` after each record it copies.
 - **`chdir`**: requires a directory and swaps `p->cwd` under `proc_lock`.
@@ -568,12 +568,12 @@ A pid directory's `read_inode` fails with `-ENOENT` once the process is gone.
 - It lays out the regions as above and marks the metadata blocks used. It writes the log header magic with `n = 0`.
 - It creates the root directory with `.` and `..`.
 - Then it processes each spec:
-  - `/path=hostfile`: a regular file, mode 0755.
+  - `/path=hostfile`: a regular file, mode 0755 if the host file is executable, 0644 otherwise.
   - `/path=@/existing`: a hard link to a file listed earlier.
   - `/dir/[:mode[:uid[:gid]]]`: a directory, created with any missing parents.
 - Blocks and inodes are allocated sequentially (`next_block`, `next_ino`).
 
-The Makefile builds `build/fs.img` with `FS_MB ?= 32` from the user programs (`/bin/*`; the `eutils` names are hard links), `/etc/motd`, `/etc/passwd`, `/dev/`, `/proc/`, `/tmp/:0777`, `/www/`, `/home/` and `/home/guest/:0755:1000:1000`. The image is rebuilt whenever a program changes, which discards run-time files.
+The Makefile builds `build/fs.img` with `FS_MB ?= 32` from the user programs (`/bin/*`; the `eutils` names are hard links), `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc`, `/dev/`, `/proc/`, `/tmp/:0777`, `/www/`, `/home/` and `/home/guest/:0755:1000:1000`. The image is rebuilt whenever a program changes, which discards run-time files.
 
 **`mkfs --check IMAGE`** (`do_check`) exits with 0 if clean, 1 if it found errors, 2 for usage or I/O errors. It checks, in order:
 

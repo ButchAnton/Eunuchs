@@ -46,7 +46,7 @@ What it does not do:
 | `user/bin/{ping,nc,ifconfig,netstat}.c` | Network clients and configuration. |
 | `user/bin/{httpd,rshd,echod}.c` | Network servers. |
 | `user/bin/{utests,stress,segv,spin,exitcode,hello}.c` | Test and demonstration programs. |
-| `user/etc/motd`, `user/etc/passwd`, `user/etc/group`, `user/etc/hostname`, `user/etc/eshrc` | Message of the day; user database (`root` 0, `guest` 1000, both with `/bin/esh`); group names (for `ps`); host name for prompts; the shell's system-wide start-up file. |
+| `user/etc/motd`, `user/etc/passwd`, `user/etc/group`, `user/etc/hostname`, `user/etc/eshrc` | Message of the day; user database (`root` 0, `guest` 1000, both with `/bin/esh`); group names (for `ps` and `ls`); host name for prompts; the shell's system-wide start-up file. |
 | `user/www/index.html` | `httpd`'s default page (links into `/proc`). |
 | `Makefile` (`UCFLAGS`, `ULIB`, `UPROGS`, `UMULTI`, `EUTILS_LINKS`, `FS_FILES`) | How user code is compiled, linked, stripped and put in the disk image. `UMULTI` links each directory `user/bin/NAME/` into one program `/bin/NAME`. |
 
@@ -227,6 +227,50 @@ The shell is `esh`; [12-shell.md](12-shell.md) describes the language, the line 
 - **The terminal.** It uses the TTY in raw mode while editing and restores the saved modes before running each command. It answers to the kernel's job control: process groups, `tcsetpgrp`, `SIGTTIN`/`SIGTTOU`, `WUNTRACED`. When the terminal answers a cursor-position query, it sets the kernel's window size with `TIOCSWINSZ`, so `top` and other programs see the real size.
 - **libc.** It relies on the libc's buffered stdout (flushed before every `fork`), `malloc` (plus its own per-command arena), `opendir`/`readdir`, `poll`, and the termios and signal wrappers.
 
+### The `ls` command
+
+`ls` (`user/bin/ls.c`) behaves like GNU coreutils' `ls`, and BSD's where the letters agree. `ls --help` lists every option.
+
+**Layout.**
+- On a terminal it prints names in columns that fit the terminal width (`-C`; `-x` fills across). It uses GNU's layout: as many columns as fit, each as wide as its widest name plus two spaces. Otherwise it prints one name per line (`-1`).
+- `-m` separates names with commas.
+- `-l` gives the long format:
+  - mode, link count, owner, group, size, modification time and name;
+  - devices show `major, minor` instead of a size;
+  - times older than six months, or in the future, show the year instead of the time;
+  - a `total` line gives the blocks (1 KiB units) of the listed files.
+- Long-format variants:
+  - `-o` leaves out the group, `-g` the owner, and `-n` shows numeric ids;
+  - `-h` gives human-readable sizes (1.5K, 23M);
+  - `--full-time` and `--time-style=full-iso|long-iso|iso` choose the time format.
+- `-i` and `-s` add inode numbers and block counts in any format.
+
+**What is listed.**
+- Arguments that are files come first, then the contents of each directory argument. Directories get a `dir:` header when there is more than one argument, or with `-R`.
+- `-a` includes names starting with `.`, and `-A` does the same without `.` and `..`.
+- `-d` lists directories themselves, and `-R` recurses.
+- `-B` hides backup files (`~`), and `-I PAT`/`--hide=PAT` hides names matching a glob.
+
+**Order.**
+- By name (byte order), the default.
+- `-t` newest first, or by ctime with `-c`.
+- `-S` largest first, `-X` by extension, `-v` natural order (`b9` before `b10`), `-U` directory order.
+- `-r` reverses any order, and `--group-directories-first` puts directories first.
+
+**Names.**
+- `-F` appends `/` to directories, `*` to executables and `|` to FIFOs; `-p` appends only the `/`.
+- `--color[=always|auto|never]` (and `-G`) colors names from `LS_COLORS`, using GNU's defaults for the keys it doesn't set:
+  - `di` directories (bold blue), `ex` executables (bold green), `cd` devices;
+  - `ow` world-writable directories (blue on green, like `/tmp`), `su`/`sg` setuid and setgid files;
+  - `*.ext` rules.
+
+  `/etc/eshrc` aliases `ls` to `ls --color=auto`.
+- On a terminal, names that need quoting are shown the way the shell would quote them (`'a file'`). That's GNU's `shell-escape` style; `-N` prints names literally. `-Q` uses C-style double quotes, `-b` backslash escapes, and `-q` shows `?` for unprintable characters.
+
+**Exit status:** 0 if everything worked; 1 for a minor problem, such as an unreadable subdirectory; 2 when a command-line argument couldn't be accessed (`ls: cannot access 'x': No such file or directory`).
+
+**Not available:** symbolic links (efs has none, so `-L`/`-H` are accepted and change nothing), access times (`-u` uses the modification time), and time zones (times are UTC).
+
 ### The `ps` command
 
 `ps` (`user/bin/ps.c`) follows Linux's procps. An option with a dash is a System V option, one without is a BSD option, and a single command line can mix them, so both habits work: `ps -ef`, `ps -lf`, `ps -ejH`, `ps aux`, `ps axjf`.
@@ -378,7 +422,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 |---|---|---|
 | `init` | `init [-1] [PROG ARGS...]` | pid 1. Runs `/bin/esh -l` by default and restarts it 200 ms after it exits. `-1`: run once and return its status. |
 | `esh` (also `sh`) | `esh`, `esh -c CMDS [NAME ARGS]`, `esh FILE [ARGS]`, `esh -i`, `esh -l` | The shell; see [12-shell.md](12-shell.md). |
-| `ls` | `ls [-l] [PATH...]` | `-l`: mode, links, size, inode (not owner). One name per line, in directory order. |
+| `ls` | `ls [OPTION]... [FILE]...` | GNU-style; see [The `ls` command](#the-ls-command). |
 | `cat` | `cat [FILE...]` | stdin with no arguments; 4 KiB reads. |
 | `grep` | `grep [-v] [-n] [-i] [-c] PATTERN [FILE...]` | Kernighan & Pike matcher: `c . ^ $ *`. Reads one byte per syscall; lines longer than 1023 bytes are truncated. Exit 0 if any match, 1 if none, 2 for usage errors. |
 | `ps` | `ps [options]` | procps-style: dashed options are System V (`-ef`, `-lf`, `-ejH`, `-o pid,args`), undashed are BSD (`aux`, `axjf`), and they mix. See [The `ps` command](#the-ps-command). |

@@ -49,7 +49,7 @@ What it does not do (see Limitations for the details):
 
 Invoked as `sh`, esh turns on `shwordsplit`, so POSIX scripts that rely on `$var` splitting behave as expected.
 
-Interactive shells read `/etc/eshrc` and then `~/.eshrc` (for root, `/.eshrc`). The shipped `/etc/eshrc` turns on `autocd autopushd pushdsilent pushdignoredups correct histignoredups histignorespace`, sets `PROMPT='%F{green}%n@%m%f:%F{blue}%~%f%# '`, sets `RPROMPT` to show a non-zero exit status in red, and defines a few aliases (`ll`, `l`, `..`, `...`, `h`, `j`, `d`).
+Interactive shells read `/etc/eshrc` and then `~/.eshrc` (for root, `/.eshrc`). The shipped `/etc/eshrc` turns on `autocd autopushd pushdsilent pushdignoredups correct histignoredups histignorespace`, sets `PROMPT='%F{green}%n@%m%f:%F{blue}%~%f%# '`, sets `RPROMPT` to show a non-zero exit status in red, and defines a few aliases (`ls` with `--color=auto`, `ll`, `la`, `l`, `..`, `...`, `h`, `j`, `d`).
 
 ### Syntax
 

@@ -338,6 +338,8 @@ def main():
         ("ps -ef", "/bin/esh -l"),                         # cmdline from /proc/<pid>/cmdline
         ("ps -o pid=,comm= -p 1", "    1 init"),
         ("ps -o ppid= -p $$", "    1\r\n"),                # the console shell is init's child
+        ("ls -l /etc/passwd", "-rw-r--r-- 1 root root 72 "),
+        ("ls -d /tmp /bin", "/bin  /tmp"),
         ("su guest", None, False), (None, "guest@eunuchs:~% ", False),
         ("id", "uid=1000(guest)"),
         ("touch /etc/nope", "Permission denied"),

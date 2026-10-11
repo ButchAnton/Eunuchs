@@ -155,7 +155,7 @@ The kernel's `ksym_lookup`/`ksym_find`/`ksym_format` (`kernel/debug/ksyms.c`) se
 
 | Spec | Meaning |
 |---|---|
-| `/path=hostfile` | Copy a host file in (mode 0755, uid/gid 0, from `alloc_inode`) |
+| `/path=hostfile` | Copy a host file in (uid/gid 0; mode 0755 if the host file is executable, else 0644) |
 | `/path=@/existing` | Hard link to an entry listed earlier |
 | `/dir/[:mode[:uid[:gid]]]` | Create a directory, optionally with octal mode and owner |
 
@@ -684,7 +684,7 @@ build/tools/mkfs --check /tmp/t.img
 - **`tracedump=build/ktest-trace.bin` is relative to QEMU's working directory.** `make test` runs from the repository root, so it works; running `run_tests.py` from another directory writes the trace elsewhere, and the runner then silently skips the Perfetto conversion.
 - **Exit status 3 has two meanings**: a simulated power failure and a recursive panic both call `platform_exit(3)`. The crash stages also require the `simulating a power failure` text, so this is only a diagnostic ambiguity.
 - **Host tests need the cross toolchain**, because `test_fsck.py` uses `build/user/bin/hello` as payload. `test_fsck.py` never deletes its temporary directory.
-- **mkfs gives every copied file mode 0755** (`alloc_inode`), including `/etc/passwd`, `/etc/motd` and `/www/index.html`; there is no spec syntax for file modes. `SIZE_MB` is parsed with `atoi` without validation.
+- **mkfs takes file modes from the host** (0755 if executable, else 0644); there is no spec syntax for other modes or owners of files. `SIZE_MB` is parsed with `atoi` without validation.
 - **The pass-1/pass-2 check compares only text symbols** (`grep -i ' t '`), not data or rodata addresses. This is enough as long as `.ksyms` stays last in `kernel.ld`.
 - **Record/replay is one CPU only**, with no semihosting and no host port forwarding (`RROPTS`). `rr_prepare` writes the options with `echo '$(1)'`, so an `APPEND` containing a single quote breaks it.
 - **The kernel is compiled for `rv64gc/lp64d`.** Nothing in the build stops the compiler from emitting FP instructions in kernel code, and the kernel saves no FP state. Kernel code uses no floating point today; this is a latent hazard, not a current bug.
