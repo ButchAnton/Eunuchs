@@ -227,6 +227,38 @@ The shell is `esh`; [12-shell.md](12-shell.md) describes the language, the line 
 - **The terminal.** It uses the TTY in raw mode while editing and restores the saved modes before running each command. It answers to the kernel's job control: process groups, `tcsetpgrp`, `SIGTTIN`/`SIGTTOU`, `WUNTRACED`. When the terminal answers a cursor-position query, it sets the kernel's window size with `TIOCSWINSZ`, so `top` and other programs see the real size.
 - **libc.** It relies on the libc's buffered stdout (flushed before every `fork`), `malloc` (plus its own per-command arena), `opendir`/`readdir`, `poll`, and the termios and signal wrappers.
 
+### The `more` and `less` pager
+
+`more` (`user/bin/more.c`) is also installed as `/bin/less`, and the name it is run as picks the personality:
+
+| | `more` | `less` |
+|---|---|---|
+| Start | Prints the first screen where the cursor is (no clearing). If everything fits on one screen, it just prints it and exits. | Clears the screen; marks rows past the end with `~`. |
+| Prompt | `--More--(42%)`, or `--More--(Next file: x)` (`-d` adds a hint) | the file name on the first screen, then `:`; `(END)` at the end |
+| End of the last file | exits | waits (`-E` exits, `-F` exits if it all fit) |
+| Several files | `::::::::::::::` headers between them | `:n` / `:p` |
+
+Both keep what they have read in memory, so they scroll backward as well as forward, even when reading a pipe.
+
+**Keys.** `h` shows a summary. A number typed first is a count.
+- Forward: Space/`f`/`^F`/PageDown a screen; Return/`j`/`^N`/Down a line; `d`/`^D` half a screen; `s` skips lines.
+- Backward: `b`/`^B`/PageUp a screen; `k`/`y`/`^P`/Up a line; `u`/`^U` half a screen.
+- Jumps: `g`/`<`/Home to line N (default 1); `G`/`>`/End to the end or line N; `p`/`%` to N percent.
+- Search: `/pattern` forward, `?pattern` backward, `n`/`N` repeat it. Matches are shown in reverse video. Patterns are grep's: `c . ^ $ *` and `\c`.
+- Marks: `m` plus a letter sets one, `'` plus the letter returns to it.
+- Files: `:n` and `:p` go to the next and previous file; `:f`, `=` or `^G` shows where you are.
+- `!command` runs a shell command. `r`/`^L` redraws. `-N`, `-i` and `-R` toggle options. `q`, `Q`, `:q` or `ZZ` quits.
+
+**Options.** `-N` line numbers; `-i` case-insensitive searches; `-R` passes color escapes (`ESC[...m`) through, so `ls --color=always | less -R` keeps its colors; `-s` squeezes runs of blank lines; `-F`, `-E` and `-d` as above; `-NUM` lines per screen; `+NUM` starts at a line and `+/PATTERN` at the first match. `-X`, `-c`, `-p`, `-f`, `-u`, `-l`, `-S` and `-K` are accepted and ignored.
+
+**Terminal.**
+- Keys are read from `/dev/tty`, so `ps aux | more` works, and the size comes from the terminal (`TIOCGWINSZ`, or `LINES`/`COLUMNS`).
+- Long lines wrap, tabs expand to 8 columns, and control characters show as `^X`.
+- Only `ICANON` and `ECHO` are turned off, so `^C` quits (status 130) and `^Z` suspends. Either way the terminal modes are restored, and after `fg` the screen is redrawn.
+- When standard output is not a terminal, the pager just copies its input (with `::::` headers for several files in `more` style), so `cmd | more | wc -l` works.
+
+**Not available:** regular expressions beyond grep's subset, following a growing file (`F`), an editor (`v`), and the alternate screen: after `less` quits, its last screen stays visible, as with `less -X`.
+
 ### The `ls` command
 
 `ls` (`user/bin/ls.c`) behaves like GNU coreutils' `ls`, and BSD's where the letters agree. `ls --help` lists every option.
@@ -426,6 +458,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `cat` | `cat [FILE...]` | stdin with no arguments; 4 KiB reads. |
 | `grep` | `grep [-v] [-n] [-i] [-c] PATTERN [FILE...]` | Kernighan & Pike matcher: `c . ^ $ *`. Reads one byte per syscall; lines longer than 1023 bytes are truncated. Exit 0 if any match, 1 if none, 2 for usage errors. |
 | `ps` | `ps [options]` | procps-style: dashed options are System V (`-ef`, `-lf`, `-ejH`, `-o pid,args`), undashed are BSD (`aux`, `axjf`), and they mix. See [The `ps` command](#the-ps-command). |
+| `more`, `less` | `more [-NiRsFEd] [-NUM] [+NUM \| +/PAT] [FILE...]` | Pager; see [The `more` and `less` pager](#the-more-and-less-pager). |
 | `top` | `top` | Raw mode with `VMIN=0`; shows `/proc/uptime`, 10 lines of `/proc/cpus` and 20 of `/proc/threads` every second; `q` or `^C` quits. |
 | `ping` | `ping [-c N] [-i MS] [-s SIZE] [-W MS] HOST` | Raw ICMP, root only. |
 | `nc` | `nc [-uv] HOST PORT`, `nc -l [-ukv] PORT` | TCP or UDP netcat. |

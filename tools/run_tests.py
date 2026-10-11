@@ -340,6 +340,9 @@ def main():
         ("ps -o ppid= -p $$", "    1\r\n"),                # the console shell is init's child
         ("ls -l /etc/passwd", "-rw-r--r-- 1 root root 72 "),
         ("ls -d /tmp /bin", "/bin  /tmp"),
+        ("more /etc/passwd", "guest:x:1000"),             # fits on a screen: shown, then exits
+        ("for i in {1..60}; do echo pg $i; done | more", "--More--", False),
+        (b"q", None),                                       # quits from the prompt
         ("su guest", None, False), (None, "guest@eunuchs:~% ", False),
         ("id", "uid=1000(guest)"),
         ("touch /etc/nope", "Permission denied"),
