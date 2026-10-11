@@ -497,7 +497,9 @@ static long sock_send(struct socket *s, struct file *f, const void *buf, size_t 
                 continue;
             }
             if (t == -EAGAIN) {
-                if (nonblock || done)           /* a partial write returns what it did */
+                /* Blocking: wait until everything is queued (a signal
+                 * returns what was sent). Non-blocking: return what fit. */
+                if (nonblock)
                     break;
                 if (sock_wait(s)) {
                     r = -ERESTARTSYS;

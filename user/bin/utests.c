@@ -822,8 +822,12 @@ static void t_tcp_loopback_echo(void)
         char buf[3000];
         long n;
         while ((n = read(c, buf, sizeof(buf))) > 0)
-            if (write(c, buf, (size_t)n) != n)
-                _exit(3);
+            for (long off = 0; off < n;) {
+                long w = write(c, buf + off, (size_t)(n - off));
+                if (w <= 0)
+                    _exit(3);
+                off += w;
+            }
         close(c);
         _exit(n == 0 ? 0 : 4);
     }
@@ -831,7 +835,10 @@ static void t_tcp_loopback_echo(void)
     int s = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a = lo_addr(port);
     CHECK(connect(s, (struct sockaddr *)&a, sizeof(a)) == 0);
-    /* 200 KB through a 32 KB window: send and receive interleaved */
+    /* 200 KB through a 32 KB window: send and receive interleaved. Non-blocking,
+     * so a write takes only what fits and we never block in write while the
+     * echo server is blocked writing back to us. */
+    CHECK(fcntl(s, F_SETFL, O_NONBLOCK) == 0);
     static unsigned char out[200000], in[200000];
     for (size_t i = 0; i < sizeof(out); i++)
         out[i] = (unsigned char)(i * 7 + (i >> 9));
@@ -841,7 +848,7 @@ static void t_tcp_loopback_echo(void)
         CHECK(poll(&p, 1, 5000) == 1);
         if (p.revents & POLLOUT) {
             long n = write(s, out + sent, sizeof(out) - sent > 8192 ? 8192 : sizeof(out) - sent);
-            CHECK(n > 0);
+            CHECK(n > 0 || (n < 0 && errno == EAGAIN));
             sent += n > 0 ? (size_t)n : 0;
             if (sent == sizeof(out))
                 shutdown(s, SHUT_WR);
@@ -849,17 +856,24 @@ static void t_tcp_loopback_echo(void)
         if (p.revents & POLLIN) {
             long n = read(s, in + got, sizeof(in) - got);
             CHECK(n > 0);
-            if (n <= 0)
+            if (n <= 0) {
+                printf("    read returned %ld (%s) after %lu of %lu bytes back, %lu sent, revents %#x\n",
+                       n, n < 0 ? strerror(errno) : "end of file", (unsigned long)got,
+                       (unsigned long)sizeof(in), (unsigned long)sent, p.revents);
                 break;
+            }
             got += (size_t)n;
         }
     }
     CHECK(got == sizeof(in) && !memcmp(in, out, sizeof(in)));
+    CHECK(fcntl(s, F_SETFL, 0) == 0);
     char c;
     CHECK(read(s, &c, 1) == 0);                 /* server closed after our FIN */
     close(s);
     int st;
     CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st))
+        printf("    echo server: wait status %#x\n", st);
 }
 
 static void t_tcp_errors(void)

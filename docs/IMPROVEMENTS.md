@@ -105,6 +105,7 @@ The stale statements in `docs/` were fixed during the review; the comments in th
 ### 1.6 Fixed since the review
 
 - **H5, spurious end-of-file on the terminal.** The TTY input queue now stores `^D` as a marker entry (`Q_EOF`) in line with the text, and one counter of line ends is kept right by every push and pop, in every mode ([07](subsystems/07-devices-and-tty.md#tty-read-tty_read)).
+- **Flaky `tcp_loopback_echo`.** A blocking TCP `send` returned a short count when the send buffer filled, so the test's echo server (and `echod`) gave up on a "short" `write` and reset the connection, about one boot in seven. Blocking sends now wait until all the data is queued, as on Linux. The test's client uses a non-blocking socket for its `poll` loop, and its server loops on `write`.
 - **C10 and the old shell's wrong behavior.** The shell was replaced by [esh](subsystems/12-shell.md). It expands each command when it runs, applies redirections to builtins, has its own state per `source`, and frees per-command memory. It has no fixed word limits, and doesn't use process groups when not interactive.
 
 ## 2. Top recommendations

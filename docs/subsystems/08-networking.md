@@ -654,7 +654,7 @@ All socket and protocol state is read and written with `net_lock` held. Blocking
 - **Stream:**
   - Fails with `ENOTCONN` without a tcb or on a listener.
   - Loops over 4 KiB chunks: `copy_from_user` (while holding the lock), then `tcp_send`.
-  - On `-EAGAIN` it waits only if nothing has been sent yet and the call is blocking. **A blocking send that has made progress returns a short count** rather than waiting for more room.
+  - On `-EAGAIN` a blocking call waits for room and continues, so it returns only when all the data is queued, as on Linux; a signal ends the wait and returns what was queued so far (or restarts the call if nothing was). A non-blocking call returns what fit, or `EAGAIN`.
   - On `-EPIPE` with nothing sent, it raises `SIGPIPE` unless `MSG_NOSIGNAL` (0x4000) is set.
   - Ends with `net_kick()`.
   - A destination address passed to `sendto` is ignored.
@@ -840,7 +840,7 @@ TCP flags print in the order `S F R P .`.
   - finally, a check that `nb_live == 0`.
 
   Run `build/host/test_tcp -vv LOSS SEED DUP STALL` to replay one 60 KB transfer with every state change, retransmission and out-of-window drop logged.
-- User tests (`utests`): `tcp_loopback_echo` (200 KB through a forked echo server, driven by `poll`), `tcp_errors` (refused, `EADDRINUSE`, `ENOTCONN`, reset → `ECONNRESET` then `EPIPE`, raw UDP → `EPROTONOSUPPORT`, `ENOTSOCK`), `nonblocking_sockets` (`EAGAIN` accept, `EINPROGRESS` connect, `SO_ERROR`), `udp_loopback` (automatic bind, truncation, reply). The stress program makes one loopback TCP connection per iteration (`stress.c: tcp_round`).
+- User tests (`utests`): `tcp_loopback_echo` (200 KB through a forked echo server, driven by `poll` on a non-blocking client socket), `tcp_errors` (refused, `EADDRINUSE`, `ENOTCONN`, reset → `ECONNRESET` then `EPIPE`, raw UDP → `EPROTONOSUPPORT`, `ENOTSOCK`), `nonblocking_sockets` (`EAGAIN` accept, `EINPROGRESS` connect, `SO_ERROR`), `udp_loopback` (automatic bind, truncation, reply). The stress program makes one loopback TCP connection per iteration (`stress.c: tcp_round`).
 - `tools/run_tests.py` has two network stages:
   - `network`: ping the gateway and localhost; HTTP from the host (including a live `/proc/net/tcp` that must show `ESTABLISHED`); UDP echo; 1 MiB host → guest; `/bin/sh` guest → host, CRC-checked.
   - `network, 5% loss` (`net.drop=5`): a multi-file transfer over loopback, then 128 KiB from the host.
@@ -870,7 +870,7 @@ TCP flags print in the order `S F R P .`.
 
 **Socket API deviations**
 
-- A blocking `send`/`write` that sent anything returns a short count instead of blocking until all the data is queued, so callers must loop (`httpd`'s `send_all` does). `read`/`recv` return at most 4096 bytes per call.
+- `read`/`recv` return at most 4096 bytes per call.
 - `SO_ERROR` for TCP is not cleared after it is read, and `s->error` is never set. `SO_RCVTIMEO` is in the ABI header but fails with `ENOPROTOOPT`. `MSG_WAITALL` is not supported.
 - `tcp_send` turns every error except `ECONNREFUSED` into `EPIPE`, so a `write` after a timeout or reset never sees `ETIMEDOUT`/`ECONNRESET` (`read` does).
 - A `connect` interrupted by a signal is restarted as a new `connect`, which then fails with `EALREADY` while the handshake is still in progress.
