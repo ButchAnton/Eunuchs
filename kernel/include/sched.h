@@ -143,6 +143,7 @@ void thread_list_print(int (*print)(const char *fmt, ...));
 int thread_backtrace(int (*print)(const char *fmt, ...), int tid);
 void sched_print(int (*print)(const char *fmt, ...));
 const char *thread_state_name(enum thread_state s);
+u64 thread_cpu_ticks(struct thread *t);
 size_t kstack_used(const void *base, size_t size);
 
 /* ---- wait queues ---- */

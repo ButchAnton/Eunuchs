@@ -87,6 +87,9 @@ static int head(int argc, char **argv)
     if (argc > 2 && !strcmp(argv[1], "-n")) {
         n = atoi(argv[2]);
         i = 3;
+    } else if (argc > 1 && argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
+        n = atoi(argv[1] + 1);          /* -NUM, the traditional form */
+        i = 2;
     }
     int fd = open_in(i < argc ? argv[i] : 0);
     if (fd < 0)
@@ -107,6 +110,9 @@ static int tail(int argc, char **argv)
     if (argc > 2 && !strcmp(argv[1], "-n")) {
         n = atoi(argv[2]);
         i = 3;
+    } else if (argc > 1 && argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
+        n = atoi(argv[1] + 1);          /* -NUM, the traditional form */
+        i = 2;
     }
     int fd = open_in(i < argc ? argv[i] : 0);
     if (fd < 0)

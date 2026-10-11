@@ -203,6 +203,7 @@ extern const struct chr_ops tty_ops;
 void tty_init(void);
 void tty_input(char c);
 struct tty *tty_console(void);
+int tty_fg_pgrp(struct tty *tty);
 void tty_set_ctty(struct proc *p);
 void tty_print(int (*print)(const char *fmt, ...));
 

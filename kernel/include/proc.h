@@ -136,6 +136,8 @@ struct proc {
     struct inode *cwd;
     u64 syscalls;
     u64 started;                    /* rdtime */
+    char cmdline[256];              /* argv, NUL-separated (truncated): /proc/<pid>/cmdline */
+    u16 cmdline_len;
 
     /* Signals (signal.c) */
     u32 sig_pending;

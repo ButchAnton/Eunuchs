@@ -113,7 +113,7 @@ static const struct {
 };
 #define NNET ARRAY_SIZE(net_files)
 
-static const char *const pid_files[] = { NULL, "status", "maps", "fds", "stack", "ustack" };
+static const char *const pid_files[] = { NULL, "status", "maps", "fds", "stack", "ustack", "cmdline" };
 #define NPIDF ARRAY_SIZE(pid_files)
 
 static u32 pid_dir(int pid) { return PID_BASE + (u32)pid * PID_FILES; }
@@ -135,6 +135,24 @@ static void gen_pid_locked(struct proc *p, int which, print_fn print)
               p->umask);
         print("pgid %d\nsid %d\nstopped %d\nsig_pending %08x\nsig_blocked %08x\n", p->pgid,
               p->sid, p->stopped, p->sig_pending, p->sig_blocked);
+        /* For ps: Unix state letter, times in ms, sizes in KiB, terminal. */
+        char st = p->state == P_ZOMBIE ? 'Z' : p->stopped ? 'T' : !t ? '?'
+                : t->state == T_RUNNING || t->state == T_RUNNABLE ? 'R'
+                : t->state == T_SLEEPING ? (t->interruptible ? 'S' : 'D') : 'X';
+        u64 vsz = 0;
+        if (p->mm) {
+            struct vma *v;
+            unsigned long vf = spin_lock_irqsave(&p->mm->vma_lock);
+            list_for_each_entry(v, &p->mm->vmas, node)
+                vsz += v->end - v->start;
+            spin_unlock_irqrestore(&p->mm->vma_lock, vf);
+        }
+        u64 tbase = platform.timebase ? platform.timebase : 1;
+        print("ustate %c\nstart_ms %lu\ncpu_ms %lu\nvsz_kib %lu\ntty %s\ntpgid %d\npsr %d\n", st,
+              (unsigned long)(p->started * 1000 / tbase),
+              (unsigned long)(t ? thread_cpu_ticks(t) * 1000 / tbase : 0),
+              (unsigned long)(vsz / 1024), p->ctty ? "console" : "-",
+              p->ctty ? tty_fg_pgrp(p->ctty) : -1, t ? t->cpu : -1);
         print("sig_caught");
         for (int s = 1; s < 32; s++)
             if (p->sigactions[s].handler > 1)
@@ -157,6 +175,11 @@ static void gen_pid_locked(struct proc *p, int which, print_fn print)
             struct trap_frame *tf = thread_user_tf(p->thread);
             proc_user_backtrace(print, p, tf->sepc, TF_FP(tf));
         }
+        break;
+    case 6:
+        /* Like Linux: the arguments, each ending in a NUL. */
+        for (u16 i = 0; i < p->cmdline_len; i++)
+            print("%c", p->cmdline[i]);
         break;
     }
 }

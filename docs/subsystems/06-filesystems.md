@@ -183,7 +183,7 @@ file block bn            where
 | `NET_DIR` = 0x80000 | `/proc/net` |
 | 0x80001..0x80005 | `dev arp tcp udp stats` |
 | `PID_BASE` + pid×8 (`PID_BASE` = 0x100000) | `/proc/<pid>` |
-| … + 1..5 | `status maps fds stack ustack` |
+| … + 1..6 | `status maps fds stack ustack cmdline` |
 
 ### devfs inode numbering
 
@@ -545,11 +545,12 @@ Reads (`proc_read`) and seeks then work on this snapshot, so a reader always see
 - **Global files**: the same print functions the monitor uses (`pmm_print`, `bcache_print`, `vfs_mounts_print`, ...). `uptime` and `trace` (the last 200 events) are local.
 - **`/proc/net/*`**: generated with the network mutex `net_lock` held (`NET_GEN`).
 - **`/proc/<pid>/*`** (`gen_pid`): generated with `proc_lock` held, so the process cannot be freed meanwhile.
-  - `status`: pid, ppid, name, state, tid, waiting, switches, syscalls, RSS, ids, umask, process group, session, and signal masks plus caught and ignored signals.
+  - `status`: pid, ppid, name, state, tid, waiting, switches, syscalls, RSS, ids, umask, process group, session, and signal masks plus caught and ignored signals; then the fields `ps` needs: `ustate` (the Unix state letter: R, S, D for an uninterruptible sleep, T, Z), `start_ms` (start time, ms since boot), `cpu_ms` (CPU time including the current slice, `thread_cpu_ticks`), `vsz_kib` (sum of the VMAs), `tty` (`console` or `-`), `tpgid` (the terminal's foreground group), `psr` (the CPU it last ran on).
   - `maps`: `mm_print`.
   - `fds`: first a `cwd <path>` line, then `files_print_fds`. The cwd path needs sleeping I/O, so it is resolved *before* taking `proc_lock`, using a reference taken with `idup`.
   - `stack`: the kernel backtrace (`thread_backtrace`).
   - `ustack`: the user backtrace from the saved trap frame.
+  - `cmdline`: the arguments, NUL-separated (`proc.cmdline`, set by `do_exec`).
 
 **Names** (`pr_lookup`):
 - `self` maps to the caller's pid directory.
@@ -717,7 +718,7 @@ Numbers are Linux RISC-V (`lib/include/uapi/syscall.h`).
 - **`/dev`**: `console`, `tty`, `tty0`, `null`, `zero`, `kmsg`, `disk0`.
 - **`/proc`**: `meminfo`, `slabinfo`, `interrupts`, `threads`, `sched`, `procs`, `mounts`, `bcache`, `blk`, `icache`, `trace`, `virtio`, `uptime`, `pipes`, `tty`, `cpus`, `lockdep`, `profile`.
 - **`/proc/net`**: `dev`, `arp`, `tcp`, `udp`, `stats`.
-- **Per process**: `/proc/<pid>/{status,maps,fds,stack,ustack}` and `/proc/self`.
+- **Per process**: `/proc/<pid>/{status,maps,fds,stack,ustack,cmdline}` and `/proc/self`.
 
 ### Boot options
 

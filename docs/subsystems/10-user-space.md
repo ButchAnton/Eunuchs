@@ -46,7 +46,7 @@ What it does not do:
 | `user/bin/{ping,nc,ifconfig,netstat}.c` | Network clients and configuration. |
 | `user/bin/{httpd,rshd,echod}.c` | Network servers. |
 | `user/bin/{utests,stress,segv,spin,exitcode,hello}.c` | Test and demonstration programs. |
-| `user/etc/motd`, `user/etc/passwd`, `user/etc/hostname`, `user/etc/eshrc` | Message of the day; user database (`root` 0, `guest` 1000, both with `/bin/esh`); host name for prompts; the shell's system-wide start-up file. |
+| `user/etc/motd`, `user/etc/passwd`, `user/etc/group`, `user/etc/hostname`, `user/etc/eshrc` | Message of the day; user database (`root` 0, `guest` 1000, both with `/bin/esh`); group names (for `ps`); host name for prompts; the shell's system-wide start-up file. |
 | `user/www/index.html` | `httpd`'s default page (links into `/proc`). |
 | `Makefile` (`UCFLAGS`, `ULIB`, `UPROGS`, `UMULTI`, `EUTILS_LINKS`, `FS_FILES`) | How user code is compiled, linked, stripped and put in the disk image. `UMULTI` links each directory `user/bin/NAME/` into one program `/bin/NAME`. |
 
@@ -227,6 +227,82 @@ The shell is `esh`; [12-shell.md](12-shell.md) describes the language, the line 
 - **The terminal.** It uses the TTY in raw mode while editing and restores the saved modes before running each command. It answers to the kernel's job control: process groups, `tcsetpgrp`, `SIGTTIN`/`SIGTTOU`, `WUNTRACED`. When the terminal answers a cursor-position query, it sets the kernel's window size with `TIOCSWINSZ`, so `top` and other programs see the real size.
 - **libc.** It relies on the libc's buffered stdout (flushed before every `fork`), `malloc` (plus its own per-command arena), `opendir`/`readdir`, `poll`, and the termios and signal wrappers.
 
+### The `ps` command
+
+`ps` (`user/bin/ps.c`) follows Linux's procps. An option with a dash is a System V option, one without is a BSD option, and a single command line can mix them, so both habits work: `ps -ef`, `ps -lf`, `ps -ejH`, `ps aux`, `ps axjf`.
+
+**Selection.** With no options, `ps` lists processes that have your effective uid and your terminal (in BSD style, any of yours with a terminal).
+
+| Options | Selects |
+|---|---|
+| `-e`, `-A`, `ax` | Every process. |
+| `a` / `x` | BSD: lift "only mine" / lift "only with a terminal". |
+| `-a` | Processes with a terminal, except session leaders. |
+| `-d` | Everything except session leaders. |
+| `-N`, `--deselect` | The opposite of the rest of the selection. |
+| `-p`, `p`, `--pid`, `NNN` | By pid. |
+| `--ppid` | By parent. |
+| `-s`, `--sid` | By session. |
+| `-g` | By session (a number) or group (a name). |
+| `-u`, `U`, `--user` / `-U` | By effective / real user (names or numbers). |
+| `-G`, `--group` | By real group. |
+| `-t`, `t`, `--tty`, `T` | By terminal (`console`, or `-` for none); `T` means my terminal. |
+| `-C` | By command name. |
+| `r` | Narrows any selection to running processes. |
+
+Lists are comma-separated. A process that matches any of the lists given is selected. `ps` exits with status 1 if it selects nothing, so `ps -p $pid >/dev/null` tests whether a process exists.
+
+**Formats.**
+
+| Options | Columns |
+|---|---|
+| (default) | `PID TTY TIME CMD`; BSD style: `PID TTY STAT TIME COMMAND` |
+| `-f` | `UID PID PPID C STIME TTY TIME CMD` (with arguments) |
+| `-F` | `-f` plus `SZ RSS PSR` |
+| `-l`, `-lf` | `F S UID PID PPID C PRI NI ADDR SZ WCHAN TTY TIME CMD` (and `STIME` with `-f`) |
+| `-j`, `-jf` | `PID PGID SID TTY TIME CMD`; with `-f`, `-f` plus `PGID SID` |
+| `-L` | Adds `LWP` (and `NLWP` with `-f`); every process has one thread. |
+| `u` | `USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND` |
+| `j` | `PPID PID PGID SID TTY TPGID STAT UID TIME COMMAND` |
+| `l` | `F UID PID PPID PRI NI VSZ RSS WCHAN STAT TTY TIME COMMAND` |
+| `v` | `PID TTY STAT TIME VSZ RSS %MEM COMMAND` |
+| `s` | `UID PID PENDING BLOCKED IGNORED CAUGHT STAT TTY TIME COMMAND` |
+| `-o`, `o`, `--format LIST` | Your own columns: `ps -o pid,ppid,stat,wchan,args`. `name=HEADER` renames a column (the header runs to the end of the list unless a known column name follows a comma), and `name=` alone hides it. If every header is empty, no header line is printed. |
+| `-O`, `O LIST` | `PID`, then `LIST`, then the rest of the default. |
+
+**Other options.**
+- `-H` indents commands by depth. `f`/`--forest` draws the tree with `\_` (`ps axjf`, `ps -ef --forest`).
+- `--sort` and `k` sort by `[+|-]KEY,...` (`ps aux --sort=-rss`). The default order is by pid.
+- `h`/`--no-headers` drops the header line.
+- `c` shows the command name instead of the arguments; `n` shows numeric user and group ids.
+- `-w`/`w` widens the output to 132 columns, and giving it twice removes the limit (`--width N` sets it). Otherwise output to a terminal is cut at its width.
+- `ps -o help` (or `ps L`) lists every column with a description; `--help` prints a summary.
+
+**Columns.**
+- **Ids:** `pid ppid pgid sid tpgid lwp nlwp uid ruid user ruser gid rgid group rgroup`. User and group names come from `/etc/passwd` and `/etc/group`.
+- **Terminal and state:**
+  - `tty`;
+  - `s`: the Unix state, `R`, `S`, `D` (an uninterruptible sleep), `T` (stopped) or `Z` (zombie);
+  - `stat`: the state plus BSD flags, `s` (session leader) and `+` (in the terminal's foreground group).
+- **Commands and times:**
+  - `comm` and `args`: zombies show `[name] <defunct>`, and processes without arguments `[name]`;
+  - CPU time: `time`, `times`, `bsdtime`;
+  - since the start: `etime`, `etimes`;
+  - start time: `stime`, `start`, `lstart`, all in UTC;
+  - CPU use: `%cpu`, the CPU time divided by the time since start, as in procps, and `c`, its integer form.
+- **Memory:** `%mem`, `rss`, `vsz`, `sz`.
+- **Scheduling:** `psr` (the CPU it last ran on) and `wchan` (the kernel's wait reason: `wait4`, `tty read`, `socket`, `pipe-read`...).
+- **Signals and mask:** `pending`, `blocked`, `ignored` and `caught` (Linux-style hex masks), and `umask`.
+- **Eunuchs only:** `syscalls` (system calls made) and `switches` (times scheduled).
+- **Fixed values:** the scheduler has no priorities, so `pri`, `ni` and `cls` show 80, 0 and `TS`. `f` is 4 for a process running as root and 0 otherwise. `addr` is `-`.
+
+**Where the data comes from.**
+- `/proc/<pid>/status`, including the fields the kernel adds for `ps`: `ustate`, `start_ms`, `cpu_ms`, `vsz_kib`, `tty`, `tpgid`, `psr`.
+- `/proc/<pid>/cmdline` for the arguments.
+- `/proc/meminfo` for `%mem`, `uptime_ms()` and `time()` for elapsed and start times.
+
+Only processes are listed. Kernel threads are in `/proc/threads` and the monitor's `ps`.
+
 ### eutils
 
 `eutils` (`user/bin/eutils.c`) is one binary. `main` takes the basename of `argv[0]` and dispatches with a chain of `strcmp`s. The disk image has `/bin/eutils` plus one hard link per name in `EUTILS_LINKS`, made by mkfs's `/path=@/existing` syntax. An unknown name prints `eutils: unknown tool 'X'` and exits with 2. Running `/bin/eutils` directly ends up there too. Some tools (`ln`, `mv`, `cp`, `chmod`, `chown`) are only matched when the argument count is right, so a usage error also produces the "unknown tool" message.
@@ -305,7 +381,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `ls` | `ls [-l] [PATH...]` | `-l`: mode, links, size, inode (not owner). One name per line, in directory order. |
 | `cat` | `cat [FILE...]` | stdin with no arguments; 4 KiB reads. |
 | `grep` | `grep [-v] [-n] [-i] [-c] PATTERN [FILE...]` | Kernighan & Pike matcher: `c . ^ $ *`. Reads one byte per syscall; lines longer than 1023 bytes are truncated. Exit 0 if any match, 1 if none, 2 for usage errors. |
-| `ps` | `ps` | PID, PPID, state, wait channel and name from `/proc/<pid>/status` (first 511 bytes). |
+| `ps` | `ps [options]` | procps-style: dashed options are System V (`-ef`, `-lf`, `-ejH`, `-o pid,args`), undashed are BSD (`aux`, `axjf`), and they mix. See [The `ps` command](#the-ps-command). |
 | `top` | `top` | Raw mode with `VMIN=0`; shows `/proc/uptime`, 10 lines of `/proc/cpus` and 20 of `/proc/threads` every second; `q` or `^C` quits. |
 | `ping` | `ping [-c N] [-i MS] [-s SIZE] [-W MS] HOST` | Raw ICMP, root only. |
 | `nc` | `nc [-uv] HOST PORT`, `nc -l [-ukv] PORT` | TCP or UDP netcat. |
@@ -336,8 +412,8 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `cp` | `cp FROM TO` | Exactly two arguments; creates `TO` with 0644. |
 | `wc` | `wc [-lwc] [FILE...]` | Words are split on space, tab and newline. |
 | `stat` | `stat PATH...` | Inode, type, size, blocks, links, mode. |
-| `head` | `head [-n N] [FILE]` | Default 10 lines; reads a byte at a time. |
-| `tail` | `tail [-n N] [FILE]` | Reads the whole input into memory. |
+| `head` | `head [-n N \| -N] [FILE]` | Default 10 lines; reads a byte at a time. |
+| `tail` | `tail [-n N \| -N] [FILE]` | Reads the whole input into memory. |
 | `tee` | `tee [FILE]` | One file at most. |
 | `chmod` | `chmod OCTAL FILE...` | Octal modes only. |
 | `chown` | `chown USER[:GID] FILE...` | User by name or uid from `/etc/passwd`; group numeric only (otherwise -1). |
@@ -367,7 +443,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `/bin/<prog>` for every `user/bin/*.c` and every directory `user/bin/<prog>/` | `build/user/stripped/<prog>` (DWARF stripped, symbols kept) |
 | `/bin/sh` | hard link to `/bin/esh` |
 | `/bin/<applet>` for every `EUTILS_LINKS` name | hard link to `/bin/eutils` (`=@/bin/eutils`) |
-| `/etc/motd`, `/etc/passwd`, `/etc/hostname`, `/etc/eshrc` | `user/etc/` |
+| `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` | `user/etc/` |
 | `/dev/`, `/proc/` | empty mount points |
 | `/tmp/` | mode 0777 |
 | `/www/`, `/www/index.html` | `user/www/index.html` |
@@ -414,7 +490,7 @@ guest:x:1000:1000:guest:/home/guest:/bin/esh
   - `dbg_ps()`, `dbg_files()`, `dbg_vm()`: dump the process table, this process's descriptors, or its memory map to the console;
   - `dbg_fscrash(point)`: crash-consistency testing;
   - `dbg_profile(op, arg)`: the profiler (`profile run CMD` is the easy way to use it).
-- **procfs.** `/proc/<pid>/status` (credentials, pgid/sid, stopped, signal masks and dispositions), `maps`, `fds`, `stack` (kernel stack), `ustack` (symbolized user backtrace of a live process); `/proc/self`.
+- **procfs.** `/proc/<pid>/status` (credentials, pgid/sid, stopped, signal masks and dispositions), `maps`, `fds`, `stack` (kernel stack), `ustack` (symbolized user backtrace of a live process), `cmdline`; `/proc/self`.
 - **Monitor** (`Ctrl-]`): `procs`, `ubt <pid>` (user backtrace from the saved trap frame), `vm <pid> [va]`, `files <pid>`, `strace <pid>`, `kill <pid>`, `tty` (foreground group, termios, queued input). An `ebreak` in user code also stops in the monitor; `c` continues.
 - **GDB.** `make debug` then `make gdb`; `eu-procs` lists processes. For source-level debugging of a program, `add-symbol-file build/user/bin/<prog>` (no offset is needed because every program is linked at `0x10000`). Since all programs share that address range, a breakpoint on a user address fires in whichever process is running there, so combine it with a condition or use `dbg_break()` in the program instead. `__restore_rt` has no CFI (`.eh_frame` is discarded anyway), so GDB may stop unwinding at a signal handler's caller.
 - **Profiling.** `profile run CMD` gives a quick report with user functions symbolized; `profile dump` plus `make flamegraph` on the host symbolizes user frames from `build/user/bin`.
@@ -438,7 +514,7 @@ Commands:
 - **`tail -n 0`** prints the whole input: the loop `++lines == n` never matches 0. `tail` also ignores a failed `realloc`.
 - **Usage errors in `ln`, `mv`, `cp`, `chmod` and `chown`** produce `eutils: unknown tool 'X'` because the argument-count check is part of the dispatch condition.
 - **Commands read one byte per system call**: `head`, `grep`, and `esh` when reading commands from a pipe or the `read` builtin (so that input meant for later commands stays unread). `top` writes one byte per call. This is slow, and very visible under `strace`.
-- **`ps` reads only 511 bytes** of each `status` file; **`lookup_user` reads only 1023 bytes** of `/etc/passwd`.
+- **`lookup_user` reads only 1023 bytes** of `/etc/passwd` (so does `ps`'s user and group lookup, with 2047).
 - **`httpd`**: files over 64 KiB are truncated; `HEAD` replies say `Content-Length: 0`. The directory-listing loop stops only when `len` reaches `sizeof(body) - 300`, but one entry can add almost 400 bytes, so a listing that long could make `sizeof(body) - len` wrap and overflow `body`. An empty path (`GET  HTTP/1.0`) reads `path[-1]`.
 - **`echod`'s header comment** says it logs every connection and datagram; the code logs nothing after start-up. **`eutils.c`'s header comment** omits `crc32` and `profile`.
 - **`su` has no password check** (it relies on `setuid` failing for non-root), and **`rshd` has no authentication**. Both are deliberate for a local VM. A remote `esh -i` has no terminal, so there is no `^C`, job control or line editing.

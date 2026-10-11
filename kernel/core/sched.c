@@ -880,6 +880,12 @@ static bool running_now(struct thread *t)
     return t->on_cpu && t->cpu >= 0 && t->cpu < ncpus_online && cpus[t->cpu].cur_thread == t;
 }
 
+/* CPU time used by t so far, including the current slice (rdtime ticks). */
+u64 thread_cpu_ticks(struct thread *t)
+{
+    return t->runtime + (running_now(t) ? acct_now() - cpus[t->cpu].last_switch : 0);
+}
+
 void thread_list_print(print_fn print)
 {
     unsigned long flags;

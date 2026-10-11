@@ -265,6 +265,17 @@ static long do_exec(struct proc *p, const char *path, char *const argv[], char *
     mm_destroy(old);
     strlcpy(p->name, basename(path), sizeof(p->name));
     strlcpy(current->name, p->name, sizeof(current->name));
+    p->cmdline_len = 0;
+    for (int i = 0; i < argc && p->cmdline_len < sizeof(p->cmdline); i++) {
+        size_t room = sizeof(p->cmdline) - p->cmdline_len;
+        size_t len = strlen(argv[i]) + 1;
+        if (len > room)
+            len = room;
+        memcpy(p->cmdline + p->cmdline_len, argv[i], len);
+        p->cmdline_len += len;
+    }
+    if (p->cmdline_len)
+        p->cmdline[p->cmdline_len - 1] = 0;
     set_image(p, img);
     signal_exec(p);
     if (fmode & S_ISUID)
@@ -451,6 +462,8 @@ long sys_fork(void)
     child->uid = parent->uid, child->euid = parent->euid, child->suid = parent->suid;
     child->gid = parent->gid, child->egid = parent->egid, child->sgid = parent->sgid;
     child->umask = parent->umask;
+    memcpy(child->cmdline, parent->cmdline, parent->cmdline_len);
+    child->cmdline_len = parent->cmdline_len;
     files_fork(child, parent);
     signal_fork(child, parent);
 

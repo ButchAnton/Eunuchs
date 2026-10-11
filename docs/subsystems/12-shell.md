@@ -289,7 +289,7 @@ Keys are emacs-style, as in zsh's default keymap:
 | `$name`, `${name` | Variable names. |
 | `~name` | User names from `/etc/passwd`. |
 | After `<`, `>`, ... | File names. |
-| `-x` after a known command | Options with descriptions (`ls`, `grep`, `nc`, `ping`, `netstat`, `wc`, `head`, `tail`, `httpd`, `stress`, `kill`, and the builtins); subcommands of `profile` and `dbg`. |
+| `-x` after a known command | Options with descriptions (`ps`, `ls`, `grep`, `nc`, `ping`, `netstat`, `wc`, `head`, `tail`, `httpd`, `stress`, `kill`, and the builtins); subcommands of `profile` and `dbg`. |
 | `cd`, `pushd`, `rmdir` | Directories. |
 | `fg`, `bg`, `disown`, `wait`, `kill %` | Job specs, described by state and command. |
 | `kill -` / `trap ... ` | Signal names. |

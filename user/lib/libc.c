@@ -513,6 +513,22 @@ int getchar(void)
 
 /* ---- string extras ---- */
 
+size_t strcspn(const char *s, const char *reject)
+{
+    size_t n = 0;
+    while (s[n] && !strchr(reject, s[n]))
+        n++;
+    return n;
+}
+
+size_t strspn(const char *s, const char *accept)
+{
+    size_t n = 0;
+    while (s[n] && strchr(accept, s[n]))
+        n++;
+    return n;
+}
+
 char *strcpy(char *d, const char *s)
 {
     char *r = d;

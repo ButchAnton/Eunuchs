@@ -83,6 +83,7 @@ void tty_init(void)
 }
 
 struct tty *tty_console(void) { return &console_tty; }
+int tty_fg_pgrp(struct tty *tty) { return tty ? tty->pgrp : -1; }
 
 static void out_raw(struct tty *tty, const char *s, size_t n)
 {

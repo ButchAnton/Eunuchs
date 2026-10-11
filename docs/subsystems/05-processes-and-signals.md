@@ -36,7 +36,7 @@ What it does not do (and where that lives):
 | `lib/include/uapi/signal.h` | Signal numbers, names and default actions (the `SIGNALS` X-macro), `NSIG`, `SIGBIT`, `SA_*` flags, `struct sigaction`, `SIG_BLOCK`/`UNBLOCK`/`SETMASK`, `WUNTRACED`. It is shared with libc. |
 | `lib/include/uapi/syscall.h` | System-call numbers and strace formats, `WNOHANG`, and `DBG_*` operations (including `DBG_STRACE`). |
 | `kernel/drivers/tty.c` | Job control on the console: `tty_input` (`^C`, `^\`, `^Z`), `job_control` (SIGTTIN), and `tty_ioctl` (`TIOCGPGRP`, `TIOCSPGRP`, `TIOCSCTTY`, `TIOCNOTTY`). `tty_set_ctty` is also here. |
-| `kernel/fs/procfs.c` | `/proc/<pid>/{status,maps,fds,stack,ustack}` (`gen_pid`, `gen_pid_locked`), `/proc/procs`, `/proc/self`. |
+| `kernel/fs/procfs.c` | `/proc/<pid>/{status,maps,fds,stack,ustack,cmdline}` (`gen_pid`, `gen_pid_locked`), `/proc/procs`, `/proc/self`. |
 | `kernel/arch/riscv/trap.c` | `user_exception` (faults lead to `user_fault`) and `return_to_user_checks` (calls `signal_deliver`, then `syscall_restart_check`). |
 | `user/lib/libc.c`, `user/lib/syscall.S`, `user/lib/crt0.S` | The user side: `sigaction` inserts `__restore_rt` as `sa_restorer`. `__restore_rt` issues `rt_sigreturn` (139). `_start` reads argc/argv/envp from the stack. |
 | `kernel/tests/test_proc.c` | KTESTs: VMA add/find/split, demand paging and COW refcounts, `copy_*_user` rejecting bad ranges, `elf_load` and `elf_symbolize` on `/bin/hello`, and rejection of a junk ELF. |
@@ -532,7 +532,8 @@ Numbers are from `lib/include/uapi/syscall.h`.
 | File | Contents |
 |---|---|
 | `/proc/procs` | `proc_list_print`: PID, PPID, PGID, SID, name, state (`zombie`, `T` for stopped, or the thread state), TID, syscalls, RSS, strace, SIGPEND, SIGBLK, age. |
-| `/proc/<pid>/status` | pid, ppid, name, state, tid, wait reason, context switches, syscalls, rss_kib, strace, uid/euid/gid/egid/umask, pgid, sid, stopped, sig_pending, sig_blocked, sig_caught, sig_ignored. |
+| `/proc/<pid>/status` | pid, ppid, name, state, tid, wait reason, context switches, syscalls, rss_kib, strace, uid/euid/gid/egid/umask, pgid, sid, stopped, sig_pending, sig_blocked, sig_caught, sig_ignored; then, for `ps`, `ustate` (the Unix state letter: R, S, D for an uninterruptible sleep, T, Z), `start_ms` (start time, ms since boot), `cpu_ms` (CPU time including the current slice, `thread_cpu_ticks`), `vsz_kib` (sum of the VMAs), `tty` (`console` or `-`), `tpgid` (the terminal's foreground group), `psr` (the CPU it last ran on). |
+| `/proc/<pid>/cmdline` | The arguments of the last `execve`, each followed by a NUL (as on Linux), kept in `proc.cmdline` (256 bytes, truncated) and copied by `fork`. |
 | `/proc/<pid>/maps` | `mm_print` (VMAs, resident and COW pages). |
 | `/proc/<pid>/fds` | The cwd path, then the descriptors. |
 | `/proc/<pid>/stack` | Kernel backtrace of the process's thread. |

@@ -335,6 +335,9 @@ def main():
         ("echo $(( 6 * 7 )) ${HOME:-none} ~", "42 / /"),
         ("[[ abc == a* ]] && echo cond-ok", "cond-ok"),
         ("cat <<EOF", None, False), ("one $((1+1))", None, False), ("EOF", "one 2"),
+        ("ps -ef", "/bin/esh -l"),                         # cmdline from /proc/<pid>/cmdline
+        ("ps -o pid=,comm= -p 1", "    1 init"),
+        ("ps -o ppid= -p $$", "    1\r\n"),                # the console shell is init's child
         ("su guest", None, False), (None, "guest@eunuchs:~% ", False),
         ("id", "uid=1000(guest)"),
         ("touch /etc/nope", "Permission denied"),
