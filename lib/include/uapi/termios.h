@@ -59,6 +59,7 @@ struct termios {
 #define TIOCGPGRP  0x540F
 #define TIOCSPGRP  0x5410
 #define TIOCGWINSZ 0x5413
+#define TIOCSWINSZ 0x5414
 #define FIONREAD   0x541B
 #define TIOCNOTTY  0x5422
 

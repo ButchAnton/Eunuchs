@@ -1,6 +1,6 @@
 # User space: libc, shell and commands
 
-Everything that runs in U-mode: a small static C library (`user/lib/`), the headers programs compile against (`user/include/` plus the shared ABI in `lib/include/uapi/`), the shell (`/bin/sh`), `init`, the multi-call `eutils` binary and about twenty other programs. Every program is a static ELF linked at `0x10000` with the same startup code and the whole libc, and is copied into the efs disk image at build time. The libc is deliberately small and debugging-oriented: system call wrappers that set `errno`, one line-buffered stdout, a first-fit `malloc` with magic numbers and poisoning, and thin wrappers for signals, sockets and termios.
+Everything that runs in U-mode: a small static C library (`user/lib/`), the headers programs compile against (`user/include/` plus the shared ABI in `lib/include/uapi/`), the shell (`esh`, also `/bin/sh`; it has [its own document](12-shell.md)), `init`, the multi-call `eutils` binary and about twenty other programs. Every program is a static ELF linked at `0x10000` with the same startup code and the whole libc, and is copied into the efs disk image at build time. The libc is deliberately small and debugging-oriented: system call wrappers that set `errno`, one line-buffered stdout, a first-fit `malloc` with magic numbers and poisoning, and thin wrappers for signals, sockets and termios.
 
 ## Responsibilities and scope
 
@@ -9,7 +9,7 @@ What this subsystem does:
 - **Program startup and exit.** `crt0.S` turns the initial stack built by the kernel's `do_exec` into `main(argc, argv)` with `environ` set; `exit` flushes stdout and calls `SYS_exit`.
 - **System call wrappers.** One generic `__syscall` stub (`syscall.S`) plus a C wrapper per call (`libc.c`, `net.c`) that converts `-errno` returns into `-1` and `errno`.
 - **Library services.** Formatted output (the kernel's `printf` core, shared through `lib/printf.c`), string functions (`lib/string.c`, also shared), heap allocation, environment handling, directory reading, time conversion, `poll`/`select`, IPv4 address helpers, termios helpers and the Eunuchs-specific debug hooks (`dbg_*`).
-- **The shell.** Command-line parsing, expansion, pipelines, redirection, variables, job control and built-ins (`user/bin/sh.c`).
+- **The shell.** `esh`, a zsh-like shell with a line editor (`user/bin/esh/`), is described in [12-shell.md](12-shell.md). This document covers only how it fits in.
 - **Commands.** `init` (pid 1), file and text tools, process tools, network tools and servers, and test programs (`utests`, `stress`, `segv`, ...).
 - **Disk-image contents.** Which files and links go into `build/fs.img` (`Makefile`: `UPROGS`, `EUTILS_LINKS`, `FS_FILES`).
 
@@ -39,16 +39,16 @@ What it does not do:
 | `lib/include/uapi/termios.h` | `struct termios` (Linux layout), flags, `TCGETS`/`TIOC*` ioctl numbers, `struct winsize`. |
 | `user/include/*.h` | POSIX-style headers: `unistd.h`, `stdio.h`, `stdlib.h`, `string.h`, `errno.h`, `fcntl.h`, `signal.h`, `dirent.h`, `termios.h`, `time.h`, `poll.h`, `netdb.h`, `eunuchs.h`, `sys/{mman,select,socket,stat,wait}.h`, `netinet/in.h`, `arpa/inet.h`. |
 | `user/user.ld` | Linker script: text at `0x10000`, page-aligned r-x / r-- / rw- segments. |
-| `user/bin/init.c` | pid 1: prints `/etc/motd`, runs and restarts `/bin/sh`, reaps orphans; `-1` mode for tests. |
-| `user/bin/sh.c` | The shell. |
+| `user/bin/init.c` | pid 1: prints `/etc/motd`, runs and restarts `/bin/esh -l`, reaps orphans; `-1` mode for tests. |
+| `user/bin/esh/*.c` | The shell (one program from several files; see [12-shell.md](12-shell.md)). |
 | `user/bin/eutils.c` | Multi-call binary: 32 small tools chosen by `argv[0]`. |
 | `user/bin/{ls,cat,grep,ps,top}.c` | Standalone file, text and process tools. |
 | `user/bin/{ping,nc,ifconfig,netstat}.c` | Network clients and configuration. |
 | `user/bin/{httpd,rshd,echod}.c` | Network servers. |
 | `user/bin/{utests,stress,segv,spin,exitcode,hello}.c` | Test and demonstration programs. |
-| `user/etc/motd`, `user/etc/passwd` | Message of the day; user database (`root` 0, `guest` 1000). |
+| `user/etc/motd`, `user/etc/passwd`, `user/etc/hostname`, `user/etc/eshrc` | Message of the day; user database (`root` 0, `guest` 1000, both with `/bin/esh`); host name for prompts; the shell's system-wide start-up file. |
 | `user/www/index.html` | `httpd`'s default page (links into `/proc`). |
-| `Makefile` (`UCFLAGS`, `ULIB`, `UPROGS`, `EUTILS_LINKS`, `FS_FILES`) | How user code is compiled, linked, stripped and put in the disk image. |
+| `Makefile` (`UCFLAGS`, `ULIB`, `UPROGS`, `UMULTI`, `EUTILS_LINKS`, `FS_FILES`) | How user code is compiled, linked, stripped and put in the disk image. `UMULTI` links each directory `user/bin/NAME/` into one program `/bin/NAME`. |
 
 ## Concepts and data structures
 
@@ -117,10 +117,11 @@ struct block {               32 bytes, so user pointers stay 16-byte aligned
 ```
 
 - Requests are rounded up to 16 bytes.
-- There is one singly linked free list (`free_list`), searched first-fit from the head. `free` pushes onto the head, so the most recently freed block is reused first (LIFO).
-- A free block is split if the remainder can hold a header plus 16 bytes (`sizeof(struct block) + 16` = 48). The remainder goes to the head of the free list.
-- If nothing fits, the heap grows by `sbrk(max(4096, n + 32))`. The surplus of the new chunk becomes a free block (same split rule).
-- Freed blocks are **never coalesced** and the heap is never returned to the kernel.
+- There is one singly linked free list (`free_list`), kept in address order and searched first-fit from the lowest address.
+- A free block is split if the remainder can hold a header plus 16 bytes (`sizeof(struct block) + 16` = 48). The remainder takes the block's place in the list.
+- `free` (through `free_insert`) puts the block in its place in the list and merges it with the free block right after it and the free block right before it, when they are adjacent in memory. Long-running programs (the shell) therefore reuse freed memory for larger requests instead of fragmenting the heap.
+- If nothing fits, the heap grows by `sbrk(max(4096, n + 32))`. The surplus of the new chunk becomes a free block, merged with a free block that ends where the old heap ended.
+- The heap is never returned to the kernel.
 - `heap_used` and `heap_total` count bytes; `malloc_stats()` prints them.
 
 Debugging checks (all in `libc.c`):
@@ -128,12 +129,12 @@ Debugging checks (all in `libc.c`):
 | Check | Where | Reports |
 |---|---|---|
 | Every block walked on the free list must have `MAGIC_FREE`. | `malloc` | `free list corrupted` |
-| Freeing a block whose magic is already `MAGIC_FREE`. | `free` | `double free` |
+| Freeing a block whose magic is already `MAGIC_FREE`. | `free` | `double free` (if the block was since merged into a neighbour, its header no longer has a magic and the report is the next row's) |
 | Freeing a block whose magic is neither value. | `free` | `free of a pointer malloc did not return` (also catches an overwritten header) |
 | `realloc` of a block without `MAGIC_USED`. | `realloc` | `realloc of a bad pointer` |
 | Freed memory is filled with `0x6b` (the kernel's freed-page byte). | `free` | A use after free reads `0x6b6b...`, which is easy to spot in a fault report. |
 
-`malloc_die` prints `malloc: <what> (<ptr>) -- heap corruption or bad pointer` to stderr, emits a `dbg_mark("malloc abort")` trace event and kernel log line, and calls `_exit(134)` (the status a `SIGABRT` death would produce, but delivered as a normal exit).
+`malloc_die` flushes stdout, prints `malloc: <what> (<ptr>) -- heap corruption or bad pointer` to stderr, emits a `dbg_mark("malloc abort")` trace event and kernel log line, and calls `_exit(134)` (the status a `SIGABRT` death would produce, but delivered as a normal exit).
 
 ### Environment
 
@@ -144,19 +145,6 @@ The kernel's `proc_spawn` gives the first process `PATH=/bin`, `HOME=/`, `TERM=v
 ### DIR
 
 `opendir` opens the path with `O_RDONLY | O_DIRECTORY` and mallocs a `struct DIR { int fd; int pos, n; struct dirent ents[16]; }`. `readdir` refills `ents` with one `getdents64` call when empty. `struct dirent` is a fixed 64-byte record (`d_ino`, `d_type`, `d_name[59]`), not Linux's variable-length one, so `readdir` simply indexes the array.
-
-### Shell data structures (`sh.c`)
-
-| Structure | Limit | Purpose |
-|---|---|---|
-| `struct var vars[MAXVARS]` | 64 | Shell variables: `name`, `value` (both malloc'd), `exported`. |
-| `struct tok toks[256]` | 250 tokens per line | Output of `lex`: type (`T_WORD`, `T_PIPE`, `T_AND`, `T_OR`, `T_SEMI`, `T_BG`, `T_REDIR`, `T_END`), the expanded word, `glob` (unquoted `*`/`?` seen), `assign` (looks like `NAME=`), and for redirections `rkind` (`R_IN`, `R_OUT`, `R_APPEND`, `R_DUP`), `rfd`, `rdup`. |
-| `struct cmd` | `argv[MAXWORDS+1]` (64 words), 8 assignments, `MAXREDIR` 8 redirections | One simple command. |
-| `struct pipeline` | `MAXCMDS` 8 commands | Commands, `bg` flag, the operator that follows (`next`), and up to 160 bytes of text for job messages. |
-| `struct job jobs[MAXJOBS]` | 16 | `id` (index + 1; 0 = free slot), `pgid`, `pids[8]`, `done[8]`, `npids`, `running`, `stopped`, `status` (raw wait status of the last command), `text`. |
-| `LINE` | 1024 | Input line buffer and maximum expanded word. |
-
-Global state: `last_status` (`$?`), `last_bg` (`$!`), `interactive` (stdin is a TTY), `shell_pgid`, `shell_tmodes` (termios saved at start-up and restored after each foreground job), `got_sigint`.
 
 ## How it works
 
@@ -208,11 +196,11 @@ The kernel honours `SA_RESTART`, `SA_NODEFER` and `SA_RESETHAND` (`signal_delive
 - lengths `hh h l ll z t j`;
 - conversions `d i u o x X p s c %`.
 
-`%p` always prints `0x`. `%s` of `NULL` prints `(null)`. An unknown conversion is printed literally (`%` and the character) so the mistake is visible. There is no floating point. `kvsnprintf` always NUL-terminates when `size > 0` and returns the length the output would have had (C99 semantics), so callers that do `n += snprintf(...)` must clamp, as `sh.c` does in `lex`.
+`%p` always prints `0x`. `%s` of `NULL` prints `(null)`. An unknown conversion is printed literally (`%` and the character) so the mistake is visible. There is no floating point. `kvsnprintf` always NUL-terminates when `size > 0` and returns the length the output would have had (C99 semantics), so callers that do `n += snprintf(...)` must clamp.
 
 ### Heap allocation
 
-The flow is described under "malloc heap" above. `sbrk(inc)` caches the break in `cur_brk` (fetched with `brk(0)` the first time) and calls `brk(old + inc)`. `brk(addr)` stores whatever the kernel returns, which is the old break if the request was refused, and fails with `ENOMEM` if that differs from `addr`. `calloc` is `malloc` + `memset`, and does not check `n * size` for overflow. `realloc` returns the same pointer when the block is already big enough. Otherwise it allocates, copies and frees, and never grows in place.
+The flow is described under "malloc heap" above. `sbrk(inc)` caches the break in `cur_brk` (fetched with `brk(0)` the first time) and calls `brk(old + inc)`. `brk(addr)` stores whatever the kernel returns, which is the old break if the request was refused, and fails with `ENOMEM` if that differs from `addr`. `calloc` is `malloc` + `memset`; it returns `NULL` if `n * size` overflows. `realloc` returns the same pointer when the block is already big enough. Otherwise it allocates, copies and frees, and never grows in place.
 
 Programs that want big, page-granular memory can use `mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`. The kernel rejects writable+executable mappings with `EACCES` (tested in `utests.c` `t_mmap`).
 
@@ -224,113 +212,20 @@ Programs that want big, page-granular memory can use `mmap(NULL, len, PROT_READ|
 
 `init` (`user/bin/init.c`) runs as pid 1, started by the kernel's `kinit` (default `/bin/init`, overridable with the `init=` boot option).
 
-1. Program to run: `argv[1..]`, or `/bin/sh` if none. `init -1 PROG ARGS...` means "once": the `utest` boot option starts `init -1 /bin/utests [arg]`.
+1. Program to run: `argv[1..]`, or `/bin/esh -l` (a login shell) if none. `init -1 PROG ARGS...` means "once": the `utest` boot option starts `init -1 /bin/utests [arg]`.
 2. Prints `init: pid N, running PROG`, then (not in once mode) copies `/etc/motd` to stdout.
 3. Loop: fork and `execv` the program. Then `wait()` repeatedly. Children that are not the program are adopted orphans and are just reaped. When the program exits:
    - in once mode, init returns its status (`128 + signal` if it was killed), and the kernel powers off with that result;
-   - otherwise it prints `init: /bin/sh (pid N) exited with status S; restarting`, sleeps 200 ms and starts it again.
+   - otherwise it prints `init: /bin/esh (pid N) exited with status S; restarting`, sleeps 200 ms and starts it again.
 
 ### The shell
 
-#### Start-up (`main`)
+The shell is `esh`; [12-shell.md](12-shell.md) describes the language, the line editor, and how they are implemented. As a user-space program, what matters here is:
 
-1. Import every `NAME=value` from `environ` as an exported variable; set `PATH=/bin` if missing.
-2. `sh -c 'line'`: run one line with `run_line` and exit with `$?` (only `argv[2]` is used; extra arguments are ignored).
-3. `sh -i ...`: set `prompts = 1` and drop the flag. This shows prompts even when stdin is not a terminal (`rshd` uses it), but does not enable job control.
-4. `sh file`: run the file with `run_file` and exit with `$?`.
-5. Otherwise read commands from stdin. If stdin is a TTY (`isatty(0)`), the shell is interactive:
-   - ignore `SIGQUIT`, `SIGTSTP`, `SIGTTIN` and `SIGTTOU`;
-   - install `on_sigint` for `SIGINT` without `SA_RESTART`, so `^C` interrupts the blocking `read` with `EINTR`;
-   - `setpgid(0, 0)` and `tcsetpgrp(0, shell_pgid)` to own the terminal;
-   - save the terminal modes in `shell_tmodes`.
-6. Main loop: `reap_background()`, print the prompt (`root@eunuchs:/dir# `, `guest@...$ ` for uid 1000, otherwise `user@...$ `), `read_line`, `run_line`. `read_line` returns `-2` for `^C` at the prompt, which just prints a new prompt. On EOF the loop ends, an interactive shell prints `exit`, and the shell exits with `$?`.
-
-`read_line` reads one byte per `read` call, stops at `'\n'`, drops `'\r'` (for lines arriving over `rshd`/`nc`), and returns at most `LINE - 1` = 1023 characters. A longer line is split and the rest is read as the next line.
-
-#### Lexing and expansion (`lex`)
-
-`lex` turns the entire line into `toks[]` before anything runs. Expansion happens here, as each word is built:
-
-| Input | Result |
-|---|---|
-| spaces, tabs | separate words |
-| `#` at the start of a token | comment to end of line |
-| `\|\|` `&&` `\|` `&` `;` | operator tokens |
-| `<` `>` `>>` `>&` with an optional single-digit fd before it (`2>`, `0<`, `3>>`) | redirection tokens. `>&` takes an optional single digit after it (default 1). Default fd: 0 for `<`, 1 otherwise. |
-| `'...'` | literal; no expansion inside |
-| `"..."` | `$` expansion and `\` escapes inside; no globbing |
-| `\x` (outside single quotes) | literal `x` |
-| `$NAME`, `${NAME}`, `$?`, `$$`, `$!` | value of the variable (empty if unset). A `$` followed by anything else is kept literally. |
-| `~` at the start of a word, followed by `/`, a space or the end | `$HOME` (or `/` if `HOME` is empty) |
-| unquoted `*` or `?` | sets `glob` on the token |
-| unquoted `=` after a valid name, in a word with no quotes before it | sets `assign` (`NAME=value`) |
-
-Variable values are inserted as-is: there is no field splitting, and wildcards that come from a variable do not glob. An unterminated quote is a syntax error (`$?` = 2).
-
-#### Parsing (`parse_pipeline`)
-
-`run_line` calls `parse_pipeline` repeatedly, starting at token index `ti`. Each call builds one `struct pipeline`:
-
-- `T_WORD` with `assign`, before any command word → `assigns[]` (up to 8).
-- `T_WORD` with `glob` → expanded in place by `glob()`.
-- any other `T_WORD` → `argv[]` (words past 64 are dropped silently).
-- `T_REDIR` → consume the following word as the file name (not needed for `R_DUP`).
-- `T_PIPE` → start the next `cmd` (an empty command before `|` is a syntax error; at most 8 commands).
-- `T_SEMI`, `T_AND`, `T_OR`, `T_BG`, `T_END` → end of pipeline. `bg` is set for `&`, and `next` records the operator (`&` counts as `;`).
-
-`glob(pat)` supports wildcards only in the last path component. It opens the directory part (`.` if there is no `/`), matches each entry with the recursive `match()` (`*` and `?` only; no `[...]`), skips dot-files unless the pattern starts with `.`, and sorts the results with an insertion sort. A pattern that matches nothing stays as a literal word.
-
-Back in `run_line`, the text of the pipeline (words and `|`) is saved for job messages, and the `&&`/`||` short-circuit is applied: skip if the previous operator was `&&` and `$?` ≠ 0, or `||` and `$?` = 0. Operators associate left to right with equal precedence.
-
-#### Running a pipeline (`run_pipeline`)
-
-1. A single foreground command with no words but with assignments (`A=1 B=2`) sets shell variables. A variable that was already exported stays exported.
-2. A single foreground command is offered to `run_builtin`. If it returns ≥ 0, that is `$?` and nothing is forked. Builtins are therefore not available inside pipelines or in the background: there `cd` would be looked up in `PATH` and fail with "command not found".
-3. Otherwise a job slot is allocated (`job_new`; "too many jobs" after 16). For each command:
-   - create a pipe if another command follows;
-   - `fork`;
-   - in the child: if interactive, `setpgid(0, pgid)` (the first child's pid is the group) and, for a foreground job, `tcsetpgrp(0, pgid)`. Then connect the previous pipe to stdin and the new pipe's write end to stdout, and call `child_exec`;
-   - in the parent: record the pgid (the first child's pid when interactive, otherwise the shell's own group), call `setpgid(pid, pgid)` too so neither side can race, record the pid, close the pipe ends it no longer needs.
-4. `child_exec` resets `SIGINT`, `SIGQUIT`, `SIGTSTP`, `SIGTTIN` and `SIGTTOU` to `SIG_DFL` (ignored signals survive `exec`, so this is required), applies redirections, builds the environment with `build_env`, and calls `execvp`. On failure it prints `sh: NAME: command not found` and exits with 127 (for `ENOENT`), or prints the `strerror` text and exits with 126.
-5. Background (`&`): set `$!` to the last pid, print `[id] pid` if interactive, set `$?` = 0, return. Foreground: give the terminal to the job and call `wait_fg`.
-
-`apply_redirs` processes redirections left to right:
-- `R_DUP` is `dup2(rdup, fd)`;
-- the others `open` the file (`O_RDONLY`; `O_WRONLY|O_CREAT|O_TRUNC`; or `O_WRONLY|O_CREAT|O_APPEND`, mode `0666` before umask) and `dup2` it onto the target fd.
-
-So `cmd > f 2>&1` sends both outputs to `f`, and `cmd 2>&1 > f` sends stderr to the old stdout, as in POSIX shells.
-
-`build_env` makes a fresh environment in static storage: every exported variable as `NAME=value` (each truncated to 255 bytes), minus those overridden by the command's prefix assignments, followed by those assignments. The kernel's limit of 32 environment strings applies to the result.
-
-#### Waiting and job control
-
-- `wait_fg(j)` calls `waitpid(pid, &st, WUNTRACED)` for each process of the job in order, retrying on `EINTR`. `collect` marks a process done (and records the status of the last one) or marks the job stopped. Afterwards an interactive shell takes the terminal back (`tcsetpgrp(0, shell_pgid)`) and restores `shell_tmodes` (`TCSADRAIN`), because a program such as `top` may have left raw mode on.
-- If the job stopped, the shell prints `[n]+  Stopped  text`, sets `$?` = 148 (`128 + SIGTSTP`), and keeps the job.
-- Otherwise it reports deaths by signal other than `SIGINT` and `SIGPIPE` (e.g. `Segmentation fault (core dumped)`), sets `$?` (exit code, or `128 + signal`), and frees the slot.
-- `reap_background` runs before every prompt and after every line of a script. It polls each unfinished pid with `WNOHANG | WUNTRACED`, and prints `[n]   Done  text`, `[n]   Exit N  text` or `[n]   <signal>  text` when a job's last process has finished.
-- `fg [%n]` and `bg [%n]` (default: the highest-numbered job) print the job text, clear `stopped`, send `SIGCONT` to the group (`kill(-pgid, SIGCONT)`), and for `fg` hand over the terminal and `wait_fg`.
-- `^Z` works because the job, not the shell, is the terminal's foreground group: the TTY sends `SIGTSTP` to the job, `waitpid(..., WUNTRACED)` returns a stop status, and the shell (which ignores `SIGTSTP`) takes the terminal back.
-
-#### Built-ins (`run_builtin`)
-
-| Built-in | Behaviour |
-|---|---|
-| `cd [dir]` | `chdir` (default `$HOME`, or `/` if empty); sets and exports `PWD`. |
-| `pwd` | Prints `getcwd`. |
-| `exit [n]` | `exit(n)` (default `$?`); flushes stdout. |
-| `export NAME[=value]...` | Sets and/or marks exported; a bare unknown name is created empty and exported. |
-| `unset NAME...` | Removes shell variables. |
-| `set` | Lists variables (`export NAME=value` for exported ones). Takes no options. |
-| `jobs` | Reaps, then lists `[n]  Running/Stopped  text`. |
-| `fg [%n]`, `bg [%n]` | See above. |
-| `kill [-SIG] %n ...` | Only when at least one argument is a job spec (`%n`). Names: `KILL INT STOP CONT HUP TERM` (with or without `SIG`) or a number. For `TERM`, `KILL`, `INT`, `HUP` and `CONT` it first sends `SIGCONT` so a stopped job can die. Plain pids, or other signal names, fall through to `/bin/kill`. |
-| `wait` | `wait_fg` on every job that is not stopped. |
-| `umask [octal]` | Sets, or prints in `%04o`. |
-| `source file`, `. file` | `run_file` in the current shell. |
-| `exec cmd args...` | Applies redirections, builds the environment, `execvp`; prints an error and returns 127 on failure. `exec` with no arguments does nothing (redirections are not applied). |
-| `help` | Lists built-ins and syntax, and every name in `/bin`. |
-
-Only `exec` applies redirections. For every other built-in, redirections and prefix assignments are ignored (see Limitations).
+- **One binary, several sources.** It is built from `user/bin/esh/*.c` by the `UMULTI` rule and installed as `/bin/esh`, with `/bin/sh` a hard link to it. Invoked as `sh`, it turns on `shwordsplit` for POSIX scripts.
+- **Who runs it.** `init` starts `esh -l` on the console; `su` execs the shell field of `/etc/passwd`; `rshd` runs `esh -i` (prompts without a terminal).
+- **The terminal.** It uses the TTY in raw mode while editing and restores the saved modes before running each command. It answers to the kernel's job control: process groups, `tcsetpgrp`, `SIGTTIN`/`SIGTTOU`, `WUNTRACED`. When the terminal answers a cursor-position query, it sets the kernel's window size with `TIOCSWINSZ`, so `top` and other programs see the real size.
+- **libc.** It relies on the libc's buffered stdout (flushed before every `fork`), `malloc` (plus its own per-command arena), `opendir`/`readdir`, `poll`, and the termios and signal wrappers.
 
 ### eutils
 
@@ -345,7 +240,7 @@ All of them use the BSD socket API from `net.c`, with `resolve_host` for names (
   - `/proc/...` is served straight from procfs; any other path is under the root (`-r`, default `/www`), and `/` means `/index.html`.
   - Directories get an HTML listing. Files are read into a 64 KiB static buffer (larger files are truncated). Responses are HTTP/1.0 with `Connection: close`.
   - It logs one line per request, and the parent reaps children with `WNOHANG` after each `accept`.
-- **`rshd`**: port 23 (`-p`). For each connection it forks, `dup2`s the socket onto fds 0-2, writes a greeting and `execv("/bin/sh", {"sh", "-i"})`. There is no authentication and no TTY, so `^C` does not reach remote commands.
+- **`rshd`**: port 23 (`-p`). For each connection it forks, `dup2`s the socket onto fds 0-2, writes a greeting and `execv("/bin/esh", {"esh", "-i"})`. There is no authentication and no TTY, so `^C` does not reach remote commands.
 - **`echod`**: TCP and UDP on port 7 (`-p`). The parent `poll`s both sockets with a 1 s timeout, answers UDP datagrams itself, and forks a child per TCP connection that echoes until EOF.
 - **`nc`**: client (`nc [-u] [-v] host port`) or server (`nc -l [-u] [-k] [-v] port`).
   - `pump` polls the socket and stdin. At EOF on stdin it does `shutdown(SHUT_WR)` (TCP), or for UDP waits up to 1 s for replies.
@@ -362,7 +257,7 @@ User processes have one thread each, so the only concurrency inside a process is
 - **`errno` is one global int.** A handler that makes a failing system call overwrites the `errno` the interrupted code was about to read. Handlers should save and restore it.
 - **stdout.** `printf`, `puts` and `putchar` in a handler can interleave with, or corrupt, the main program's `outbuf`/`outlen` (non-atomic append-and-increment). `write(2)` or `fprintf_fd`, which only uses its own stack buffer, is safe from a handler.
 - **malloc** is not reentrant: the free list is modified without any protection. Never allocate in a handler.
-- **Static result buffers**: `inet_ntoa`, `sh.c`'s `var_get` (for `$?`, `$$`, `$!`), and `ps.c`'s `field` return pointers to static storage.
+- **Static result buffers**: `inet_ntoa`, `esh`'s `var_get` for computed specials (`RANDOM`, `SECONDS`, ...), and `ps.c`'s `field` return pointers to static storage.
 
 Fork and exec interactions:
 
@@ -405,8 +300,8 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 
 | Name | Usage | Notes |
 |---|---|---|
-| `init` | `init [-1] [PROG ARGS...]` | pid 1. Runs `/bin/sh` by default and restarts it 200 ms after it exits. `-1`: run once and return its status. |
-| `sh` | `sh`, `sh -c LINE`, `sh [-i] FILE`, `sh -i` | See the grammar below. |
+| `init` | `init [-1] [PROG ARGS...]` | pid 1. Runs `/bin/esh -l` by default and restarts it 200 ms after it exits. `-1`: run once and return its status. |
+| `esh` (also `sh`) | `esh`, `esh -c CMDS [NAME ARGS]`, `esh FILE [ARGS]`, `esh -i`, `esh -l` | The shell; see [12-shell.md](12-shell.md). |
 | `ls` | `ls [-l] [PATH...]` | `-l`: mode, links, size, inode (not owner). One name per line, in directory order. |
 | `cat` | `cat [FILE...]` | stdin with no arguments; 4 KiB reads. |
 | `grep` | `grep [-v] [-n] [-i] [-c] PATTERN [FILE...]` | Kernighan & Pike matcher: `c . ^ $ *`. Reads one byte per syscall; lines longer than 1023 bytes are truncated. Exit 0 if any match, 1 if none, 2 for usage errors. |
@@ -417,7 +312,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `ifconfig` | `ifconfig`, `ifconfig IFACE [ADDR] [netmask M] [gw G] [up\|down]` | Configuring needs root. |
 | `netstat` | `netstat [-t] [-u] [-s] [-i] [-a]` | Prints `/proc/net/*`. |
 | `httpd` | `httpd [-p PORT] [-r ROOT]` | Default 80 and `/www`; serves `/proc/...` live. `make run` forwards Mac port 8080. |
-| `rshd` | `rshd [-p PORT]` | Default 23; unauthenticated `sh -i` per connection. `make run` forwards Mac port 2323. |
+| `rshd` | `rshd [-p PORT]` | Default 23; unauthenticated `esh -i` per connection. `make run` forwards Mac port 2323. |
 | `echod` | `echod [-p PORT]` | TCP and UDP echo, default 7. `make run` forwards Mac UDP port 5555. |
 | `utests` | `utests [MODE]` | 40 user-space tests ending in `UTEST RESULT: PASS\|FAIL`. Modes `persist-check`, `crash-commit-write\|check`, `crash-log-write\|check` and `stress[:secs]` are used by `tools/run_tests.py`. |
 | `stress` | `stress [-j WORKERS] [-t SECS] [-n ITERS] [-v]` | Defaults: 8 workers, 10 s. Each iteration: an `echo \| cat` pipeline, file I/O in `/tmp`, a COW fork with `mmap`, and 16 KiB over loopback TCP. Prints `STRESS RESULT: PASS\|FAIL`. |
@@ -458,27 +353,10 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `free` | `free` | Copies `/proc/meminfo`. |
 | `sleep` | `sleep SECS[.FRACTION]` | Millisecond resolution (three fraction digits). |
 | `strace` | `strace CMD [ARGS...]` | `dbg_strace(1)` then `execvp`; the trace goes to the kernel log/console. |
-| `su` | `su [USER]` | `setgid`+`setuid` from `/etc/passwd` (only root can switch), `chdir` home, sets `HOME` and `USER`, execs `/bin/sh`. No password check. |
+| `su` | `su [USER]` | `setgid`+`setuid` from `/etc/passwd` (only root can switch), `chdir` home, sets `HOME`, `USER`, `LOGNAME` and `SHELL`, execs the user's shell from `/etc/passwd`. No password check. |
 | `dbg` | `dbg break \| mark TEXT \| vm \| files \| ps \| fscrash POINT` | Front end for `SYS_debug`. |
 | `uname` | `uname` | Prints `Eunuchs 0.1 riscv64`. |
 | `clear` | `clear` | ANSI home + clear screen. |
-
-### Shell grammar
-
-```
-line      := list? ('#' comment)?
-list      := pipeline (op pipeline)* ['&' | ';']
-op        := ';' | '&' | '&&' | '||'                  (left to right, equal precedence)
-pipeline  := command ('|' command)*                   (at most 8 commands)
-command   := assignment* (word | redirection)*        (at most 64 words, 8 redirections)
-assignment:= NAME '=' word                            (only before the first word)
-redirection := [digit] ('<' | '>' | '>>') word
-             | [digit] '>&' [digit]
-word      := ( plain-char | '\' char | "'" ... "'" | '"' ... '"' | '$' expansion )+
-expansion := NAME | '{' NAME '}' | '?' | '$' | '!'
-```
-
-Not supported: `if`/`while`/`for`/`case`, functions, subshells `( )`, groups `{ }`, command substitution, arithmetic, here-documents, `<&`, multi-digit fds, positional parameters (`$1`, `$#`, `$@`), `[...]` globs, aliases, history and line editing (editing is the TTY's canonical mode).
 
 ### Files in the disk image
 
@@ -486,9 +364,10 @@ Not supported: `if`/`while`/`for`/`case`, functions, subshells `( )`, groups `{ 
 
 | Path | Source |
 |---|---|
-| `/bin/<prog>` for every `user/bin/*.c` | `build/user/stripped/<prog>` (DWARF stripped, symbols kept) |
+| `/bin/<prog>` for every `user/bin/*.c` and every directory `user/bin/<prog>/` | `build/user/stripped/<prog>` (DWARF stripped, symbols kept) |
+| `/bin/sh` | hard link to `/bin/esh` |
 | `/bin/<applet>` for every `EUTILS_LINKS` name | hard link to `/bin/eutils` (`=@/bin/eutils`) |
-| `/etc/motd`, `/etc/passwd` | `user/etc/` |
+| `/etc/motd`, `/etc/passwd`, `/etc/hostname`, `/etc/eshrc` | `user/etc/` |
 | `/dev/`, `/proc/` | empty mount points |
 | `/tmp/` | mode 0777 |
 | `/www/`, `/www/index.html` | `user/www/index.html` |
@@ -496,11 +375,11 @@ Not supported: `if`/`while`/`for`/`case`, functions, subshells `( )`, groups `{ 
 
 The image is rebuilt whenever any program changes, which discards files created at run time.
 
-`/etc/passwd` has the standard seven fields. Only `lookup_user` in `eutils` reads it, and only the first 1023 bytes:
+`/etc/passwd` has the standard seven fields. `lookup_user` in `eutils` reads the first 1023 bytes (for `su`, `chown` and `id`); `esh` reads it for user names, home directories and `~user`:
 
 ```
-root:x:0:0:root:/:/bin/sh
-guest:x:1000:1000:guest:/home/guest:/bin/sh
+root:x:0:0:root:/:/bin/esh
+guest:x:1000:1000:guest:/home/guest:/bin/esh
 ```
 
 ### Adding a program or an applet
@@ -515,7 +394,9 @@ guest:x:1000:1000:guest:/home/guest:/bin/sh
 2. Add `foo` to `EUTILS_LINKS` in the Makefile.
 3. Update the comment at the top of `eutils.c` and the tables here.
 
-**A new libc function or system call wrapper:** add the code to `libc.c` (or `net.c` for networking) and the prototype to the right header in `user/include`. A new system call also needs an entry in `SYSCALLS` in `lib/include/uapi/syscall.h` and a kernel implementation. A new shell built-in goes in `run_builtin` in `sh.c`, and should be added to the `help` text.
+**A new libc function or system call wrapper:** add the code to `libc.c` (or `net.c` for networking) and the prototype to the right header in `user/include`. A new system call also needs an entry in `SYSCALLS` in `lib/include/uapi/syscall.h` and a kernel implementation. A new shell builtin is a function in `user/bin/esh/builtins.c` plus an entry (with its one-line help) in the `builtins[]` table.
+
+**A program from several files:** put the sources in `user/bin/NAME/`; the `UMULTI` rule links every `.c` there into `/bin/NAME`.
 
 ## Debugging and observability
 
@@ -525,7 +406,7 @@ guest:x:1000:1000:guest:/home/guest:/bin/sh
   - a symbolized user backtrace (`proc_user_backtrace`, up to 64 frames, recursion collapsed), which needs the frame pointers that `UCFLAGS` keep;
   - the memory map.
 
-  `segv` shows each kind. The shell then prints the signal description (`Segmentation fault (core dumped)`) and sets `$?` to `128 + sig`.
+  `segv` shows each kind. The shell then prints the signal description (`esh: segmentation fault (core dumped)  segv null`) and sets `$?` to `128 + sig`.
 - **strace.** `strace CMD` (eutils applet), `dbg_strace(1|2)` from code (2 also follows forks), or `strace <pid> [on|off|follow]` in the monitor. One line per call, decoded with the format strings in `SYSCALLS`, e.g. `[4 hello] write(1, "hello ..."..., 49) = 49`; errors show the `E*` name and message. The output goes to the kernel log/console, not the program's stderr.
 - **`dbg_*` hooks** (`eunuchs.h`, also the `dbg` applet):
   - `dbg_mark(msg)`: a trace event plus a log line. `utests` marks each test, and `malloc_die` marks aborts;
@@ -538,27 +419,14 @@ guest:x:1000:1000:guest:/home/guest:/bin/sh
 - **GDB.** `make debug` then `make gdb`; `eu-procs` lists processes. For source-level debugging of a program, `add-symbol-file build/user/bin/<prog>` (no offset is needed because every program is linked at `0x10000`). Since all programs share that address range, a breakpoint on a user address fires in whichever process is running there, so combine it with a condition or use `dbg_break()` in the program instead. `__restore_rt` has no CFI (`.eh_frame` is discarded anyway), so GDB may stop unwinding at a signal handler's caller.
 - **Profiling.** `profile run CMD` gives a quick report with user functions symbolized; `profile dump` plus `make flamegraph` on the host symbolizes user frames from `build/user/bin`.
 - **Heap.** `malloc_stats()` prints bytes in use and heap size; `/proc/<pid>/maps` shows the `heap` VMA. A `0x6b6b6b6b...` value in a register or a crash address almost always means use after free.
-- **Shell.** `sh -c '...'` runs one line non-interactively; `set` shows variables; `jobs` shows job state; `$?` holds `128 + signal` for killed jobs.
+- **Shell.** See [12-shell.md](12-shell.md#debugging-and-observability): `set -x`, `whence -v`, `typeset -p`, `jobs -l`.
 
 ## Limitations and known issues
 
-Shell (`sh.c`):
-
-- **Expansion happens for the whole line before any of it runs.** `lex` expands `$VAR`, `$?` and `~` for every pipeline on the line up front. So `false; echo $?` prints the status of the previous line, and `X=1; echo $X` prints the old value of `X`. Globs, by contrast, are expanded at parse time, just before each pipeline runs.
-- **`source` corrupts the rest of the calling line.** `run_file` → `run_line` → `lex` overwrites the global `toks[]`. When `. file; cmd` returns from `source`, the outer `run_line` keeps parsing at its old index in tokens that now belong to the last line of `file`.
-- **Redirections and prefix assignments are ignored for built-ins** other than `exec`: `pwd > f`, `jobs > f`, `set > f` and `help > f` write to the terminal. `A=1 > f` sets `A` but does not create `f`.
-- **Built-ins only run as a single foreground command.** `cd x &` or `jobs | cat` try to exec a program of that name.
-- **Job control in scripts targets the shell's own process group.** When not interactive, `j->pgid = getpgrp()`, so `kill %1` (or `fg`/`bg`) in a script signals the shell itself and everything in its group.
-- **Memory is never freed per line.** Every word `lex` or `glob` creates is `xstrdup`'d and never freed, so a long-running shell (or a long script) grows its heap with every command. `xstrdup` does not check for `NULL`.
-- **Silent truncation.** Lines over 1023 bytes are split; words over 64 per command are dropped; exported values over 255 bytes are truncated in `build_env`. More than 32 exported variables (or 4 KiB of argument and environment strings) makes `execve` fail with `E2BIG`, reported as `sh: cmd: Argument list too long`.
-- **Glob into a full argv.** If a command already has 64 words, `glob(..., max = 0)` still stores the unmatched pattern at `argv[64]` and returns 1, so `argc` becomes 65 and the terminating `NULL` slot is overwritten.
-- **`$?` after a stop is always 148**, even for `SIGSTOP` or `SIGTTIN`.
-- **No signal from `rshd` sessions.** The remote shell has no TTY, so there is no `^C` or job control.
-
 libc:
 
-- **`malloc` never coalesces** adjacent free blocks and never shrinks the heap. A program that alternates allocation sizes fragments and grows without bound. The LIFO free list reuses freed memory immediately, which hides use-after-free bugs, and the `0x6b` poison is written but never checked.
-- **`calloc` does not check `n * size` for overflow.** `setenv` does not check `malloc`'s result, and `unsetenv` leaks the strings `setenv` allocated.
+- **`malloc` reuses freed memory immediately** (first fit from the lowest address), which can hide use-after-free bugs, and the `0x6b` poison is written but never checked. It never shrinks the heap.
+- **`setenv` does not check `malloc`'s result,** and `unsetenv` leaks the strings `setenv` allocated.
 - **stdio.** Only stdout is buffered, and not flushed on `_exit`, crashes or `fork`. `printf`'s `write` result is ignored, so a short write to a pipe or socket loses data silently. `fprintf_fd` truncates at 511 bytes and does not flush stdout first unless it writes to fd 1, so stderr text can appear before earlier stdout text that has no newline.
 - **`execvp`** builds up to 255-byte paths, but the kernel accepts only 128-byte paths in `execve`. It returns immediately on any error other than `ENOENT` (e.g. `EACCES` in an early `PATH` entry), and an empty `PATH` component becomes `/file` instead of the current directory.
 - **Not reentrant**: `errno`, the stdout buffer, malloc and static result buffers (see Concurrency).
@@ -569,25 +437,20 @@ Commands:
 
 - **`tail -n 0`** prints the whole input: the loop `++lines == n` never matches 0. `tail` also ignores a failed `realloc`.
 - **Usage errors in `ln`, `mv`, `cp`, `chmod` and `chown`** produce `eutils: unknown tool 'X'` because the argument-count check is part of the dispatch condition.
-- **Commands read one byte per system call**: `head`, `grep` and the shell's `read_line`. `top` writes one byte per call. This is slow, and very visible under `strace`.
+- **Commands read one byte per system call**: `head`, `grep`, and `esh` when reading commands from a pipe or the `read` builtin (so that input meant for later commands stays unread). `top` writes one byte per call. This is slow, and very visible under `strace`.
 - **`ps` reads only 511 bytes** of each `status` file; **`lookup_user` reads only 1023 bytes** of `/etc/passwd`.
 - **`httpd`**: files over 64 KiB are truncated; `HEAD` replies say `Content-Length: 0`. The directory-listing loop stops only when `len` reaches `sizeof(body) - 300`, but one entry can add almost 400 bytes, so a listing that long could make `sizeof(body) - len` wrap and overflow `body`. An empty path (`GET  HTTP/1.0`) reads `path[-1]`.
 - **`echod`'s header comment** says it logs every connection and datagram; the code logs nothing after start-up. **`eutils.c`'s header comment** omits `crc32` and `profile`.
-- **`su` has no password check** (it relies on `setuid` failing for non-root), and **`rshd` has no authentication**. Both are deliberate for a local VM.
+- **`su` has no password check** (it relies on `setuid` failing for non-root), and **`rshd` has no authentication**. Both are deliberate for a local VM. A remote `esh -i` has no terminal, so there is no `^C`, job control or line editing.
 
 ## Potential improvements
 
-1. **Expand per pipeline, not per line** — Split `lex` into tokenizing (once per line) and expansion (in `run_line` just before each pipeline runs), and give `run_file` its own token array. That fixes `false; echo $?`, `X=1; echo $X`, and the `source` token-clobbering bug in one change. Impact: high. Effort: medium.
-2. **Apply redirections to built-ins** — Save fds 0-2 with `dup`, call `apply_redirs`, run the built-in, flush stdout, then restore. Without this, `pwd > f` and `jobs > f` write to the terminal. Impact: medium. Effort: small.
-3. **Free per-line allocations in the shell** — Free every `toks[].word` and globbed `argv` entry after the line runs (or use a per-line arena). This stops the interactive shell's heap from growing without bound. Impact: medium. Effort: small.
-4. **Correct job semantics in non-interactive shells** — Do not record a pgid (or refuse `kill %n`, `fg` and `bg`) when `interactive == 0`, so `kill %1` in a script cannot signal the shell's own process group. Impact: medium. Effort: small.
-5. **Coalescing allocator with stronger checks** — Keep blocks in address order (or add boundary tags) to merge neighbours. Make the free list FIFO, like the kernel slab, to delay reuse. Verify the `0x6b` poison on allocation (`memchr_inv`) to report writes after free. Add a tail canary for overruns. This turns malloc from a leak-prone list into a real use-after-free and overflow detector. Impact: high. Effort: medium.
-6. **Flush stdout before `fork` and on fatal paths** — Provide `fork()` that calls `fflush_stdout` first, and flush in `malloc_die`. That avoids duplicated and lost output, which is otherwise a common source of confusing test logs. Impact: medium. Effort: small.
-7. **Make `printf` handle short writes** — Loop in `fflush_stdout` until the buffer is fully written, or until a real error occurs. Output to sockets (`rshd`) and full pipes is otherwise silently truncated. Impact: medium. Effort: small.
-8. **Buffered input for line readers** — Add a small `read`-ahead buffer helper (or a minimal `FILE`/`fgets`) and use it in `sh.c` `read_line`, `grep` and `head`. Today they make one system call per byte, which dominates their run time and their `strace` output. The shell needs care to keep unread input for its children when reading stdin. Impact: medium. Effort: medium.
-9. **Fix `eutils` argument handling** — Separate "which tool" from "is the usage right" so `cp a` prints a usage message. Make `tail -n 0` print nothing and check `realloc`. Let `mv`/`cp` accept a directory target. Impact: low. Effort: small.
-10. **Harden `httpd`** — Bound the directory listing by the remaining space before each `snprintf`, handle an empty path, stream files instead of truncating at 64 KiB, and send the real `Content-Length` for `HEAD`. It is the one program reachable from the host network by default. Impact: medium. Effort: small.
-11. **Keep `execvp` and kernel limits consistent** — Return `ENAMETOOLONG` early for paths over the kernel's 128 bytes, keep searching `PATH` after `EACCES` (remembering the error), and treat empty `PATH` components as `.`. Impact: low. Effort: small.
-12. **Basic control flow in the shell** — `if`/`while`/`for` and positional parameters (`$1`, `$#`, `$@` for `sh file args`) would let test scripts and `/etc` start-up scripts be written in the shell instead of C test programs. Impact: medium. Effort: large.
-13. **Make signal handlers safer to write** — Save and restore `errno` around handler invocation in a libc trampoline, and document which libc functions are safe in handlers. Optionally add `SA_RESTART` to `signal()` to match BSD/glibc behaviour. Impact: low. Effort: small.
-14. **Unwind info for `__restore_rt` and correct header comments** — Add `.cfi_signal_frame`-style annotations (and keep a minimal `.eh_frame` for it) so GDB can unwind through signal handlers. Fix the stale comments in `uapi/signal.h` (`SA_RESTART`), `echod.c` and `eutils.c`. Impact: low. Effort: small.
+1. **Stronger allocator checks** — Neighbouring free blocks are merged now; next, delay reuse (a FIFO quarantine of recently freed blocks, like the kernel slab). Verify the `0x6b` poison on allocation (`memchr_inv`) to report writes after free. Add a tail canary for overruns. This turns malloc from a leak-prone list into a real use-after-free and overflow detector. Impact: high. Effort: medium.
+2. **Flush stdout before `fork` and on fatal paths** — Provide `fork()` that calls `fflush_stdout` first, and flush in `malloc_die`. That avoids duplicated and lost output, which is otherwise a common source of confusing test logs. Impact: medium. Effort: small.
+3. **Make `printf` handle short writes** — Loop in `fflush_stdout` until the buffer is fully written, or until a real error occurs. Output to sockets (`rshd`) and full pipes is otherwise silently truncated. Impact: medium. Effort: small.
+4. **Buffered input for line readers** — Add a small `read`-ahead buffer helper (or a minimal `FILE`/`fgets`) and use it in `grep` and `head`. Today they make one system call per byte, which dominates their run time and their `strace` output. Impact: medium. Effort: medium.
+5. **Fix `eutils` argument handling** — Separate "which tool" from "is the usage right" so `cp a` prints a usage message. Make `tail -n 0` print nothing and check `realloc`. Let `mv`/`cp` accept a directory target. Impact: low. Effort: small.
+6. **Harden `httpd`** — Bound the directory listing by the remaining space before each `snprintf`, handle an empty path, stream files instead of truncating at 64 KiB, and send the real `Content-Length` for `HEAD`. It is the one program reachable from the host network by default. Impact: medium. Effort: small.
+7. **Keep `execvp` and kernel limits consistent** — Return `ENAMETOOLONG` early for paths over the kernel's 128 bytes, keep searching `PATH` after `EACCES` (remembering the error), and treat empty `PATH` components as `.`. Impact: low. Effort: small.
+8. **Make signal handlers safer to write** — Save and restore `errno` around handler invocation in a libc trampoline, and document which libc functions are safe in handlers. Optionally add `SA_RESTART` to `signal()` to match BSD/glibc behaviour. Impact: low. Effort: small.
+9. **Unwind info for `__restore_rt` and correct header comments** — Add `.cfi_signal_frame`-style annotations (and keep a minimal `.eh_frame` for it) so GDB can unwind through signal handlers. Fix the stale comments in `uapi/signal.h` (`SA_RESTART`), `echod.c` and `eutils.c`. Impact: low. Effort: small.

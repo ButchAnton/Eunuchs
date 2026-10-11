@@ -413,11 +413,11 @@ TTY side (`kernel/drivers/tty.c`, a single `console_tty` that has `sid` and `pgr
 | Background read | `job_control` (from `tty_read`): if the caller's ctty is this tty and its `pgid` differs from `tty.pgrp`, then it returns `-EIO` when SIGTTIN is ignored or blocked; otherwise it sends SIGTTIN to the caller's whole group and returns `-ERESTARTSYS`. After a `fg`, the read restarts transparently. |
 | Background write | Not checked: there is no `TOSTOP` and no SIGTTOU. |
 
-The shell (`user/bin/sh.c`) is the main user:
-- it ignores SIGTSTP and SIGTTOU;
+The shell (`esh`, [12-shell.md](12-shell.md#job-control)) is the main user:
+- it ignores SIGTSTP, SIGTTIN and SIGTTOU, and catches SIGINT and SIGCHLD (without `SA_RESTART`);
 - it calls `setpgid` on both sides of `fork`;
 - it moves jobs to the foreground with `tcsetpgrp` and continues them with `kill(-pgid, SIGCONT)`;
-- it collects stops with `waitpid(..., WUNTRACED)`.
+- it collects stops with `waitpid(-1, ..., WUNTRACED)`, and relies on `SIGCHLD` to report background jobs while the user is typing.
 
 ### Credentials and permissions (`cred.c`)
 

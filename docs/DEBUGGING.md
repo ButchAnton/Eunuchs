@@ -90,15 +90,17 @@ The root filesystem is **efs** on a virtio disk, `build/fs.img`. `make` builds i
 
 ## User space and processes
 
-The system boots into `init`, which prints `/etc/motd` and runs **`/bin/sh`**.
+The system boots into `init`, which prints `/etc/motd` and runs the shell, **`esh`** (also `/bin/sh`), as a login shell.
 
-**The shell** supports:
-- pipelines (`|`) and lists (`;`, `&&`, `||`, `&`)
-- redirections: `<`, `>`, `>>`, `2>`, `2>&1`
-- quoting (`'…'`, `"…"`, `\x`) and expansion (`$VAR`, `$?`, `$$`, `$!`, `~`, `*`/`?` globs)
-- variables: `VAR=value cmd`, `export`, `unset`, `set`
-- jobs: `cmd &`, `jobs`, `fg`, `bg`, `wait`, `kill %n`; `^Z` stops the foreground job
-- `cd`, `umask`, `source`, `exec`, `help`, and script modes (`sh -c '…'`, `sh file`)
+**The shell** is zsh-like; [subsystems/12-shell.md](subsystems/12-shell.md) is its manual. In short:
+- the language: pipelines, lists, `if`/`while`/`for`/`case`, functions, arrays, `[[ ]]`, `(( ))`, here-documents, and zsh's expansions (`${x:-d}`, `${(U)x}`, `{1..9}`, `**/*.c`);
+- job control: `^Z`, `fg`, `bg`, `jobs`, `kill %1`; finished background jobs are reported right away;
+- editing: syntax highlighting, gray autosuggestions from history (Right accepts), Up/Down history search by prefix, `^R` incremental search, Tab completion with a menu on the second Tab, `!!`/`!$`/`^a^b`;
+- `help` lists builtins and keys; `setopt` shows the options; `/etc/eshrc` and `~/.eshrc` are the start-up files.
+
+Under `make run`, QEMU keeps `Ctrl-A` for itself (`Ctrl-A X` quits): press `Ctrl-A Ctrl-A` to move to the start of the line, or use Home.
+
+For debugging scripts and the shell itself: `set -x` traces commands after expansion, `whence -v`/`type` say what a name is, and `strace esh -c '...'` shows the system calls.
 
 **Utilities:**
 - files and text: `ls [-l] cat grep echo mkdir rm rmdir touch ln mv cp wc head tail tee stat chmod chown`

@@ -36,10 +36,17 @@ struct tty {
     struct termios t;
     char line[LINE_MAX + 1];
     int line_len;
-    char q[QUEUE];              /* readable input */
+    /*
+     * Readable input. Each entry is a character, or Q_EOF: the end of a
+     * line committed with ^D (no character; an empty one reads as EOF).
+     * `delims` counts the entries that end a canonical read ('\n' and
+     * Q_EOF) and is kept exact by every push and pop in either mode, so
+     * switching between raw and canonical mode (a line editor does it for
+     * every command) never leaves stale line counts behind.
+     */
+    u16 q[QUEUE];
     u32 qhead, qtail;
-    int eofs;                   /* pending ^D-on-empty-line markers */
-    int lines;                  /* complete lines in q (canonical mode) */
+    int delims;
     struct waitqueue rwait;
     int sid, pgrp;
     struct winsize ws;
@@ -110,32 +117,53 @@ static void erase_chars(struct tty *tty, int n)
     }
 }
 
-static void q_push(struct tty *tty, char c)
+#define Q_EOF 0x100
+
+static u32 q_room(struct tty *tty)
 {
-    if (tty->qhead - tty->qtail >= QUEUE) {
+    return QUEUE - (tty->qhead - tty->qtail);
+}
+
+static bool is_delim(u16 e)
+{
+    return e == '\n' || e == Q_EOF;
+}
+
+static void q_push(struct tty *tty, u16 e)
+{
+    if (!q_room(tty)) {
         tty->dropped++;
         return;
     }
-    tty->q[tty->qhead++ % QUEUE] = c;
+    tty->q[tty->qhead++ % QUEUE] = e;
+    tty->delims += is_delim(e);
+}
+
+static u16 q_pop(struct tty *tty)
+{
+    u16 e = tty->q[tty->qtail++ % QUEUE];
+    tty->delims -= is_delim(e);
+    return e;
 }
 
 static void flush_input(struct tty *tty)
 {
     tty->line_len = 0;
     tty->qhead = tty->qtail;
-    tty->lines = tty->eofs = 0;
+    tty->delims = 0;
 }
 
+/* A finished line: all of it (with its delimiter) or, if it can't fit, none. */
 static void commit_line(struct tty *tty, bool newline)
 {
+    if (q_room(tty) < (u32)tty->line_len + 1) {
+        tty->dropped += (u64)tty->line_len + 1;
+        tty->line_len = 0;
+        return;
+    }
     for (int i = 0; i < tty->line_len; i++)
-        q_push(tty, tty->line[i]);
-    if (newline)
-        q_push(tty, '\n');
-    if (!newline && !tty->line_len)
-        tty->eofs++;
-    else
-        tty->lines++;
+        q_push(tty, (u8)tty->line[i]);
+    q_push(tty, newline ? '\n' : Q_EOF);
     tty->line_len = 0;
 }
 
@@ -192,7 +220,7 @@ void tty_input(char c)
             tty->dropped++;
         }
     } else {
-        q_push(tty, c);
+        q_push(tty, (u8)c);
         echo_char(tty, c);
     }
 out:
@@ -209,7 +237,7 @@ out:
 static bool readable(struct tty *tty)
 {
     if (tty->t.c_lflag & ICANON)
-        return tty->lines > 0 || tty->eofs > 0;
+        return tty->delims > 0;
     return tty->qhead != tty->qtail;
 }
 
@@ -242,19 +270,21 @@ static long tty_read(struct file *f, void *buf, size_t n, bool user)
     size_t got = 0;
     unsigned long flags = spin_lock_irqsave(&tty->lock);
     bool canon = tty->t.c_lflag & ICANON;
-    if (canon && tty->lines == 0 && tty->eofs > 0) {
-        tty->eofs--;                    /* ^D on an empty line: EOF */
-    } else {
-        while (got < MIN(n, sizeof(tmp)) && tty->qtail != tty->qhead) {
-            char c = tty->q[tty->qtail++ % QUEUE];
-            tmp[got++] = c;
-            if (canon && c == '\n') {
-                tty->lines--;
+    /*
+     * Canonical: up to and including the next newline, or up to a ^D
+     * marker (consumed; nothing before it on the line means EOF, a 0 read).
+     * Raw: whatever is queued; ^D markers left from canonical input vanish.
+     */
+    while (got < MIN(n, sizeof(tmp)) && tty->qtail != tty->qhead) {
+        u16 e = q_pop(tty);
+        if (e == Q_EOF) {
+            if (canon)
                 break;
-            }
+            continue;
         }
-        if (canon && got && tmp[got - 1] != '\n' && tty->qtail == tty->qhead && tty->lines > 0)
-            tty->lines--;               /* a ^D-terminated line was consumed */
+        tmp[got++] = (char)e;
+        if (canon && e == '\n')
+            break;
     }
     spin_unlock_irqrestore(&tty->lock, flags);
     if (user ? copy_to_user((uintptr_t)buf, tmp, got) : (memcpy(buf, tmp, got), 0))
@@ -332,6 +362,16 @@ static long tty_ioctl(struct file *f, unsigned long req, uintptr_t arg)
         return 0;
     case TIOCGWINSZ:
         return copy_to_user(arg, &tty->ws, sizeof(tty->ws));
+    case TIOCSWINSZ: {
+        /* The serial line can't report a size; the shell measures the
+         * terminal (cursor-position query) and records it here for others. */
+        struct winsize ws;
+        if (copy_from_user(&ws, arg, sizeof(ws)))
+            return -EFAULT;
+        if (ws.ws_row && ws.ws_col)
+            tty->ws = ws;
+        return 0;
+    }
     case FIONREAD: {
         int n = (int)(tty->qhead - tty->qtail);
         return copy_to_user(arg, &n, sizeof(n));
@@ -387,8 +427,8 @@ void tty_print(print_fn print)
     flagstr(print, "lflag", tty->t.c_lflag, lf, ARRAY_SIZE(lf));
     flagstr(print, "iflag", tty->t.c_iflag, inf, ARRAY_SIZE(inf));
     flagstr(print, "oflag", tty->t.c_oflag, of, ARRAY_SIZE(of));
-    print("  line being edited: \"%.*s\" (%d chars); queued %u bytes, %d lines, %d EOFs\n",
-          tty->line_len, tty->line, tty->line_len, tty->qhead - tty->qtail, tty->lines, tty->eofs);
+    print("  line being edited: \"%.*s\" (%d chars); queued %u entries, %d complete lines\n",
+          tty->line_len, tty->line, tty->line_len, tty->qhead - tty->qtail, tty->delims);
     print("  in %lu, out %lu, dropped %lu, signals sent %lu\n", (unsigned long)tty->in,
           (unsigned long)tty->out, (unsigned long)tty->dropped, (unsigned long)tty->sigs);
 }

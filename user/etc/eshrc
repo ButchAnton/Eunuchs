@@ -1,0 +1,17 @@
+# /etc/eshrc: read by every interactive esh, before ~/.eshrc.
+# `help` lists builtins and keys; `setopt` shows the options that are on.
+
+setopt autocd autopushd pushdsilent pushdignoredups correct
+setopt histignoredups histignorespace
+
+# user@host:dir% , and the exit status on the right when it isn't 0
+PROMPT='%F{green}%n@%m%f:%F{blue}%~%f%# '
+RPROMPT='%(?..%F{red}%?%f)'
+
+alias ll='ls -l'
+alias l='ls'
+alias ..='cd ..'
+alias ...='cd ../..'
+alias h='history'
+alias j='jobs -l'
+alias d='dirs -v'

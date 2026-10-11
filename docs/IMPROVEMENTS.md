@@ -39,7 +39,6 @@ The system is a single-user teaching OS running in a VM, but it does have users 
 | H2 | Retry loop on safe accesses to user memory (likely) | `arch/riscv/trap.c: trap_handler`: the copy-on-write/demand-paging retry matches every exception-table entry, including `safe_read_*` | A `safe_read` of a mapped user address (monitor `mem 0x10000` after a user breakpoint, a backtrace into user space) faults forever |
 | H3 | netd can miss its wakeup | `net/net.c: netd`: checks for pending timers, drops `net_lock`, then waits; a `net_kick` in between is lost | TCP timers stall until the next packet arrives |
 | H4 | Any trap after a stack overflow halts | `arch/riscv/trap.c: stack_overflow`: `overflow_sp` is never cleared | The overflow report's own `safe_read` faults turn into "overflow while handling overflow" and QEMU exits |
-| H5 | Spurious end-of-file on the terminal | `drivers/tty.c`: `lines`/`eofs` accounting (raw reads never decrement `lines`; type-ahead `abc^D def\n`; full queue) | After a raw-mode program (or certain type-ahead), the shell can read EOF and exit |
 | H6 | Monitor commands allocate memory | `debug/monitor.c` → `trace_dump_file`, `profile_report`, `profile_start`, `kmalloc` | If a parked CPU holds a slab lock, the monitor wedges |
 | H7 | Tests that hang instead of failing | `user/bin/utests.c: t_tcp_loopback_echo` (poll loop never ends), `user/bin/stress.c: tcp_round` (`accept` waits forever) | A failure shows up only as a timeout, with no hint of which check failed |
 | H8 | Persist probes and orphans never give up | `net/tcp.c: retransmit_timeout` | A closed socket whose peer vanished with a zero window lives forever |
@@ -58,18 +57,12 @@ The system is a single-user teaching OS running in a VM, but it does have users 
 | C7 | Missing memory barrier in virtqueues | `drivers/virtio.c: virtq_get` (no fence between reading `used->idx` and the ring entry) | Could read a stale completion on real weakly ordered hardware |
 | C8 | Lost receive buffers | `drivers/virtio_net.c: post_rx` (a failed refill is never retried) | The receive ring shrinks for good under memory pressure |
 | C9 | Restart after `rt_sigreturn` | `proc/syscall.c: syscall_dispatch` + `signal.c: do_rt_sigreturn` | If the restored `a0` is -512, the interrupted context is rewound and changed |
-| C10 | Shell keeps writing past `argv` | `user/bin/sh.c: parse_pipeline` + `glob` with 64 words | Writes `argv[64]` |
 | C11 | `httpd` directory listing can overflow its buffer | `user/bin/httpd.c: handle` | One long entry wraps `sizeof(body) - len` |
 | C12 | Process freed while still listed | `proc/proc.c: proc_spawn` failure path frees a proc still in `all_procs` | Dangling list entry (needs an allocation failure) |
 | C13 | Wrong FIN acknowledgement in simultaneous open | `net/tcp.c: ack_advance` | `fin_was_acked` set too early (rare path) |
 
 ### 1.4 Wrong behavior
 
-- **Shell:**
-  - It expands the whole line before running any of it, so `false; echo $?` and `X=1; echo $X` print stale values (`sh.c: lex`/`run_line`).
-  - `source` clobbers the outer line's tokens.
-  - Built-ins ignore redirections.
-  - Job control in non-interactive shells signals the shell's own group.
 - **Signals:**
   - `kill` of a running process waits for its next trap (no IPI).
   - `SA_RESTART` restarts `nanosleep` for its full time.
@@ -109,6 +102,11 @@ These were all reported by the reviews:
 
 The stale statements in `docs/` were fixed during the review; the comments in the source are still to do.
 
+### 1.6 Fixed since the review
+
+- **H5, spurious end-of-file on the terminal.** The TTY input queue now stores `^D` as a marker entry (`Q_EOF`) in line with the text, and one counter of line ends is kept right by every push and pop, in every mode ([07](subsystems/07-devices-and-tty.md#tty-read-tty_read)).
+- **C10 and the old shell's wrong behavior.** The shell was replaced by [esh](subsystems/12-shell.md). It expands each command when it runs, applies redirections to builtins, has its own state per `source`, and frees per-command memory. It has no fixed word limits, and doesn't use process groups when not interactive.
+
 ## 2. Top recommendations
 
 Ranked by value for effort. The first group is mostly small fixes for the bugs above. The second makes future bugs cheaper to find. The third extends the system.
@@ -123,7 +121,7 @@ Ranked by value for effort. The first group is mostly small fixes for the bugs a
 | 4 | Make double frees of coalesced pages detectable (poison and flag every page of a free block) | H | S | C1 |
 | 5 | Limit the uaccess retry to `copy_*_user` instructions (a separate exception table or flag) | H | S | H2 |
 | 6 | Fix `strace_enter` bounds; clear `overflow_sp` after reporting | H | S | S5, H4 |
-| 7 | Fix the TTY line/EOF accounting, with line-discipline unit tests | H | S | H5 |
+| 7 | Line-discipline unit tests (`KTEST`s feeding `tty_input`), now that the accounting is fixed | M | S | |
 | 8 | Fix netd's lost kick (check for work after `prepare_to_wait`, under the lock) | H | S | H3 |
 | 9 | Fix the inode reuse race and the `vfs_read_all` use-after-free; take `alloc_lock` | H | S | C2–C4 |
 | 10 | No allocation in monitor paths (preallocate, or refuse while the world is stopped) | H | S | H6 |
@@ -143,9 +141,9 @@ Ranked by value for effort. The first group is mostly small fixes for the bugs a
 
 | Rank | Improvement | Impact | Effort |
 |---:|---|:-:|:-:|
-| 17 | Shell: expand per pipeline, redirections for built-ins, control flow (`if`, `while`, `for`) and positional parameters | H | M |
+| 17 | Shell: regular expressions for `[[ =~ ]]`, extended globbing and glob qualifiers, `SIGWINCH` from the console | M | M |
 | 18 | TCP: NewReno fast recovery, delayed ACKs and Nagle, window scaling with configurable buffers | M | M |
-| 19 | User-space C library: coalescing malloc with checked poison and canaries; buffered input; flush before `fork` | H | M |
+| 19 | User-space C library: malloc with checked poison, canaries and delayed reuse; buffered input; flush before `fork` | H | M |
 | 20 | Scheduler: per-CPU run queues, or at least last-CPU affinity; split `sched_lock`; ticket spinlocks | M | L |
 
 ## 3. Cross-cutting themes
@@ -156,7 +154,7 @@ Patterns that showed up in several independent reviews. Fixing them as patterns,
    - the command line (32 words, 256 bytes) and the `log=` spec (128 bytes);
    - reserved regions, harts and virtio devices (8 each);
    - ppoll wait registrations (128) and the environment (63 entries);
-   - stdout lines (511 bytes), shell lines (1023 bytes), `getdents64` names, `httpd` files over 64 KiB;
+   - stdout lines (511 bytes), `getdents64` names, `httpd` files over 64 KiB;
    - the ARP and lockdep class tables.
 
    Several of these drop data with no message; a dropped reserved region could even hand firmware memory to the allocator. A `WARN_ONCE`-style helper that reports the first truncation per site would make all of them visible at boot or at first use.
@@ -249,7 +247,6 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Smaller items: `getdents64` names; harden `vfs_getcwd`; root-only `DBG_FSCRASH`; `eu-files` for pipes.
 
 ### [Devices and the terminal](subsystems/07-devices-and-tty.md#potential-improvements)
-- TTY line accounting (H/S).
 - `VMIN`/`VTIME` and `O_NONBLOCK` (M/M).
 - Retry receive-buffer refills and export the driver counters (M/S).
 - virtqueue barrier, config generation, reset wait (M/S).
@@ -258,7 +255,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - SIGTTOU and ioctl validation (M/S).
 - Interrupt-driven, buffered UART output (M/M).
 - Line-discipline ktests (M/S).
-- Smaller items: `OPOST`, window size and SIGWINCH; `EVENT_IDX` and batched kicks; scatter-gather I/O; a driver registry; `_POSIX_VDISABLE`.
+- Smaller items: `OPOST` and SIGWINCH; `EVENT_IDX` and batched kicks; scatter-gather I/O; a driver registry; `_POSIX_VDISABLE`.
 
 ### [Networking](subsystems/08-networking.md#potential-improvements)
 - netd lost kick (H/S).
@@ -285,17 +282,20 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Smaller items: profiler rate and dump fixes; user symbolization per process; full trace dumps while stopped; semihosting in replays; a sorted symbol index.
 
 ### [User space](subsystems/10-user-space.md#potential-improvements)
-- Expand per pipeline (H/M).
-- A coalescing malloc with real checks (H/M).
-- Redirections for built-ins (M/S).
-- Free per-line shell memory (M/S).
-- Correct job semantics in non-interactive shells (M/S).
+- A malloc with real checks: delayed reuse, checked poison, canaries (H/M).
 - Flush before `fork` (M/S).
 - `printf` short writes (M/S).
 - Buffered line input (M/M).
 - Harden `httpd` (M/S).
-- Control flow in the shell (M/L).
 - Smaller items: eutils arguments; consistent `execvp` limits; safer signal handlers; unwind information for `__restore_rt`.
+
+### [The shell](subsystems/12-shell.md#potential-improvements)
+- Regular expressions for `[[ =~ ]]` (M/M).
+- Extended globbing and glob qualifiers (M/M).
+- More completion: program arguments, hosts, pids (M/M).
+- vi mode and `bindkey` (M/M).
+- `SIGWINCH` from the console (L/S).
+- Smaller items: cache parsed functions; shared history between running shells; wide characters; time zones; process substitution.
 
 ### [Build and testing](subsystems/11-build-and-testing.md#potential-improvements)
 - Stage selection (H/M).

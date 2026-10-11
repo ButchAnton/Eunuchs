@@ -61,6 +61,11 @@ UCFLAGS := -march=rv64imac -mabi=lp64 -mcmodel=medany \
 ULIB    := $(BUILD)/user/lib/crt0.o $(BUILD)/user/lib/syscall.o $(BUILD)/user/lib/libc.o \
            $(BUILD)/user/lib/printf.o $(BUILD)/user/lib/string.o $(BUILD)/user/lib/net.o
 UPROGS  := $(patsubst user/bin/%.c,$(BUILD)/user/bin/%,$(wildcard user/bin/*.c))
+# Programs spread over several files: user/bin/NAME/*.c -> /bin/NAME
+UMULTI  := $(notdir $(patsubst %/,%,$(dir $(wildcard user/bin/*/*.c))))
+UMULTI  := $(sort $(UMULTI))
+UPROGS  += $(addprefix $(BUILD)/user/bin/,$(UMULTI))
+UMULTI_OBJS := $(patsubst user/bin/%.c,$(BUILD)/user/multi/%.o,$(wildcard user/bin/*/*.c))
 # --- Disk image: user programs and a few directories, built by the host mkfs ---
 MKFS    := $(BUILD)/tools/mkfs
 FSIMG   := $(BUILD)/fs.img
@@ -68,8 +73,9 @@ FS_MB   ?= 32
 EUTILS_LINKS = echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile \
                true false yes kill date dmesg free sleep strace su dbg uname clear
 FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(notdir $(p))) \
-           $(foreach l,$(EUTILS_LINKS),/bin/$(l)=@/bin/eutils) \
-           /etc/motd=user/etc/motd /etc/passwd=user/etc/passwd /dev/ /proc/ /tmp/:0777 \
+           $(foreach l,$(EUTILS_LINKS),/bin/$(l)=@/bin/eutils) /bin/sh=@/bin/esh \
+           /etc/motd=user/etc/motd /etc/passwd=user/etc/passwd /etc/hostname=user/etc/hostname \
+           /etc/eshrc=user/etc/eshrc /dev/ /proc/ /tmp/:0777 \
            /www/ /www/index.html=user/www/index.html \
            /home/ /home/guest/:0755:1000:1000
 DISKOPTS = -global virtio-mmio.force-legacy=false \
@@ -147,6 +153,19 @@ $(BUILD)/user/%.o: user/%.S
 $(BUILD)/user/bin/%: $(BUILD)/user/bin/%.o $(ULIB) user/user.ld
 	$(call msg,ULD,$@)
 	$(Q)$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ $< $(ULIB) -lgcc
+
+$(BUILD)/user/multi/%.o: user/bin/%.c
+	@mkdir -p $(dir $@)
+	$(call msg,UCC,$<)
+	$(Q)$(CC) $(UCFLAGS) -MMD -MP -c $< -o $@
+
+# A multi-file program links every object in its directory.
+define MULTI_RULE
+$(BUILD)/user/bin/$(1): $(patsubst user/bin/$(1)/%.c,$(BUILD)/user/multi/$(1)/%.o,$(wildcard user/bin/$(1)/*.c)) $(ULIB) user/user.ld
+	$$(call msg,ULD,$$@)
+	$$(Q)$$(CC) $$(UCFLAGS) -nostdlib -static -T user/user.ld -o $$@ $$(filter %.o,$$^) -lgcc
+endef
+$(foreach p,$(UMULTI),$(eval $(call MULTI_RULE,$(p))))
 
 # The disk image gets copies without DWARF (symbol tables stay, for the
 # kernel's user backtraces); the full binaries in build/user/bin are for GDB.
@@ -341,4 +360,4 @@ test-host: $(HOST_TESTS) $(MKFS) $(BUILD)/user/bin/hello
 clean:
 	rm -rf $(BUILD)
 
--include $(KOBJS:.o=.d) $(ULIB:.o=.d) $(UPROGS:=.d)
+-include $(KOBJS:.o=.d) $(ULIB:.o=.d) $(UPROGS:=.d) $(UMULTI_OBJS:.o=.d)

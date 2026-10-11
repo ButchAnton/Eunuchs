@@ -7,6 +7,7 @@ on failure the tail of the log is shown.
 """
 import argparse
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -14,6 +15,11 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# Terminal control sequences from the shell's line editor (colors, cursor
+# movement, OSC 133 prompt marks): dropped from what tests match against.
+ESCAPES = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[78=>]")
 
 
 class Console:
@@ -24,7 +30,19 @@ class Console:
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT)
         self.buf = b""
+        self.raw = b""          # undecoded tail: possibly the start of an escape sequence
         self.log = log
+
+    def _add(self, d):
+        self.raw += d
+        cut = self.raw.rfind(b"\x1b")
+        keep = b""
+        if cut >= 0 and not ESCAPES.match(self.raw, cut) and len(self.raw) - cut < 64:
+            self.raw, keep = self.raw[:cut], self.raw[cut:]
+        text = ESCAPES.sub(b"", self.raw)
+        self.raw = keep
+        self.buf += text
+        self.log.write(text.decode("utf-8", "replace"))
 
     def expect(self, text, timeout=10):
         import select
@@ -39,8 +57,7 @@ class Console:
                 d = os.read(self.p.stdout.fileno(), 65536)
                 if not d:
                     raise EOFError("console closed while expecting %r" % text)
-                self.buf += d
-                self.log.write(d.decode("utf-8", "replace"))
+                self._add(d)
         i = self.buf.index(want) + len(want)
         self.buf = self.buf[i:]
 
@@ -304,16 +321,21 @@ def main():
         ("echo abc > /tmp/f; wc -c /tmp/f", "4"),
         ("cat", None, False), (b"\x03", None),             # ^C interrupts cat
         ("echo status=$?", "status=130"),
-        ("sleep 30", None, False), (b"\x1a", "Stopped  sleep 30"),  # ^Z
-        ("jobs", "[1]  Stopped  sleep 30"),
-        ("kill %1", None),
-        ("sleep 0.2", "Terminated  sleep 30"),          # reported at the next prompt
+        ("sleep 30", None, False), (b"\x1a", "esh: suspended  sleep 30"),  # ^Z
+        ("jobs", "[1]  + suspended  sleep 30"),
+        ("kill %1", "[1]  + terminated  sleep 30"),    # reported as soon as it happens
         ("sleep 1 &", "[1] "), ("wait", None),
         ("V=hi sh -c 'echo inner=$V'", "inner=hi"),
         ("false || echo or-ok && echo and-ok", "and-ok"),
-        ("nosuch", "command not found"),
-        ("segv null", "Segmentation fault (core dumped)"),
-        ("su guest", None, False), (None, "guest@eunuchs:/home/guest$ ", False),
+        ("nosuch", "esh: command not found: nosuch"),
+        ("segv null", "esh: segmentation fault (core dumped)  segv null"),
+        ("x=(a b c); echo ${#x} $x[2] ${(U)x[3]}", "3 b C"),
+        ("f() { echo f:$1; return 3 }; f arg; echo rc=$?", "rc=3"),
+        ("for i in {1..3}; do print -n $i; done; echo", "123\r\n"),
+        ("echo $(( 6 * 7 )) ${HOME:-none} ~", "42 / /"),
+        ("[[ abc == a* ]] && echo cond-ok", "cond-ok"),
+        ("cat <<EOF", None, False), ("one $((1+1))", None, False), ("EOF", "one 2"),
+        ("su guest", None, False), (None, "guest@eunuchs:~% ", False),
         ("id", "uid=1000(guest)"),
         ("touch /etc/nope", "Permission denied"),
         ("exit", None),

@@ -36,8 +36,9 @@ Each document has the same structure:
 | 7 | [Devices and the terminal](subsystems/07-devices-and-tty.md) | virtio transport, block and network drivers, UART, TTY line discipline, RTC | `kernel/drivers/` |
 | 8 | [Networking](subsystems/08-networking.md) | Netbufs, interfaces, ARP, IPv4/ICMP, UDP, TCP, sockets | `kernel/net/` |
 | 9 | [Debugging internals](subsystems/09-debugging-internals.md) | How the monitor, trace, profiler, backtraces, ktest and GDB helpers are built and extended | `kernel/debug/`, `tools/` |
-| 10 | [User space](subsystems/10-user-space.md) | libc, program startup, the shell, every command | `user/` |
+| 10 | [User space](subsystems/10-user-space.md) | libc, program startup, every command | `user/` |
 | 11 | [Build and testing](subsystems/11-build-and-testing.md) | Toolchain, Makefile, disk image, QEMU setups, test suites, CI | `Makefile`, `tools/`, `tests/` |
+| 12 | [The shell](subsystems/12-shell.md) | esh: the zsh-like language, job control, the line editor (manual and internals) | `user/bin/esh/` |
 
 ## Reading paths
 

@@ -547,9 +547,12 @@ long strtol(const char *s, char **end, int base)
 }
 
 /* ---- malloc ----
- * First-fit free list over sbrk. Each block has a header with a magic
- * number; free() checks it (catches frees of bad pointers, double frees and
- * header overwrites) and poisons the memory with 0x6b like the kernel. */
+ * First-fit over an address-ordered free list on top of sbrk. free() merges
+ * a block with free neighbours, so memory freed in a long-running program
+ * (the shell) can be reused for bigger requests instead of fragmenting.
+ * Each block has a header with a magic number; free() checks it (catches
+ * frees of bad pointers, double frees and header overwrites) and poisons the
+ * memory with 0x6b like the kernel. */
 
 #define MAGIC_USED 0xa110c8edUL
 #define MAGIC_FREE 0xf4eeb10cUL
@@ -557,7 +560,7 @@ long strtol(const char *s, char **end, int base)
 struct block {
     unsigned long magic;
     size_t size;            /* usable bytes */
-    struct block *next;     /* free list */
+    struct block *next;     /* free list, in address order */
     unsigned long pad;
 };
 
@@ -566,27 +569,62 @@ static size_t heap_used, heap_total;
 
 static void malloc_die(const char *what, void *p)
 {
+    fflush_stdout();
     fprintf_fd(2, "malloc: %s (%p) -- heap corruption or bad pointer\n", what, p);
     dbg_mark("malloc abort");
     _exit(134);
 }
 
+static char *block_end(struct block *b)
+{
+    return (char *)(b + 1) + b->size;
+}
+
+/* Put a free block in the list (address order), merging with neighbours. */
+static void free_insert(struct block *b)
+{
+    struct block *prev = 0, *cur = free_list;
+    while (cur && cur < b) {
+        prev = cur;
+        cur = cur->next;
+    }
+    b->magic = MAGIC_FREE;
+    b->next = cur;
+    if (prev)
+        prev->next = b;
+    else
+        free_list = b;
+    if (cur && block_end(b) == (char *)cur) {
+        b->size += sizeof(struct block) + cur->size;
+        b->next = cur->next;
+        cur->magic = 0;
+    }
+    if (prev && block_end(prev) == (char *)b) {
+        prev->size += sizeof(struct block) + b->size;
+        prev->next = b->next;
+        b->magic = 0;
+    }
+}
+
 void *malloc(size_t n)
 {
+    if (n > ((size_t)1 << 40))
+        return 0;
     n = (n + 15) & ~15UL;
     struct block **pp = &free_list;
     for (struct block *b = free_list; b; pp = &b->next, b = b->next) {
         if (b->magic != MAGIC_FREE)
             malloc_die("free list corrupted", b);
         if (b->size >= n) {
-            *pp = b->next;
-            if (b->size - n >= sizeof(struct block) + 16) {    /* split off the rest */
+            if (b->size - n >= sizeof(struct block) + 16) {    /* split: the rest keeps b's place */
                 struct block *rest = (struct block *)((char *)(b + 1) + n);
                 rest->magic = MAGIC_FREE;
                 rest->size = b->size - n - sizeof(struct block);
-                rest->next = free_list;
-                free_list = rest;
+                rest->next = b->next;
+                *pp = rest;
                 b->size = n;
+            } else {
+                *pp = b->next;
             }
             b->magic = MAGIC_USED;
             heap_used += b->size;
@@ -604,10 +642,8 @@ void *malloc(size_t n)
     b->size = n;
     if (chunk - need >= sizeof(struct block) + 16) {
         struct block *rest = (struct block *)((char *)(b + 1) + n);
-        rest->magic = MAGIC_FREE;
         rest->size = chunk - need - sizeof(struct block);
-        rest->next = free_list;
-        free_list = rest;
+        free_insert(rest);
     } else {
         b->size = chunk - sizeof(struct block);
     }
@@ -625,14 +661,14 @@ void free(void *p)
     if (b->magic != MAGIC_USED)
         malloc_die("free of a pointer malloc did not return", p);
     memset(p, 0x6b, b->size);
-    b->magic = MAGIC_FREE;
-    b->next = free_list;
-    free_list = b;
     heap_used -= b->size;
+    free_insert(b);
 }
 
 void *calloc(size_t n, size_t size)
 {
+    if (size && n > ((size_t)-1) / size)
+        return 0;
     void *p = malloc(n * size);
     if (p)
         memset(p, 0, n * size);

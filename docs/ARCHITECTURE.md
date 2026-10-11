@@ -16,7 +16,7 @@ About 30,000 lines in all:
 | `kernel/debug/` | 2,300 | monitor, symbols, backtraces, trace, profiler, lockdep, tests |
 | `kernel/tests/` | 1,400 | in-kernel unit tests (`KTEST`) |
 | `lib/` | 500 | printf and string code shared by kernel and user, ABI headers (`uapi/`) |
-| `user/` | 5,000 | libc, shell and about 60 commands |
+| `user/` | 17,000 | libc, the shell `esh` (13,000 of them) and about 60 commands |
 | `tools/`, `tests/host/` | 3,000 | mkfs/fsck, GDB helpers, trace and profile tools, test drivers, host tests |
 
 ## Machine and boot
@@ -128,7 +128,7 @@ Watch: `ps`, `sched`, `cpus`, `cpu <n>`, `locks` and `lockdep` in the monitor; `
 
 **Credentials** (`cred.c`): real, effective and saved uid/gid, permission checks in the VFS, setuid executables, umask.
 
-**User space** (`user/`): `crt0.S`, system call stubs and a small libc (stdio, a malloc with debugging checks, sockets, `poll`/`select`, termios). `init` runs `sh`, which has pipelines, redirection, variables, job control and built-ins. `eutils` is one binary behind 32 command names (`echo`, `cp`, `kill`, `profile`, `crc32`, ...).
+**User space** (`user/`): `crt0.S`, system call stubs and a small libc (stdio, a malloc with debugging checks, sockets, `poll`/`select`, termios). `init` runs the shell, `esh` (also `/bin/sh`): a zsh-like language (functions, arrays, `[[ ]]`, here-documents, zsh's expansion rules), job control, and a line editor with syntax highlighting, autosuggestions, history search and Tab completion ([12-shell.md](subsystems/12-shell.md)). `eutils` is one binary behind 32 command names (`echo`, `cp`, `kill`, `profile`, `crc32`, ...).
 
 Watch: `procs`, `ubt <pid>`, `vm <pid>`, `files <pid>` and `strace <pid>` in the monitor; `/proc/<pid>/{status,maps,fds,stack,ustack}`; a fault report for every crashed program.
 

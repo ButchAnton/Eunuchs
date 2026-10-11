@@ -145,7 +145,8 @@ static int tee(int argc, char **argv)
     return 0;
 }
 
-static int lookup_user(const char *name, int *uid, int *gid, char *home, size_t hlen)
+static int lookup_user(const char *name, int *uid, int *gid, char *home, size_t hlen,
+                       char *shell, size_t slen)
 {
     char buf[1024];
     int fd = open("/etc/passwd", O_RDONLY);
@@ -172,6 +173,8 @@ static int lookup_user(const char *name, int *uid, int *gid, char *home, size_t 
             *uid = atoi(f[2]);
             *gid = atoi(f[3]);
             snprintf(home, hlen, "%s", k >= 5 ? f[5] : "/");
+            if (shell)
+                snprintf(shell, slen, "%s", k >= 6 && f[6][0] ? f[6] : "/bin/sh");
             return 0;
         }
         line = next;
@@ -384,7 +387,8 @@ int main(int argc, char **argv)
         int uid, gid;
         char home[128];
         const char *who = argc > 1 ? argv[1] : "root";
-        if (lookup_user(who, &uid, &gid, home, sizeof(home)) < 0) {
+        char shell[128];
+        if (lookup_user(who, &uid, &gid, home, sizeof(home), shell, sizeof(shell)) < 0) {
             eprintf("su: no user %s in /etc/passwd\n", who);
             return 1;
         }
@@ -393,9 +397,12 @@ int main(int argc, char **argv)
         chdir(home);
         setenv("HOME", home, 1);
         setenv("USER", who, 1);
-        char *sh[] = { "/bin/sh", 0 };
+        setenv("LOGNAME", who, 1);
+        setenv("SHELL", shell, 1);
+        unsetenv("HISTFILE");
+        char *sh[] = { shell, 0 };
         execv(sh[0], sh);
-        return fail("/bin/sh");
+        return fail(shell);
     }
     if (!strcmp(prog, "kill")) {
         int sig = SIGTERM, i = 1;
@@ -445,7 +452,7 @@ int main(int argc, char **argv)
             gid = atoi(colon + 1);
         }
         int g;
-        if (lookup_user(argv[1], &uid, &g, home, sizeof(home)) < 0) {
+        if (lookup_user(argv[1], &uid, &g, home, sizeof(home), 0, 0) < 0) {
             eprintf("chown: unknown user %s\n", argv[1]);
             return 1;
         }

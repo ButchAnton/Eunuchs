@@ -24,7 +24,7 @@ static pid_t start(char **argv)
 int main(int argc, char **argv)
 {
     int once = argc > 1 && !strcmp(argv[1], "-1");
-    char *dflt[] = { "/bin/sh", 0 };
+    char *dflt[] = { "/bin/esh", "-l", 0 };
     char **prog = argc > (once ? 2 : 1) ? argv + (once ? 2 : 1) : dflt;
 
     printf("init: pid %d, running %s%s\n", getpid(), prog[0], once ? " once" : "");

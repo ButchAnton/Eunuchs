@@ -197,12 +197,11 @@ There is exactly one TTY, `console_tty` (`kernel/drivers/tty.c`):
 | `lock` | Spinlock `"tty"` |
 | `t` | Current `struct termios` |
 | `line[LINE_MAX + 1]`, `line_len` | Canonical-mode line being edited (`LINE_MAX` = 255) |
-| `q[QUEUE]`, `qhead`, `qtail` | Readable input ring, `QUEUE` = 1024 bytes; free-running u32 indexes |
-| `lines` | Complete lines in `q` (canonical mode) |
-| `eofs` | Pending "^D on an empty line" markers |
+| `q[QUEUE]`, `qhead`, `qtail` | Readable input ring of 1024 16-bit entries: a byte, or the marker `Q_EOF` (0x100) where `^D` ended a line; free-running u32 indexes |
+| `delims` | Entries in `q` that end a canonical read (`'\n'` and `Q_EOF`); maintained by `q_push`/`q_pop` in every mode |
 | `rwait` | Wait queue `"tty-read"`, woken on every input character and on termios changes |
 | `sid`, `pgrp` | Session and foreground process group |
-| `ws` | `struct winsize`, initialized to 24 rows × 80 columns and never changed |
+| `ws` | `struct winsize`, initialized to 24 rows × 80 columns; set by `TIOCSWINSZ` (the shell does, when the terminal reports its size) |
 | `in`, `out`, `dropped`, `sigs` | Counters for `tty` / `/proc/tty` |
 
 Two-stage input buffering in canonical mode: characters accumulate in `line` while being edited, and are copied to `q` (`commit_line`) when the line ends. In raw mode characters go straight to `q`. Readers only take from `q`.
@@ -293,15 +292,16 @@ UART RX --> PLIC --> plic_handle --> console.c: uart_irq
 Called once per character from the UART interrupt, with `tty->lock` held for the processing:
 
 1. `in++`. If `c == '\r'`: drop it if `IGNCR`; otherwise turn it into `'\n'` if `ICRNL`.
-2. **Signals** (if `ISIG`): `VINTR` → SIGINT, `VQUIT` → SIGQUIT, `VSUSP` → SIGTSTP. Unless `NOFLSH`, all pending input is flushed (`flush_input`: edited line, queue, `lines`, `eofs`). The character is echoed (`^C`) followed by a newline if `ECHO`. Processing stops.
+2. **Signals** (if `ISIG`): `VINTR` → SIGINT, `VQUIT` → SIGQUIT, `VSUSP` → SIGTSTP. Unless `NOFLSH`, all pending input is flushed (`flush_input`: edited line, queue, `delims`). The character is echoed (`^C`) followed by a newline if `ECHO`. Processing stops.
 3. **Canonical mode** (`ICANON`):
    - `VERASE` or `'\b'`: `erase_chars(1)`. With `ECHO` and `ECHOE`, each erased character is rubbed out with `"\b \b"`, twice for a control character shown as `^X` (when `ECHOCTL`).
    - `VKILL`: erase the whole line the same way.
    - `VWERASE`: erase trailing spaces, then the preceding non-space run (only `' '` counts as a separator).
-   - `VEOF`: `commit_line(false)`: copy the line to `q` without a newline. If the line was empty, `eofs++` (a pending EOF); otherwise `lines++`. `^D` is not echoed.
-   - `'\n'`: echo it, `commit_line(true)`: copy the line plus `'\n'` to `q`, `lines++`.
+   - `VEOF`: `commit_line(false)`: copy the line to `q` followed by a `Q_EOF` marker. `^D` is not echoed.
+   - `'\n'`: echo it, `commit_line(true)`: copy the line plus `'\n'` to `q`.
+   - `commit_line` is all or nothing: if the line and its delimiter don't fit in `q`, the whole line is dropped (and counted in `dropped`), so a line is never committed without its end.
    - Any other character: append to `line` and echo it, unless the line already has 255 characters, in which case `dropped++` and the character is lost.
-4. **Raw mode**: push the character to `q` (or count it in `dropped` if `q` holds 1024 bytes) and echo it.
+4. **Raw mode**: push the character to `q` (or count it in `dropped` if `q` holds 1024 entries) and echo it.
 5. After unlocking: if a signal was recognized, `sigs++`, emit the `tty_signal` trace event and, if there is a foreground group, `signal_send_pgrp(tty->pgrp, sig, 0)`. Always `wake_up(&tty->rwait)`.
 
 Echo (`echo_char`): nothing unless `ECHO`, except a newline when `ECHONL`. With `ECHOCTL`, bytes below 0x20 other than `\n` and `\t` print as `^` followed by `c + '@'`. Echo is written synchronously from the interrupt handler.
@@ -310,13 +310,13 @@ Echo (`echo_char`): nothing unless `ECHO`, except a newline when `ECHONL`. With 
 
 1. **Job control** (`job_control`): if the caller's process has this TTY as controlling terminal, a foreground group is set and the caller is not in it, then: if SIGTTIN is ignored or blocked, return `-EIO`; otherwise send SIGTTIN to the caller's group and return `-ERESTARTSYS` (the read restarts after `SIGCONT`). Processes without the TTY as controlling terminal (e.g. after `setsid`) read without this check.
 2. **Raw mode with `VMIN` = 0** and nothing queued: return 0 at once (a polling read; `top` uses this).
-3. Otherwise sleep interruptibly on `rwait` until `readable()`: in canonical mode `lines > 0 || eofs > 0`; in raw mode `q` non-empty. A signal returns `-ERESTARTSYS`. The thread's `wait_what` is `"tty read"`.
-4. Under the lock, copy into a 256-byte stack buffer:
-   - Canonical, no complete line, and a pending EOF: consume one `eofs` and return 0 (EOF).
-   - Otherwise copy up to `min(n, 256)` bytes from `q`. In canonical mode stop after a `'\n'` and decrement `lines`. If the copy ended without a newline, emptied the queue and `lines > 0`, it was a `^D`-terminated line: decrement `lines`.
+3. Otherwise sleep interruptibly on `rwait` until `readable()`: in canonical mode `delims > 0` (a complete line or a `^D` is queued); in raw mode `q` non-empty. A signal returns `-ERESTARTSYS`. The thread's `wait_what` is `"tty read"`.
+4. Under the lock, pop entries into a 256-byte stack buffer, up to `min(n, 256)` bytes:
+   - canonical mode stops after a `'\n'` (included), or at a `Q_EOF` marker (consumed, not returned). A marker with nothing before it is end of file: the read returns 0;
+   - raw mode returns whatever is queued; `Q_EOF` markers left over from canonical input are skipped.
 5. Copy to the caller (`copy_to_user` or `memcpy` for kernel callers); `-EFAULT` on a bad pointer.
 
-So a canonical read returns at most one line (or part of one if `n` is smaller; the rest stays queued), and a raw read returns whatever is queued, up to 256 bytes, as soon as there is at least one byte. `VMIN` values above 1 and `VTIME` are not implemented.
+Lines and `^D`s come out in the order they were typed, whatever mixture of modes reads them. So a canonical read returns at most one line (or part of one if `n` is smaller; the rest stays queued), and a raw read returns whatever is queued, up to 256 bytes, as soon as there is at least one byte. `VMIN` values above 1 and `VTIME` are not implemented.
 
 ### TTY write: `tty_write`
 
@@ -332,7 +332,8 @@ Copies from the caller in 256-byte chunks and writes each chunk with `out_raw` �
 | `TIOCSPGRP` | Set the foreground group; `-ENOTTY` unless the caller's controlling terminal is this TTY and its session is the TTY's session. The group id is not validated. |
 | `TIOCSCTTY` | Caller must be a session leader (`sid == pid`), else `-EPERM`. Makes the console its controlling terminal and sets the TTY's session and foreground group to the caller's. |
 | `TIOCNOTTY` | Clear the caller's controlling terminal if it is this TTY |
-| `TIOCGWINSZ` | Return `ws` (always 24 × 80) |
+| `TIOCGWINSZ` | Return `ws` (24 × 80 until set) |
+| `TIOCSWINSZ` | Set `ws`; ignored if rows or columns is 0. No `SIGWINCH` is sent. |
 | `FIONREAD` | Bytes in `q` (committed input; not the line being edited) |
 | other | `-ENOTTY` |
 
@@ -344,7 +345,7 @@ User space maps these in `user/lib/libc.c`: `tcsetattr(TCSANOW/TCSADRAIN/TCSAFLU
 
 - `tty_set_ctty(p)` (called by `proc_spawn` for kernel-spawned processes such as init) sets `p->ctty` and makes `p`'s session and group the TTY's.
 - `fork` copies `ctty` (`signal_fork`); `setsid` clears it (`do_setsid`). Only `TIOCSCTTY` or `tty_set_ctty` set it again. Opening `/dev/console` does not make it the controlling terminal; `O_NOCTTY` is defined but unused.
-- The shell uses `tcsetpgrp` (`TIOCSPGRP`) to move jobs to the foreground and `TCSETSW` to restore its saved modes after a job (`user/bin/sh.c`).
+- The shell (`esh`) uses `tcsetpgrp` (`TIOCSPGRP`) to move jobs to the foreground and `TCSETSW` to restore its saved modes after a job. While you edit a command line it puts the TTY in raw mode (no `ICANON`, `ECHO`, `ISIG`, `ICRNL`), and reads keys with `ppoll` timeouts to tell a lone Escape from an escape sequence ([12-shell.md](12-shell.md#the-line-editor)).
 
 ### virtio-mmio initialization handshake: `virtio_find`
 
@@ -497,7 +498,7 @@ A checklist, following the existing drivers:
 | Lock | Type | Protects | Taken from |
 |---|---|---|---|
 | `virtqueue.lock` (`"virtqueue"`) | spinlock, irqsave | descriptor table, free list, `nfree`, avail ring, `last_used`, `cookies`, counters | `virtq_add` (threads, IRQ), `virtq_get` (IRQ, `net_xmit`) |
-| `console_tty.lock` (`"tty"`) | spinlock, irqsave | `t`, `line`, `q`, `lines`, `eofs` | `tty_input` (IRQ), `tty_read`, `TCSETS*` |
+| `console_tty.lock` (`"tty"`) | spinlock, irqsave | `t`, `line`, `q`, `delims` | `tty_input` (IRQ), `tty_read`, `TCSETS*` |
 | `log_lock` | spinlock, irqsave | console output ordering | `console_write_locked` (TTY echo and writes), printk |
 | `proc_lock` | spinlock | process group membership and signal state | `signal_send_pgrp` from `tty_input` (after the TTY lock is dropped) |
 | `kpt_lock` | spinlock | kernel page table | `vm_map` via `ioremap` after `vm_init` |
@@ -555,7 +556,7 @@ No device-specific system calls. Devices are reached through `open`/`read`/`writ
 | `/proc/interrupts` | `irq_print` | per-CPU timer/IPI/external counts; per-PLIC-source count, time (µs), handler symbol; spurious claims |
 | `/proc/blk` | `blk_print` | capacity, queue size and free descriptors, IRQ, reads/writes (count and KiB), errors, average and max latency, in-flight count |
 | `/proc/virtio` | `virtio_print` | every virtio slot: base, IRQ, device type, version, status register |
-| `/proc/tty` | `tty_print` | session, foreground group, size, termios flags, line being edited, queued bytes/lines/EOFs, in/out/dropped/signals |
+| `/proc/tty` | `tty_print` | session, foreground group, size, termios flags, line being edited, queued entries and complete lines, in/out/dropped/signals |
 
 ### Monitor commands
 
@@ -612,7 +613,7 @@ View with `trace show` in the monitor, `eu-trace` in GDB, or a Perfetto export (
 
 **Interrupt never arrives.** Check `irq` counts. If zero: check `plat` for the IRQ number, that `irq N -> name` appeared at boot, and the device's status in `/proc/virtio` (should include `DRIVER_OK`, 0x4, and `FEATURES_OK`, 0x8; typically 0xf). If `blk` shows requests in flight while the count does not move, the device did not complete them: check the descriptors. With GDB, `vq` in `virtio_blk.c` holds the ring pointers; `vq.used->idx` vs. `vq.last_used` tells whether completions are pending but not consumed.
 
-**Terminal problems.** "Input does nothing": `tty` shows whether bytes are arriving (`in`), whether a partial line is being edited, and the foreground group; a program that is not in the foreground group gets SIGTTIN. "Characters echo twice/not at all": check `echo` and `icanon` in `tty`. Programs that exit without restoring raw mode leave the terminal raw; the shell restores its saved modes when a job ends (`user/bin/sh.c`).
+**Terminal problems.** "Input does nothing": `tty` shows whether bytes are arriving (`in`), whether a partial line is being edited, and the foreground group; a program that is not in the foreground group gets SIGTTIN. "Characters echo twice/not at all": check `echo` and `icanon` in `tty`. Programs that exit without restoring raw mode leave the terminal raw; the shell restores its saved modes when a job ends (`esh`, `term_take`).
 
 **Tests.** `user/bin/utests.c: t_tty` checks `isatty`, `tcgetattr`/`tcsetattr`, `tcgetpgrp`, opening `/dev/tty`, and SIGTTIN for a background reader. Disk and network drivers are exercised indirectly by every filesystem and network test.
 
@@ -654,11 +655,9 @@ View with `trace show` in the monitor, `eu-trace` in GDB, or a Perfetto export (
 - `VTIME` is ignored; `VMIN` > 1 behaves like 1. `O_NONBLOCK` is ignored by `tty_read` (only raw mode with `VMIN` = 0 gives non-blocking reads).
 - Output processing flags are ignored: `\n` always becomes `\r\n`, even with `OPOST` cleared.
 - `IXON` (`^S`/`^Q`), `ECHOK`, `IEXTEN` gating of `^W`, `CREAD`, and `_POSIX_VDISABLE` (a `c_cc` value of 0 disabling a character) are not implemented. Setting a control character to 0 makes NUL bytes trigger it. `'\b'` always erases.
-- Window size is fixed at 24 × 80; no `TIOCSWINSZ` or `SIGWINCH`.
+- The window size is whatever was last set with `TIOCSWINSZ` (24 × 80 at boot); the serial line can't report resizes, and there is no `SIGWINCH`.
 - No `SIGTTOU`: background jobs may write and change termios or the foreground group freely. `TIOCSPGRP` does not check that the group exists in the session; `TIOCSCTTY` takes the terminal from another session without checking. No `SIGHUP` on session leader exit.
 - Erasing a tab rubs out one column.
-- Line and queue accounting bugs (Potential improvements, item 1): a `^D`-terminated line followed by type-ahead can merge with the next line and leave `lines` too high, so a later canonical read returns 0 (a spurious EOF). Raw-mode reads consume committed lines without decrementing `lines`, so switching back to canonical with `TCSETS`/`TCSETSW` (not `TCSETSF`) after a raw program ate type-ahead can also produce a spurious EOF. Pending EOFs are consumed only after all lines, regardless of the order they were typed.
-- When the 1024-byte queue is full, `commit_line` still counts the line even if its bytes (or its newline) were dropped.
 - Console output is polled with interrupts off under `log_lock`, 256 bytes per chunk; a large write delays interrupts on that CPU for the time it takes the UART to accept 256 bytes.
 - `Ctrl-]` cannot be passed through to programs.
 
@@ -670,18 +669,17 @@ View with `trace show` in the monitor, `eu-trace` in GDB, or a Perfetto export (
 
 ## Potential improvements
 
-1. **Fix canonical line accounting** — Track line boundaries explicitly (for example, a per-line end marker or a small ring of line lengths, with EOF as a zero-length line) instead of the `lines`/`eofs` counters, and stop `tty_read` at a `^D` boundary. Reset or recompute the counters when switching modes, and make raw reads keep them consistent. This removes the spurious-EOF cases (which can make the shell exit) and preserves the order of lines and EOFs. Impact: high. Effort: small.
-2. **Implement `VMIN`/`VTIME` and `O_NONBLOCK` for the TTY** — Wait until `VMIN` bytes are available, use `VTIME` as an inter-byte or overall timeout per POSIX, and return `-EAGAIN` for non-blocking files. Editors and serial tools depend on this. Impact: medium. Effort: medium.
-3. **Retry RX refills and expose driver counters** — When `post_rx` fails, remember the deficit and refill from the next interrupt or from `netd`; print `rx_refill_failures`, `tx_queue_full`, posted RX buffers and TX in-flight in `/proc/net` or the `net` command. Today a burst of allocation failures silently and permanently starves receive. Impact: medium. Effort: small.
-4. **Add a read barrier in `virtq_get` and use the config generation counter** — Fence after reading `used->idx` and before reading the element; read 64-bit config fields under ConfigGeneration (0x0fc); wait for Status to read 0 after reset. Cheap spec compliance that matters on real hardware or other hypervisors. Impact: medium. Effort: small.
-5. **Per-request completion for block I/O** — Give each `blk_req` its own wait entry (or wake only the owner thread) instead of waking every waiter on `done_wq`. Reduces wakeups and context switches under concurrent I/O. Impact: medium. Effort: small.
-6. **Negotiate `VIRTIO_BLK_F_FLUSH` and issue flushes at log commit** — The efs log's crash guarantees assume durable completed writes; a flush after the commit block makes that explicit and holds with write-back caches. Impact: medium. Effort: small.
-7. **Implement `SIGTTOU`, validate `TIOCSPGRP`/`TIOCSCTTY`** — Stop background writers when `TOSTOP` is set and background callers of `TCSETS*`/`TIOCSPGRP`; check the target group belongs to the session; refuse to steal a terminal owned by another session. Completes job control. Impact: medium. Effort: small.
-8. **Honor `OPOST`/`ONLCR` and add `TIOCSWINSZ`/`SIGWINCH`** — Move `\n` → `\r\n` translation from `console_putc` into the TTY output path (printk keeps its own), and let user space set the window size so full-screen programs can adapt. Impact: low. Effort: small.
-9. **Buffered, interrupt-driven UART output for the TTY** — Queue user output and drain it on the THR-empty interrupt, keeping polled output for printk and panics. Removes long interrupts-off windows during large writes. Impact: medium. Effort: medium.
-10. **Unit tests for the line discipline** — `KTEST`s that feed `tty_input` character sequences (erase, kill, word erase, `^D` placement, mode switches, queue overflow) and check `tty_read` results. Most of the bugs above would have been caught. Impact: medium. Effort: small.
-11. **Notification suppression and TX batching** — Negotiate `VIRTIO_F_EVENT_IDX` or honor `used->flags`, and avoid a kick per packet; reap TX completions without an interrupt per frame. Fewer VM exits under load. Impact: low. Effort: medium.
-12. **Scatter-gather and indirect descriptors for block requests** — Allow multi-segment buffers (respecting `seg_max`/`size_max`) so larger I/O and non-contiguous buffers (kernel stacks, user pages) work without the page-crossing panic. Impact: low. Effort: medium.
-13. **A small driver registry** — A table of `{ virtio device id or DT compatible, init function }` walked at boot, plus a common place to register `/proc` and monitor printers, instead of hard-coded calls in `kinit`/`net_init`. Makes adding drivers a one-file change. Impact: low. Effort: medium.
-14. **Implement `IXON`, `_POSIX_VDISABLE` and `IEXTEN` gating** — Treat a `c_cc` value of 0 as disabled, gate `^W` on `IEXTEN`, and implement `^S`/`^Q` or clear `IXON` from the defaults so `stty`-style output is truthful. Impact: low. Effort: small.
-15. **Thread-safe `ioremap` and eager RTC mapping** — Take `kpt_lock` around the region table in `ioremap` and map the RTC at boot, so no MMIO mapping happens lazily on a hot path. Impact: low. Effort: small.
+1. **Implement `VMIN`/`VTIME` and `O_NONBLOCK` for the TTY** — Wait until `VMIN` bytes are available, use `VTIME` as an inter-byte or overall timeout per POSIX, and return `-EAGAIN` for non-blocking files. Editors and serial tools depend on this. Impact: medium. Effort: medium.
+2. **Retry RX refills and expose driver counters** — When `post_rx` fails, remember the deficit and refill from the next interrupt or from `netd`; print `rx_refill_failures`, `tx_queue_full`, posted RX buffers and TX in-flight in `/proc/net` or the `net` command. Today a burst of allocation failures silently and permanently starves receive. Impact: medium. Effort: small.
+3. **Add a read barrier in `virtq_get` and use the config generation counter** — Fence after reading `used->idx` and before reading the element; read 64-bit config fields under ConfigGeneration (0x0fc); wait for Status to read 0 after reset. Cheap spec compliance that matters on real hardware or other hypervisors. Impact: medium. Effort: small.
+4. **Per-request completion for block I/O** — Give each `blk_req` its own wait entry (or wake only the owner thread) instead of waking every waiter on `done_wq`. Reduces wakeups and context switches under concurrent I/O. Impact: medium. Effort: small.
+5. **Negotiate `VIRTIO_BLK_F_FLUSH` and issue flushes at log commit** — The efs log's crash guarantees assume durable completed writes; a flush after the commit block makes that explicit and holds with write-back caches. Impact: medium. Effort: small.
+6. **Implement `SIGTTOU`, validate `TIOCSPGRP`/`TIOCSCTTY`** — Stop background writers when `TOSTOP` is set and background callers of `TCSETS*`/`TIOCSPGRP`; check the target group belongs to the session; refuse to steal a terminal owned by another session. Completes job control. Impact: medium. Effort: small.
+7. **Honor `OPOST`/`ONLCR` and add `SIGWINCH`** — Move `\n` → `\r\n` translation from `console_putc` into the TTY output path (printk keeps its own), and send `SIGWINCH` to the foreground group when `TIOCSWINSZ` changes the size, so full-screen programs can adapt. Impact: low. Effort: small.
+8. **Buffered, interrupt-driven UART output for the TTY** — Queue user output and drain it on the THR-empty interrupt, keeping polled output for printk and panics. Removes long interrupts-off windows during large writes. Impact: medium. Effort: medium.
+9. **Unit tests for the line discipline** — `KTEST`s that feed `tty_input` character sequences (erase, kill, word erase, `^D` placement, mode switches, queue overflow) and check `tty_read` results. The line accounting bug fixed earlier (H5 in IMPROVEMENTS.md) is the kind of thing they would catch. Impact: medium. Effort: small.
+10. **Notification suppression and TX batching** — Negotiate `VIRTIO_F_EVENT_IDX` or honor `used->flags`, and avoid a kick per packet; reap TX completions without an interrupt per frame. Fewer VM exits under load. Impact: low. Effort: medium.
+11. **Scatter-gather and indirect descriptors for block requests** — Allow multi-segment buffers (respecting `seg_max`/`size_max`) so larger I/O and non-contiguous buffers (kernel stacks, user pages) work without the page-crossing panic. Impact: low. Effort: medium.
+12. **A small driver registry** — A table of `{ virtio device id or DT compatible, init function }` walked at boot, plus a common place to register `/proc` and monitor printers, instead of hard-coded calls in `kinit`/`net_init`. Makes adding drivers a one-file change. Impact: low. Effort: medium.
+13. **Implement `IXON`, `_POSIX_VDISABLE` and `IEXTEN` gating** — Treat a `c_cc` value of 0 as disabled, gate `^W` on `IEXTEN`, and implement `^S`/`^Q` or clear `IXON` from the defaults so `stty`-style output is truthful. Impact: low. Effort: small.
+14. **Thread-safe `ioremap` and eager RTC mapping** — Take `kpt_lock` around the region table in `ioremap` and map the RTC at boot, so no MMIO mapping happens lazily on a hot path. Impact: low. Effort: small.

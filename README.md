@@ -26,7 +26,7 @@ brew install qemu riscv64-elf-gcc riscv64-elf-gdb
 command make run
 ```
 
-`command` bypasses shell wrappers around `make` (such as grc) that buffer the console. Inside, `help` lists the shell's built-ins; `Ctrl-]` enters the kernel debug monitor (`help` there too, `c` to continue); `Ctrl-A X` quits QEMU.
+`command` bypasses shell wrappers around `make` (such as grc) that buffer the console. Inside, `help` lists the shell's builtins and keys; `Ctrl-]` enters the kernel debug monitor (`help` there too, `c` to continue); `Ctrl-A X` quits QEMU (so `Ctrl-A Ctrl-A`, or Home, moves to the start of the line).
 
 | Target | What it does |
 |---|---|
@@ -50,7 +50,7 @@ command make run
 - **Files:** a VFS, *efs* (an on-disk filesystem with a write-ahead log that survives power failures), devfs, and procfs with a lot of kernel state.
 - **SMP:** every hart runs threads from a shared run queue; IPIs handle reschedules, TLB shootdowns and stopping the world.
 - **Network:** Ethernet, ARP, IPv4, ICMP, UDP and TCP (with retransmission, fast retransmit, reassembly and congestion control), BSD sockets, and `poll`/`select`.
-- **User land:** a shell with pipelines, redirection and job control, plus about 60 commands including `ps`, `top`, `strace`, `grep`, `nc`, `ping`, `httpd` and `rshd`.
+- **User land:** `esh`, a zsh-like shell: functions, arrays, `[[ ]]`, zsh's expansions and job control, with a line editor that does syntax highlighting, history autosuggestions, prefix and incremental history search, and Tab completion with menus ([manual](docs/subsystems/12-shell.md)). Plus about 60 commands including `ps`, `top`, `strace`, `grep`, `nc`, `ping`, `httpd` and `rshd`.
 - **Debugging:** the [debugging guide](docs/DEBUGGING.md) covers the kdb-style monitor, symbolized panics, GDB helpers, the event trace (Perfetto), the sampling profiler (flamegraphs), lockdep, watchdogs, `strace`, packet logs and captures, fault injection, and deterministic replay with reverse debugging.
 
 ## Documents

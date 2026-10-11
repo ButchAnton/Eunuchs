@@ -1,7 +1,7 @@
 /*
  * rshd [-p port]: a remote shell (default port 23; make run forwards
  * localhost:2323 on the Mac to it: `nc localhost 2323`). Each connection
- * gets /bin/sh -i with the socket as stdin, stdout and stderr. There is no
+ * gets /bin/esh -i with the socket as stdin, stdout and stderr. There is no
  * login or encryption: this is for a VM on your own machine.
  */
 #include <arpa/inet.h>
@@ -47,8 +47,8 @@ int main(int argc, char **argv)
                 close(c);
             const char *hello = "Eunuchs remote shell. Type 'exit' to leave.\n";
             write(1, hello, strlen(hello));
-            char *sh[] = { "sh", "-i", NULL };
-            execv("/bin/sh", sh);
+            char *sh[] = { "esh", "-i", NULL };
+            execv("/bin/esh", sh);
             _exit(127);
         }
         close(c);
