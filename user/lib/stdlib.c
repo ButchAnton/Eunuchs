@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,7 +130,7 @@ long double strtold(const char *s, char **end)
     long double v = 0;
     if (!strncasecmp(p, "inf", 3)) {
         p += !strncasecmp(p, "infinity", 8) ? 8 : 3;
-        v = __builtin_infl();
+        v = ((long double)HUGE_VAL);
     } else if (!strncasecmp(p, "nan", 3)) {
         p += 3;
         if (*p == '(') {
@@ -137,7 +138,7 @@ long double strtold(const char *s, char **end)
             if (q)
                 p = q + 1;
         }
-        v = __builtin_nanl("");
+        v = ((long double)NAN);
     } else if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
                (isxdigit((unsigned char)p[2]) || (p[2] == '.' && isxdigit((unsigned char)p[3])))) {
         p += 2;
@@ -218,7 +219,7 @@ long double strtold(const char *s, char **end)
         v = mant;
         if (mant && e10) {
             if (e10 > 5000)
-                v = __builtin_infl();
+                v = ((long double)HUGE_VAL);
             else if (e10 < -5000)
                 v = 0;
             else
@@ -234,8 +235,8 @@ double strtod(const char *s, char **end)
 {
     long double v = strtold(s, end);
     double d = (double)v;
-    if ((d == __builtin_inf() || d == -__builtin_inf()) && v == v &&
-        v != __builtin_infl() && v != -__builtin_infl())
+    if ((d == HUGE_VAL || d == -HUGE_VAL) && v == v &&
+        v != ((long double)HUGE_VAL) && v != -((long double)HUGE_VAL))
         errno = ERANGE;
     return d;
 }

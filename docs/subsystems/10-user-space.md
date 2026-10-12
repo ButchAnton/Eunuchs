@@ -264,7 +264,7 @@ Numbers are collected into a 512-byte buffer and converted with `strtoll`/`strto
 
 ### Mathematics: `math.h`
 
-`math.c` computes in 128-bit `long double`, which GCC implements in software on RISC-V, and rounds the result to `double`: arguments are reduced (by `ln 2` for exponentials, modulo π/2 for trigonometry) and Taylor or atanh series summed with enough guard bits to be correct to the last bit or two (`utests` checks agreement to 1e-14). `sqrt` uses the hardware `fsqrt.d`.
+`math.c` computes in 128-bit `long double`, which is software arithmetic on RISC-V (libgcc's in GCC builds, tcc's `lib-arm64.c` in tcc builds), and rounds the result to `double`: arguments are reduced (by `ln 2` for exponentials, modulo π/2 for trigonometry) and Taylor or atanh series summed with enough guard bits to be correct to the last bit or two (`utests` checks agreement to 1e-14). `sqrt` uses the hardware `fsqrt.d` (through small inline-assembly helpers, `hw_sqrt`/`hw_sqrtf`). The libc uses no GCC floating-point builtins (`__builtin_inf`, `__builtin_nan`, `__builtin_sqrt`, ...), which tcc lacks; it uses `HUGE_VAL` and `NAN` instead, so GCC and tcc compile the same code (Eunuchs builds its own libc with tcc, [13](13-toolchain.md#eunuchs-builds-its-own-user-space-userbuildmk-make-selfhost)).
 
 - Exponential and logarithmic: `exp exp2 expm1 log log2 log10 log1p pow` (`pow` multiplies exactly for integer exponents up to 64).
 - Trigonometric and hyperbolic: `sin cos tan asin acos atan atan2 sinh cosh tanh`.

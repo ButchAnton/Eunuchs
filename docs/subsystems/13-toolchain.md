@@ -62,12 +62,14 @@ Every path is relative to `{B}`. The same configuration therefore works on the h
 
 ### The patches to TinyCC
 
-The first three are small and marked with "Eunuchs" comments; the fourth is the rewrite of most of the RISC-V assembler (below).
+Most are small and marked with "Eunuchs" comments; the fourth is the rewrite of most of the RISC-V assembler (below).
 
 1. `riscv64-link.c` gains support for the absolute relocations `R_RISCV_HI20`, `R_RISCV_LO12_I` and `R_RISCV_LO12_S` (an address split over `lui` and `addi`/a load/a store), marked with "Eunuchs" comments. tcc never emits them itself, but Homebrew's `libgcc.a` is compiled with `-mcmodel=medlow`, which does, and `libtcc1.a` includes libgcc. The addresses fit because programs are linked at `0x10000`.
 2. `riscv64-gen.c` (`gfunc_call`): an argument passed on the stack (the 9th and later) was stored through an lvalue that kept the argument's type, `const` included, so a `const`-qualified argument drew the warning "assignment of read-only location". The slot's type now drops `VT_CONSTANT`. This was a warning only; the code was right.
 3. `tccdbg.c` (`tcc_debug_end`): before the `DW_LNE_end_sequence` that closes the line program, the address is advanced to the end of the text. Without it the sequence ended at the last row's address, so a last function written on one line (`int f(void) { return 1; }`) covered no addresses and a debugger could not map its code to a line.
 4. The assembler: `tccasm.c`, `tccpp.c`, `tcc.h`, `tcctok.h`, `riscv64-asm.c` and `riscv64-tok.h` ([The assembler](#the-assembler)).
+5. `tccgen.c`: narrowing a 64-bit value held in a register to `unsigned int` zero-extended it. RISC-V keeps 32-bit values sign-extended in registers, unsigned ones included (the psABI, and tcc's own `lw`, `addw` and comparison code assume it), so a value narrowed this way compared unequal to the same value loaded from memory: `sleep_ms() == (unsigned)-1` was false in tcc-built code (the `utests` `eintr` test failed). It now emits `sext.w`.
+6. `tccelf.c`: executables kept `.symtab` and `.strtab` only with `-g` (upstream writes non-allocated sections only then). They are now always kept, as GNU ld does, because the kernel's user backtraces and `elf_symbolize` need them (`ktest elf_load_from_disk` failed on a tcc-built `/bin/hello`). This applies to every program built on Eunuchs.
 
 ### The sysroot (`build/sysroot`, copied into the image)
 
@@ -87,6 +89,8 @@ The first three are small and marked with "Eunuchs" comments; the fourth is the 
 ### Building it (on the host)
 
 1. **`build/tcc/xtcc`**: `$(HOSTCC) -O1 -w -DONE_SOURCE=1 -Iports/tcc tcc.c`, a host program that compiles for Eunuchs. It exists only to build tcc's runtime, because those files use tcc-specific code GCC does not accept.
+
+   **Limitation:** `xtcc` stores `long double` constants with only double precision (the low 64 bits of the 128-bit value are zero). On Apple Silicon the host's `long double` is 64 bits, and tcc folds constants in the host type; `/bin/tcc` on Eunuchs keeps full precision. So building `user/build.mk` with `TCC=$PWD/build/tcc/xtcc` on the Mac gives a different `math.o`/`libc.a`, `utests` and `tcc` than the guest build. The regular build uses `xtcc` only for tcc's runtime helpers, which have no such constants, so nothing shipped is affected.
 2. **`/bin/tcc`**: `tcc.c` compiled by the cross GCC with `UCFLAGS` (warnings off, `-w`) and linked like any other program against `ULIB`. It is in `UPROGS`, so it is stripped and installed like the rest. It is about 330 KiB.
 3. **The runtime**: each `third_party/tinycc/lib/*.{c,S}` that is needed is built by `xtcc -B$(TCC_SRC) -Iuser/include -Ilib/include`. `libtcc1.a` is assembled from those objects plus the members extracted from `$(CC) -march=rv64gc -mabi=lp64d -print-libgcc-file-name`.
 4. **The sysroot**: headers are copied, `libc.a` is archived from `ULIB`, `crt1.o` is assembled with `-DNO_GP`, and the empty `crti.o`/`crtn.o` are made. `make sysroot` builds just this.
@@ -169,6 +173,34 @@ tcc assembles `.S` files (after running its preprocessor on them) and inline `as
 
 **Debugging an assembly difference:** assemble the file with both (`build/tcc/xtcc -c -o a.o f.S`, `riscv64-elf-gcc -c -march=rv64g -mabi=lp64d -mno-relax -o b.o f.S`, with the same `-D`/`-I` options), link each at a fixed address (`riscv64-elf-ld -Ttext=0x80000000`, `--defsym` for undefined symbols), and compare the bytes, or `riscv64-elf-objdump -d` both and `diff`: that is what the test does.
 
+### Eunuchs builds its own user space (`user/build.mk`, `make selfhost`)
+
+`user/build.mk` is a Makefile for Eunuchs' own `make`, run in the guest from the shared tree:
+
+```
+cd /mnt/host && make -f user/build.mk [OUT=dir] [TCC=compiler]
+```
+
+Nothing in it comes from GCC:
+
+1. **The sysroot**, in `OUT/sysroot/usr/lib` (`OUT` defaults to `build/selfhost`): `crt1.o` (`crt0.S` with `-DNO_GP`), empty `crti.o`/`crtn.o` (assembled from standard input, so the file name they record is `-` whatever `OUT` is), and `libc.a` from `user/lib/*.c`, `setjmp.S`, `syscall.S`, `lib/printf.c` and `lib/string.c` with `-DFMT_FLOAT`.
+2. **tcc's runtime**, in `OUT/sysroot/usr/lib/tcc`: `libtcc1.a` from tcc's own `lib-arm64.c` (the software `long double` arithmetic), `stdatomic.c`, `builtin.c`, `armflush.c`, `atomic.S` and `alloca.S`, and `runmain.o`. Unlike the regular build's `libtcc1.a`, it contains no libgcc.
+3. **Every program**, into `OUT/bin`: each `user/bin/*.c`, `db`, `edit`, `esh`, and `tcc` itself (`third_party/tinycc/tcc.c` with `-DONE_SOURCE=1 -Iports/tcc`): 26 programs.
+
+Headers come from the source tree (`-nostdinc -Iuser/include -Ilib/include -Ithird_party/tinycc/include`), not from `/usr/include`; links use `-B OUT/sysroot/usr/lib/tcc`; archives are made with `tcc -ar`. `make` runs serially.
+
+**`make selfhost`** (on the Mac, `tools/selfhost.py`) proves it works:
+
+1. It boots Eunuchs from a copy of the image (`build/selfhost/boot.img`) with the repository shared on `/mnt/host`.
+2. **Stage 1**: `build.mk` with the image's `/bin/tcc` (which GCC built), into `build/selfhost/stage1`.
+3. **Stage 2**: `build.mk` again with stage 1's `tcc`, into `build/selfhost/stage2`.
+4. Every file of the two stages must be **byte-for-byte identical**: tcc built by tcc builds the same user space as tcc built by GCC, a bootstrap fixed point.
+5. The Makefile makes `build/selfhost/fs.img`: the normal image with every `/bin` program and the six libraries (`crt1.o`, `crti.o`, `crtn.o`, `libc.a`, `libtcc1.a`, `runmain.o`) replaced by stage 2's (`SH_FILES`, built by the `sh_file` function from `FS_FILES`; the headers are unchanged), and runs the whole `run_tests.py` scenario on it (`--programs build/selfhost/stage2/bin`).
+
+Both stages take about 37 seconds in the guest with 4 CPUs, boot included; the stages are identical and all 19 test stages pass on the self-built image. Logs: `build/selfhost/stage1.log`, `stage2.log` and `console.log`.
+
+The libc needed one change for this: `math.c` and `stdlib.c` no longer use GCC's floating-point builtins, which tcc lacks. They use `HUGE_VAL` and `NAN` (cast to `long double` where needed) instead of `__builtin_inf`/`infl`/`nan`/`nanl`, and inline-assembly helpers `hw_sqrt`/`hw_sqrtf` (`fsqrt.d`/`fsqrt.s`) instead of `__builtin_sqrt`/`sqrtf`, so both compilers compile the same code.
+
 ### Dialect problems tcc exposed in our code
 
 tcc accepts most of GNU C, but these differences had to be worked around in the libc and the programs:
@@ -217,16 +249,15 @@ None of its own: tcc and make are ordinary single-threaded processes. Two builds
 - **Code quality**: tcc does almost no optimization. tcc-built programs (`utests` and `esh` compile cleanly) are noticeably slower than GCC's `-O1` builds, so the image keeps the GCC-built binaries.
 - **`tcc -run` needs `mprotect`** and places code in the heap; there is no fallback mode.
 - **Self-hosting, measured** (building from `/mnt/host`):
-  - **tcc compiles itself** on Eunuchs (`tcc.c` with `ONE_SOURCE`), but its sources are not in `/usr/src`, so that needs the share.
-  - **The libc**: every `user/lib/*.c` compiles with tcc, and since the assembler work its `.S` files assemble too, to the same bytes as GNU as. Building the whole libc and `/bin` with tcc in the guest is the next step.
+  - **User space: done.** Step 1 (the assembler) and step 2 (`user/build.mk`, above): Eunuchs builds its C library, tcc's runtime and every program, tcc included, and the second generation is identical to the first. It needs the share: the libc's and tcc's sources are not in `/usr/src`.
   - **The kernel**: 46 of its 76 C files compile with tcc. The blockers: no `stdint.h` for the freestanding kernel build (tcc's headers expect a libc's); the `__ATOMIC_*` constants; the inline-asm `"K"` constraint (a 5-bit CSR immediate); the assembler gaps (`.macro`, `la`, the `fp` register alias, `.dword`, numeric local labels, `.option arch`), now closed: the kernel's `.S` files assemble identically; and a tcc assertion failure in its floating-point register allocator on `kernel/tests/test_debug.c`. Above all, linking: the kernel's linker script (a higher-half VMA different from the load address, page-aligned regions, `KEEP`ed tables with start and end symbols, `NOLOAD` stacks), which tcc's linker cannot express, and the two-pass link whose symbol table is generated by `tools/gen_ksyms.py`, a Python script.
 - **`make`**: no parallel builds (`-j` is ignored), no archive member syntax (`lib.a(obj.o)`), no `$(eval)`/`$(call)`/`define`; `vpath` and `unexport` lines are accepted and ignored.
-- **Size**: the sysroot adds about 4 MiB to the 32 MiB image (`libtcc1.a` is most of it, because all of libgcc is included).
+- **Size**: the sysroot adds about 4 MiB to the 32 MiB image (`libtcc1.a` is most of it, because the regular build includes all of libgcc; the self-built one, without libgcc, shows that is unnecessary).
 
 ## Potential improvements
 
 1. **Line numbers in fault reports** — Have the kernel (or a user-space helper run on a fault) map pcs to file:line through the DWARF line table that `db` already decodes, for programs built with `-g`. Impact: medium. Effort: medium.
-2. **Self-hosting, step by step** — (a) **done**: tcc's assembler handles every `.S` file in the tree, byte-identical to GNU as; (b) build the whole libc and every program in `/bin` with tcc on Eunuchs, and run the test suite against them; (c) put `third_party/tinycc` in `/usr/src/tcc` with a Makefile, and check that the second generation is byte-identical to the first; (d) the kernel's C: a freestanding `stdint.h`, `__ATOMIC_*` definitions, the `"K"` constraint, a fix for the register-allocator assertion; (e) a link path without GNU ld: teach tcc's linker the few script features the kernel needs (separate VMA and LMA, alignment, keep and start/end symbols, NOLOAD) or have the kernel relocate itself from a flat image, and rewrite `gen_ksyms` in C. Smaller assembler gaps: `%hi`/`%lo`/`%pcrel_*`, automatic compression, `.cfi` unwind tables, `.irpc`, `\@`. Impact: medium. Effort: large.
+2. **Self-hosting, step by step** — (1) **done**: tcc's assembler handles every `.S` file in the tree, byte-identical to GNU as; (2) **done**: Eunuchs builds its libc, tcc's runtime and every program with tcc, reaching a fixed point (`make selfhost`); (3) the kernel: a freestanding `stdint.h`, `__ATOMIC_*` definitions, the `"K"` constraint, a fix for the register-allocator assertion, and a link path without GNU ld (teach tcc's linker the few script features the kernel needs, separate VMA and LMA, alignment, keep and start/end symbols, NOLOAD, or have the kernel relocate itself from a flat image), with `gen_ksyms` rewritten in C. Also: put the libc's and tcc's sources in `/usr/src` so the image can rebuild everything without the share, and drop libgcc from the regular build's `libtcc1.a` (the self-built one shows it is not needed). Smaller assembler gaps: `%hi`/`%lo`/`%pcrel_*`, automatic compression, `.cfi` unwind tables, `.irpc`, `\@`. Impact: medium. Effort: large.
 3. **`-run` without `mprotect`** — A fallback that writes the program to `/tmp` and `exec`s it, for kernels or environments without `mprotect`. Impact: low. Effort: small.
 4. **`make -j`** — Run independent recipes in parallel with `fork` and `wait`; Eunuchs has four CPUs by default. Impact: medium. Effort: medium.
 5. **Trim `libtcc1.a`** — Include only the libgcc members that are actually needed (soft `long double`, a few integer helpers) instead of all of them. Impact: low. Effort: small.

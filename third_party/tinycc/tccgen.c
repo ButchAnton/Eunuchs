@@ -3464,10 +3464,17 @@ error:
             }
             ss = ds, ds = 4, dbt = sbt;
         } else if (ss == 8) {
-            /* RISC-V keeps 32bit vals in registers sign-extended.
-               So here we need a sign-extension for signed types and
-               zero-extension. for unsigned types. */
-#if !defined(TCC_TARGET_RISCV64)
+#if defined(TCC_TARGET_RISCV64)
+            /* RISC-V keeps 32bit vals in registers sign-extended, unsigned
+               ones too (as the psABI requires; lw, addw, srliw, ... all
+               produce that form, and compares rely on it). Eunuchs: this
+               zero-extended unsigned results, so an unsigned function
+               returning (unsigned)-1 compared unequal to it. */
+            if (ds == 4) {
+                gen_cvt_sxtw();
+                goto done;
+            }
+#else
             trunc = 32; /* zero upper 32 bits for non RISC-V targets */
 #endif
         } else {

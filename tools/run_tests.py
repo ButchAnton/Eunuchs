@@ -84,6 +84,8 @@ def main():
     ap.add_argument("--mkfs", required=True)
     ap.add_argument("--timeout", type=float, default=60)
     ap.add_argument("--append", default="", help="extra kernel options for every boot")
+    ap.add_argument("--programs", default=os.path.join(ROOT, "build", "user", "stripped"),
+                    help="the programs in the image (to compare files copied out of it)")
     a = ap.parse_args()
 
     build = os.path.join(ROOT, "build")
@@ -415,7 +417,7 @@ def main():
         problems.append("d/g.txt: %s" % e)
     try:
         if open(os.path.join(share, "cat.bin"), "rb").read() != \
-                open(os.path.join(build, "user", "stripped", "cat"), "rb").read():
+                open(os.path.join(a.programs, "cat"), "rb").read():
             problems.append("cat.bin differs from /bin/cat")
     except OSError as e:
         problems.append("cat.bin: %s" % e)

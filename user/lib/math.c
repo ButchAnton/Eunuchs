@@ -211,17 +211,32 @@ double fma(double x, double y, double z) { return (double)((ld)x * y + z); }
 
 /* ---- roots ---- */
 
+/* the hardware square roots (not gcc's builtins, which tcc lacks) */
+static inline double hw_sqrt(double x)
+{
+    double r;
+    __asm__("fsqrt.d %0, %1" : "=f"(r) : "f"(x));
+    return r;
+}
+
+static inline float hw_sqrtf(float x)
+{
+    float r;
+    __asm__("fsqrt.s %0, %1" : "=f"(r) : "f"(x));
+    return r;
+}
+
 double sqrt(double x)
 {
-    return __builtin_sqrt(x);           /* fsqrt.d */
+    return hw_sqrt(x);
 }
 
 long double sqrtl(long double x)
 {
-    if (x <= 0 || x != x || x == __builtin_infl())
-        return x == 0 || x == __builtin_infl() ? x : __builtin_nanl("");
-    long double g = __builtin_sqrt((double)x);
-    if (g == 0 || g == __builtin_inf())                 /* outside double's range */
+    if (x <= 0 || x != x || x == ((long double)HUGE_VAL))
+        return x == 0 || x == ((long double)HUGE_VAL) ? x : ((long double)NAN);
+    long double g = hw_sqrt((double)x);
+    if (g == 0 || g == HUGE_VAL)                 /* outside double's range */
         g = x < 1 ? 1e-300L : 1e300L;
     for (int i = 0; i < 6; i++)
         g = (g + x / g) / 2;
@@ -251,7 +266,7 @@ double hypot(double x, double y)
     x = fabs(x);
     y = fabs(y);
     if (__fpclassify(x) == FP_INFINITE || __fpclassify(y) == FP_INFINITE)
-        return __builtin_inf();
+        return HUGE_VAL;
     return (double)sqrtl((ld)x * x + (ld)y * y);
 }
 
@@ -262,7 +277,7 @@ static ld expl_(ld x)
     if (x != x)
         return x;
     if (x > 11356)
-        return __builtin_infl();
+        return ((long double)HUGE_VAL);
     if (x < -11400)
         return 0;
     /* x = k ln2 + r, |r| <= ln2 / 2 */
@@ -318,18 +333,18 @@ double expm1(double x)
 
 static double log_special(double x)
 {
-    if (x != x || x == __builtin_inf())
+    if (x != x || x == HUGE_VAL)
         return x;
     if (x == 0)
-        return -__builtin_inf();
-    return __builtin_nan("");           /* x < 0 */
+        return -HUGE_VAL;
+    return ((double)NAN);           /* x < 0 */
 }
 
-double log(double x) { return x > 0 && x < __builtin_inf() ? (double)logl_(x) : log_special(x); }
-double log2(double x) { return x > 0 && x < __builtin_inf() ? (double)(logl_(x) / LN2) : log_special(x); }
+double log(double x) { return x > 0 && x < HUGE_VAL ? (double)logl_(x) : log_special(x); }
+double log2(double x) { return x > 0 && x < HUGE_VAL ? (double)(logl_(x) / LN2) : log_special(x); }
 double log10(double x)
 {
-    return x > 0 && x < __builtin_inf() ? (double)(logl_(x) / 2.30258509299404568401799145468436421L)
+    return x > 0 && x < HUGE_VAL ? (double)(logl_(x) / 2.30258509299404568401799145468436421L)
                                         : log_special(x);
 }
 
@@ -354,14 +369,14 @@ double pow(double x, double y)
     int y_odd = y_int && fabs(y) < 0x1p53 && fmod(y, 2) != 0;
     if (x == 0) {
         if (y < 0)
-            return y_odd ? copysign(__builtin_inf(), x) : __builtin_inf();
+            return y_odd ? copysign(HUGE_VAL, x) : HUGE_VAL;
         return y_odd ? x : 0;
     }
     if (__fpclassify(y) == FP_INFINITE) {
         double ax = fabs(x);
         if (ax == 1)
             return 1;
-        return (ax > 1) == (y > 0) ? __builtin_inf() : 0;
+        return (ax > 1) == (y > 0) ? HUGE_VAL : 0;
     }
     if (__fpclassify(x) == FP_INFINITE) {
         if (x > 0)
@@ -369,7 +384,7 @@ double pow(double x, double y)
         return y > 0 ? (y_odd ? x : -x) : (y_odd ? -0.0 : 0);
     }
     if (x < 0 && !y_int)
-        return __builtin_nan("");
+        return ((double)NAN);
     if (y_int && fabs(y) <= 64) {
         /* exact-ish repeated squaring */
         ld r = 1, b = x;
@@ -441,7 +456,7 @@ static ld cos_series(ld r)
 double sin(double x)
 {
     if (x != x || __fpclassify(x) == FP_INFINITE)
-        return __builtin_nan("");
+        return ((double)NAN);
     ld r;
     switch (reduce(x, &r)) {
     case 0: return (double)sin_series(r);
@@ -454,7 +469,7 @@ double sin(double x)
 double cos(double x)
 {
     if (x != x || __fpclassify(x) == FP_INFINITE)
-        return __builtin_nan("");
+        return ((double)NAN);
     ld r;
     switch (reduce(x, &r)) {
     case 0: return (double)cos_series(r);
@@ -467,7 +482,7 @@ double cos(double x)
 double tan(double x)
 {
     if (x != x || __fpclassify(x) == FP_INFINITE)
-        return __builtin_nan("");
+        return ((double)NAN);
     ld r;
     int q = reduce(x, &r);
     ld s = sin_series(r), c = cos_series(r);
@@ -535,14 +550,14 @@ double atan2(double y, double x)
 double asin(double x)
 {
     if (x < -1 || x > 1)
-        return __builtin_nan("");
+        return ((double)NAN);
     return atan2(x, (double)sqrtl(1 - (ld)x * x));
 }
 
 double acos(double x)
 {
     if (x < -1 || x > 1)
-        return __builtin_nan("");
+        return ((double)NAN);
     return atan2((double)sqrtl(1 - (ld)x * x), x);
 }
 
@@ -575,7 +590,7 @@ double tanh(double x)
 /* ---- float versions ---- */
 
 float fabsf(float x) { return (float)fabs(x); }
-float sqrtf(float x) { return __builtin_sqrtf(x); }
+float sqrtf(float x) { return hw_sqrtf(x); }
 float floorf(float x) { return (float)floor(x); }
 float ceilf(float x) { return (float)ceil(x); }
 float sinf(float x) { return (float)sin(x); }

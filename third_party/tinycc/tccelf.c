@@ -2228,6 +2228,9 @@ static int set_sec_sizes(TCCState *s1)
 #ifdef TCC_TARGET_ARM
                    || s->sh_type == SHT_ARM_ATTRIBUTES
 #endif
+                   /* Eunuchs: keep the symbol table without -g too, as GNU
+                      ld does (the kernel names user functions from it) */
+                   || s == symtab_section || s == symtab_section->link
                    || s1->do_debug) {
             s->sh_size = s->data_offset;
         }

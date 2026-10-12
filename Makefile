@@ -116,7 +116,7 @@ SHAREOPTS = $(if $(HOSTDIR),-fsdev local$(comma)id=hostfs$(comma)path=$(HOSTDIR)
             -device virtio-9p-device$(comma)fsdev=hostfs$(comma)mount_tag=host)
 QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(SHAREOPTS) $(NETOPTS)
 
-.PHONY: all user fsck clean-home run debug gdb test stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean sysroot
+.PHONY: all user fsck clean-home run debug gdb test selfhost stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean sysroot
 
 all: $(KERNEL) $(FSIMG)
 
@@ -417,6 +417,24 @@ disasm: $(KERNEL)
 test: $(KERNEL) $(FSIMG) $(MKFS)
 	@$(PYTHON) tools/run_tests.py --qemu "$(QEMU) $(QEMUBASE)" --image $(FSIMG) \
 		--mkfs $(MKFS) --timeout $(TEST_TIMEOUT) --append "$(APPEND)"
+
+# Self-hosting: Eunuchs builds its own user space with tcc from this tree
+# (shared on /mnt/host), twice: with the image's tcc, then with the tcc that
+# built (tools/selfhost.py; the stages must be identical). Then the test suite
+# runs on an image made from what it built.
+SH_OUT   := $(BUILD)/selfhost/stage2
+SH_LIBS  := crt1.o crti.o crtn.o libc.a tcc/libtcc1.a tcc/runmain.o
+sh_file   = $(if $(findstring =$(BUILD)/user/stripped/,$(1)),$(subst =$(BUILD)/user/stripped/,=$(SH_OUT)/bin/,$(1)),$(if $(filter $(addprefix %/,$(SH_LIBS)),$(1)),$(subst =$(SYSROOT)/usr/lib/,=$(SH_OUT)/sysroot/usr/lib/,$(1)),$(1)))
+SH_FILES  = $(foreach f,$(FS_FILES),$(call sh_file,$(f)))
+
+selfhost: $(KERNEL) $(FSIMG) $(MKFS)
+	@$(PYTHON) tools/selfhost.py --qemu "$(QEMU) $(QEMUBASE)" --image $(FSIMG)
+	@if echo "$(SH_FILES)" | tr ' ' '\n' | grep -E '=$(BUILD)/user/stripped/|=$(SYSROOT)/usr/lib/(crt[1in]|libc|tcc/libtcc1|tcc/runmain)\.'; then \
+		echo "selfhost: the files above would still be the gcc-built ones"; exit 1; fi
+	$(Q)$(MKFS) --label root $(BUILD)/selfhost/fs.img $(FS_MB) $(SH_FILES) > /dev/null
+	@echo "selfhost: build/selfhost/fs.img: every program and library built on Eunuchs"
+	@$(PYTHON) tools/run_tests.py --qemu "$(QEMU) $(QEMUBASE)" --image $(BUILD)/selfhost/fs.img \
+		--mkfs $(MKFS) --timeout $(TEST_TIMEOUT) --append "$(APPEND)" --programs $(SH_OUT)/bin
 
 # SMP soak test: STRESS_SECS of parallel fork/exec/pipe/file/COW load on
 # $(CPUS) CPUs, booted with lockdep=panic (and the lockup watchdog on), then

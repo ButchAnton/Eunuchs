@@ -116,6 +116,7 @@ User link: `$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ prog.o $(UL
 | `build/ktest-trace.bin`, `ktest-trace.json` | Event trace from the first test boot, and its Perfetto conversion |
 | `build/stress.img` | `make stress` scratch image |
 | `build/tcc/xtcc`, `build/tcc/tcc.o`, `build/tcc/rt/`, `build/tcc/libgcc/` | The host cross TinyCC, `/bin/tcc`'s object, tcc's runtime objects (built by `xtcc`), and the members extracted from `libgcc.a` ([13](13-toolchain.md)) |
+| `build/selfhost/` | `make selfhost`: `boot.img`, `stage1/` and `stage2/` (each `sysroot/`, `bin/`, `obj/`), `stage1.log`, `stage2.log`, `console.log`, and `fs.img` (the image with stage 2's programs and libraries) |
 | `build/sysroot/usr/{include,lib}` | What the image gets in `/usr/include` and `/usr/lib` (`make sysroot`) |
 | `build/rr/` | Record/replay: `kernel.elf`, `base.img`, `fs.qcow2`, `snap.qcow2`, `replay.bin`, `append`, `record.log`, `replay.log` |
 | `build/ci/<step>.log` | `make ci` per-step logs |
@@ -412,11 +413,12 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 | test (1 CPU) | `make test CPUS=1` | `test--1-CPU.log` |
 | soak | `make stress CPUS=4 STRESS_SECS=<n>` (default 60, from `--stress-secs` or `$STRESS_SECS`) | `soak.log` |
 | replay | `make replay-check` | `replay.log` |
+| selfhost | `make selfhost` | `selfhost.log` |
 
 3. Print `ci: <step> ok|FAILED (Ns)` per step (on a TTY a `...` placeholder is overwritten with `\r`). On failure print the last 20 log lines and stop, unless `--keep-going`.
 4. Print `ci: X of Y steps passed in Ns` and exit 0 only if every step ran and passed.
 
-`--quick` drops `test (1 CPU)` and `soak`. Pass flags with `make ci CI_FLAGS="--quick --keep-going"`. GNU make exports command-line variables to recipe environments, so `make ci STRESS_SECS=30` reaches `ci.py` through `$STRESS_SECS`.
+`--quick` drops `test (1 CPU)`, `soak` and `selfhost`. A full run is 7 steps (about 4 minutes). Pass flags with `make ci CI_FLAGS="--quick --keep-going"`. GNU make exports command-line variables to recipe environments, so `make ci STRESS_SECS=30` reaches `ci.py` through `$STRESS_SECS`.
 
 ## Concurrency and locking
 
@@ -451,6 +453,7 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 | `replay-check` | kernel, image | Record and replay `panic=shutdown ktest`; require identical output |
 | `flamegraph` | (`build/profile.bin`) | `euprof.py report`, `svg` and `folded`, all with `--no-idle` |
 | `trace-json` | (`build/trace.bin`) | `eutrace.py perfetto` → `build/trace.json` |
+| `selfhost` | kernel, image, mkfs | Eunuchs builds its own user space twice with tcc in the guest (`tools/selfhost.py`), requires the two stages identical, makes `build/selfhost/fs.img` from stage 2 and runs the whole `make test` scenario on it ([13](13-toolchain.md#eunuchs-builds-its-own-user-space-userbuildmk-make-selfhost)) |
 | `clean` | | `rm -rf build` (keeps `home.img`) |
 | `sysroot` | `/bin/tcc`'s runtime, `libc.a` | Stage `build/sysroot` (headers, start-up files, `libc.a`, `libtcc1.a`, `runmain.o`), which the image copies to `/usr` ([13](13-toolchain.md)) |
 | `clean-home` | | `rm -f home.img` |
@@ -487,7 +490,8 @@ Boot options most used with these targets (the full list is printed by the `help
 
 | Tool | Usage |
 |---|---|
-| `tools/run_tests.py` | `--qemu "CMD"` (required; QEMU without disk), `--image` (required), `--mkfs` (required), `--timeout` (default 60), `--append` (default empty) |
+| `tools/run_tests.py` | `--qemu "CMD"` (required; QEMU without disk), `--image` (required), `--mkfs` (required), `--timeout` (default 60), `--append` (default empty), `--programs DIR` (the programs in the image, default `build/user/stripped`; the 9P stage compares the guest's copy of `/bin/cat` with `DIR/cat`) |
+| `tools/selfhost.py` | `--qemu "CMD" --image build/fs.img [--timeout 900]`: boots with the repository shared, runs both stages of `user/build.mk`, compares them |
 | `tools/ci.py` | `--quick`, `--keep-going`, `--stress-secs N` (default `$STRESS_SECS` or 60); honours `$MAKE` |
 | `tools/timeout.py` | `timeout.py SECONDS CMD...`: exit status of CMD, or 124 after killing it |
 | `tools/gen_ksyms.py` | stdin: `nm -n` output; stdout: assembly |

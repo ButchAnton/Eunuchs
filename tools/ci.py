@@ -9,8 +9,10 @@ Steps (each one's output is in build/ci/<step>.log):
   test (1 CPU)  the same on a uniprocessor
   soak          SMP stress for STRESS_SECS (default 60) with lockdep=panic
   replay        record a boot, replay it, require identical output
-Exit status 0 only if every step passed. Options: --quick (skip the 1-CPU run
-and the soak), --keep-going (run every step even after a failure).
+  selfhost      Eunuchs builds its own user space with tcc, twice (identical),
+                and the full scenario runs on an image of what it built
+Exit status 0 only if every step passed. Options: --quick (skip the 1-CPU run,
+the soak and selfhost), --keep-going (run every step even after a failure).
 """
 import argparse
 import os
@@ -42,9 +44,10 @@ def main():
         ("test (1 CPU)", make + ["test", "CPUS=1"]),
         ("soak", make + ["stress", "CPUS=4", "STRESS_SECS=%s" % a.stress_secs]),
         ("replay", make + ["replay-check"]),
+        ("selfhost", make + ["selfhost"]),
     ]
     if a.quick:
-        steps = [s for s in steps if s[0] not in ("test (1 CPU)", "soak")]
+        steps = [s for s in steps if s[0] not in ("test (1 CPU)", "soak", "selfhost")]
 
     results = []
     t_all = time.time()
