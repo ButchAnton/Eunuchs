@@ -156,7 +156,7 @@ Faults become catchable signals (`SIGSEGV`, `SIGILL`, `SIGBUS`). The detailed cr
 
 User programs are built for `rv64gc` and may use floating point. The kernel is built without FP; a thread gets zeroed FP registers on its first FP instruction (an illegal-instruction trap the kernel absorbs) and from then on they are saved and restored at context switches, copied by `fork`, and carried in signal frames. In GDB, `info registers float` shows the live user values only while that thread is the one running on the CPU; otherwise look at `((struct thread *)T)->fp`.
 
-Programs compiled on Eunuchs with `tcc` keep a symbol table; compile with `tcc -g` to debug them at source level with `db`. To chase a compile problem, `tcc -vv` shows the search paths and files used, `strace tcc ...` the system calls, and the same compiler runs on the Mac as `build/tcc/xtcc -Bbuild/sysroot/usr/lib/tcc`; disassemble its output with `riscv64-elf-objdump -d`. See [13-toolchain.md](subsystems/13-toolchain.md#debugging-and-observability).
+Programs compiled on Eunuchs with `tcc` keep a symbol table; compile with `tcc -g` to debug them at source level with `db`. To chase a compile problem, `tcc -vv` shows the search paths and files used, `strace tcc ...` the system calls, and the same compiler runs on the Mac as `build/tcc/xtcc -Bbuild/sysroot/usr/lib/tcc`; disassemble its output with `riscv64-elf-objdump -d`. For an assembly file, compare tcc with GNU as: assemble with both, link each at a fixed address with `riscv64-elf-ld`, and compare the bytes (`tests/host/test_tcc_asm.py` does exactly this; see [13](subsystems/13-toolchain.md#the-assembler)). See [13-toolchain.md](subsystems/13-toolchain.md#debugging-and-observability).
 
 ## Threads, scheduling and locks
 

@@ -1152,6 +1152,18 @@ ST_FUNC void tok_str_add_tok(TokenString *s)
     tok_str_add2(s, tok, &tokc);
 }
 
+/* for the assembler's macros: add a token with its value, and read one */
+ST_FUNC void tok_str_add_val(TokenString *s, int t, CValue *cv)
+{
+    tok_str_add2(s, t, cv);
+}
+
+static inline void tok_get(int *t, const int **pp, CValue *cv);
+ST_FUNC void tok_str_get(int *t, const int **pp, CValue *cv)
+{
+    tok_get(t, pp, cv);
+}
+
 /* like tok_str_add2(), add a space if needed */
 static void tok_str_add2_spc(TokenString *s, int t, CValue *cv)
 {

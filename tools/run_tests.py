@@ -386,6 +386,10 @@ def main():
         f.write("made on the mac\n")
     with open(os.path.join(share, "gone.txt"), "w") as f:
         f.write("delete me\n")
+    # hand-written assembly (macros, .irp, local labels, li, la, lr/sc, call)
+    # for tcc's assembler, with a C caller
+    for name in ("asmtest.S", "asmtest.c"):
+        shutil.copy(os.path.join(ROOT, "tests", "guest", name), share)
     interactive("host share (9p)", [
         ("cat /mnt/host/from-mac.txt", "made on the mac"),
         ("echo made in eunuchs > /mnt/host/from-guest.txt && mkdir /mnt/host/d && "
@@ -398,6 +402,8 @@ def main():
          "ls /mnt/host/t > /dev/null && rm /mnt/host/t/gone1 && echo count=$(ls /mnt/host/t | grep -c one)",
          "count=0"),
         ("rm -rf /mnt/host/t && echo removed", "removed"),
+        ("tcc -o /tmp/asmtest /mnt/host/asmtest.S /mnt/host/asmtest.c && /tmp/asmtest",
+         "sum=55 shifts=f000000006064245 big=123456789abcdef0 table=4321 inc=42 call=20"),
     ], extra=["-fsdev", "local,id=hostfs,path=%s,security_model=none" % share,
               "-device", "virtio-9p-device,fsdev=hostfs,mount_tag=host"])
     t0 = time.time()

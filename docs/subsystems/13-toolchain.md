@@ -62,11 +62,12 @@ Every path is relative to `{B}`. The same configuration therefore works on the h
 
 ### The patches to TinyCC
 
-All three are marked with "Eunuchs" comments.
+The first three are small and marked with "Eunuchs" comments; the fourth is the rewrite of most of the RISC-V assembler (below).
 
 1. `riscv64-link.c` gains support for the absolute relocations `R_RISCV_HI20`, `R_RISCV_LO12_I` and `R_RISCV_LO12_S` (an address split over `lui` and `addi`/a load/a store), marked with "Eunuchs" comments. tcc never emits them itself, but Homebrew's `libgcc.a` is compiled with `-mcmodel=medlow`, which does, and `libtcc1.a` includes libgcc. The addresses fit because programs are linked at `0x10000`.
 2. `riscv64-gen.c` (`gfunc_call`): an argument passed on the stack (the 9th and later) was stored through an lvalue that kept the argument's type, `const` included, so a `const`-qualified argument drew the warning "assignment of read-only location". The slot's type now drops `VT_CONSTANT`. This was a warning only; the code was right.
 3. `tccdbg.c` (`tcc_debug_end`): before the `DW_LNE_end_sequence` that closes the line program, the address is advanced to the end of the text. Without it the sequence ended at the last row's address, so a last function written on one line (`int f(void) { return 1; }`) covered no addresses and a debugger could not map its code to a line.
+4. The assembler: `tccasm.c`, `tccpp.c`, `tcc.h`, `tcctok.h`, `riscv64-asm.c` and `riscv64-tok.h` ([The assembler](#the-assembler)).
 
 ### The sysroot (`build/sysroot`, copied into the image)
 
@@ -131,12 +132,48 @@ cd /mnt/host/user/bin && make -f /usr/src/Makefile BIN=/tmp/bin
 
 builds every program from the current Mac sources in about 7 seconds (the `/usr/src` Makefile's wildcards pick up `*.c` and the `db/`, `edit/`, `esh/` directories from the current directory). With `BIN` under `/mnt/host`, the results appear on the Mac. Edit on the Mac, build and test on Eunuchs, without rebuilding the image.
 
+### The assembler
+
+tcc assembles `.S` files (after running its preprocessor on them) and inline `asm` statements with its own assembler; its C code generator emits machine code directly and never goes through it, so ordinary C was never affected by the assembler's bugs. As vendored, the RISC-V assembler could not handle our assembly and silently produced wrong code for several instructions. It now assembles every `.S` file in the tree (`kernel/arch/riscv/{boot,fp,safe,switch,trapentry,uaccess}.S`, `user/lib/{crt0,setjmp,syscall}.S`) to the same bytes as GNU as after linking, in `xtcc` on the Mac and in `/bin/tcc` on Eunuchs (same source; checked in the guest by writing objects to the 9P share and comparing them on the Mac). This is step 1 of self-hosting.
+
+**Directives added:**
+- `.macro NAME params` … `.endm`: parameters with `=default`, comma-separated arguments; `\param` substitution is textual (so `x\n` pastes to `x1`), `\()` separates a parameter from following text, and unknown `\names` pass through (so a `.irp` inside a macro works). Macros are forgotten at the end of each file.
+- `.irp`, `.dword` (= `.quad`), `.equ` (= `.set`).
+- Data sizes as in gas for RISC-V: `.word` is 4 bytes (vendored tcc made it 2, as on x86, so the `.word 0` meant as a 4-byte illegal instruction in `kernel/debug/monitor.c` and `user/bin/segv.c` was a different instruction when built with tcc), `.half` and `.short` 2, and the explicit `.2byte`, `.4byte`, `.8byte` (tcc's lexer reads `.2byte` as a number, so `tcc_assemble_internal` recognizes those spellings itself), besides `.byte`, `.long`, `.int`, `.quad`.
+- `.option arch, …` (accepted and ignored: all of RV64GC is always available); `.option pic`/`nopic` and `push`/`pop` (tracked; they change `la`).
+- `.section NAME, "flags", @type` honours the types (`@nobits`, `@note`, `@init_array`, …); with no flags string it infers them as gas does (`.text*` `ax`; `.data*`, `.sdata*`, `.bss*`, `.sbss*` `aw`; `.bss*`/`.sbss*` nobits).
+- `.cfi_*` directives are accepted and **ignored**: tcc writes no `.eh_frame` for assembly.
+- Backslashes are allowed in assembly source.
+
+**Registers and CSRs:** the alias `fp` for `s0`; every standard S-mode and M-mode CSR by name (`sstatus`, `sepc`, `scause`, `stval`, `sip`, `sie`, `stvec`, `sscratch`, `satp`, `stimecmp`, `mstatus` … `mhartid`, …). An unknown CSR name is now an error; it used to encode CSR 0.
+
+**Instructions added:** `sret`, `mret`, `unimp`, `sfence.vma [rs1[, rs2]]`, `fence.tso`, `flw`/`fsw`, `fmsub`/`fnmsub`/`fnmadd` (`.s`/`.d`), `fsgnjn`/`fsgnjx`, `fmv.x.w`/`fmv.w.x`/`fmv.x.d`/`fmv.d.x`, an optional rounding mode (`rne rtz rdn rup rmm dyn`) on `fadd`/`fsub`/`fmul`/`fdiv`/`fsqrt`/the fused forms and `fcvt`, `fscsr`/`fsrm`/`fsflags` with one or two operands, `jalr rd, rs, imm`, `jalr imm(rs)`, `jr imm(rs)`, `jump sym, temp`, and loads and stores of a symbol (`ld rd, sym`; `sd rs, sym, temp`).
+
+**Pseudo-instructions now mean what they mean in gas:**
+- `la` is `lla` (`auipc` + `addi`, `R_RISCV_PCREL_HI20`/`LO12_I`) unless `.option pic` is in effect, when it loads from the GOT with `ld` (it used `lw`, truncating addresses).
+- `li` emits gas's minimal sequence (the same constant-loading algorithm); it always used 8 instructions.
+- `call` is `auipc ra` + `jalr ra` with `R_RISCV_CALL_PLT`; it was `jalr zero` (so a call never returned) with stray GOT relocations.
+- Branches and jumps to labels emit `R_RISCV_BRANCH`/`R_RISCV_JAL`, or are resolved on the spot when the label is local, already defined and in the same section.
+
+**Bugs fixed that made silently wrong code:** a branch to any label became an inverted branch plus an `auipc t0` with no `jalr`; B-type `imm[10:5]` was masked to 5 bits (backward branches and branches of 1 KiB or more were wrong); `j`/`jal` to a `.globl` label was rejected; `srl` was encoded as `xor`, `sraw` as `srlw`, `sraiw` as `srliw`; `bgez` and `blez` were swapped; `lr.*` was encoded as `amoand`, `sc.*` and `amoor` as `amominu`; `fence iorw` lost the i/o bits; `fcvt.d.w`, `fcvt.d.wu` and `fcvt.d.s` had an invalid rounding field; `csrs`/`csrc` and friends with CSR names used CSR 0; the `jal` range check was off by one.
+
+**Compressed instructions** were rewritten: gas syntax (`c.lw rd', off(rs1')`, `c.lwsp rd, off(sp)`, …), correct encodings (`c.sw`/`c.sd` had their register fields swapped, `c.lui` was mis-scaled), labels on `c.j`/`c.beqz`/`c.bnez` (`R_RISCV_RVC_JUMP`/`RVC_BRANCH`), range checks, and the RV32-only `c.flw`, `c.fsw`, `c.flwsp`, `c.fswsp` and `c.jal` rejected (on RV64 those encodings mean `c.ld`, `c.sd`, `c.ldsp`, `c.sdsp` and `c.addiw`).
+
+**Still different from gas:**
+- No `%hi()`, `%lo()`, `%pcrel_hi()`/`%pcrel_lo()` operators: use `la`/`lla`, `li` and the symbol forms of loads and stores.
+- No automatic compression (only explicit `c.*` instructions are 2 bytes) and no linker relaxation, so tcc's objects are bigger than gas's default output (the comparison test assembles with `-march=rv64g -mno-relax` for that reason).
+- No unwind tables from `.cfi_*`, so GDB and `db` cannot unwind through assembly functions in a tcc-built object by CFI (frame pointers still work where the code keeps them).
+- No `.irpc`, no `\@` in macros, no `:req`/`:vararg` parameters, no whitespace-separated macro arguments.
+
+**Tests:** `tests/host/test_tcc_asm.py` compares tcc with GNU as on our files, a directives file and thousands of random instructions ([11](11-build-and-testing.md#host-tests-make-test-host)); the `host share (9p)` stage of `make test` assembles and runs `tests/guest/asmtest.S` with tcc on Eunuchs.
+
+**Debugging an assembly difference:** assemble the file with both (`build/tcc/xtcc -c -o a.o f.S`, `riscv64-elf-gcc -c -march=rv64g -mabi=lp64d -mno-relax -o b.o f.S`, with the same `-D`/`-I` options), link each at a fixed address (`riscv64-elf-ld -Ttext=0x80000000`, `--defsym` for undefined symbols), and compare the bytes, or `riscv64-elf-objdump -d` both and `diff`: that is what the test does.
+
 ### Dialect problems tcc exposed in our code
 
 tcc accepts most of GNU C, but these differences had to be worked around in the libc and the programs:
 
-- **`.word` is 2 bytes** in tcc's assembler (as on x86), not 4: use `.long` for 32-bit data in `.S` files.
-- **Inline assembly**: tcc saves and restores every callee-saved register an `asm` statement clobbers, around that statement, so values cannot be passed between `asm` statements in such registers (`utests`' FP tests load and read `fs` registers within one statement). Numeric local labels (`1:` with `1f`/`1b`) are unreliable. `fld`/`fsd` do not accept `"m"` operands: pass the address in a register.
+- **Inline assembly**: tcc saves and restores every callee-saved register an `asm` statement clobbers, around that statement, so values cannot be passed between `asm` statements in such registers (`utests`' FP tests load and read `fs` registers within one statement). Numeric local labels (`1:` with `1f`/`1b`) used to be unreliable; they work since the assembler work (tested in `tests/guest/asmtest.S`). `fld`/`fsd` do not accept `"m"` operands: pass the address in a register.
 - **Predefined macros**: tcc predefines `__linux__` but has no `__builtin_nan`, `__builtin_inf` or `__builtin_huge_val`, so `math.h` has a `__TINYC__` branch that defines `HUGE_VAL`, `INFINITY` and `NAN` with constant expressions (`1e500`, `0.0f / 0.0f`).
 
 ## Concurrency and locking
@@ -181,15 +218,15 @@ None of its own: tcc and make are ordinary single-threaded processes. Two builds
 - **`tcc -run` needs `mprotect`** and places code in the heap; there is no fallback mode.
 - **Self-hosting, measured** (building from `/mnt/host`):
   - **tcc compiles itself** on Eunuchs (`tcc.c` with `ONE_SOURCE`), but its sources are not in `/usr/src`, so that needs the share.
-  - **The libc**: every `user/lib/*.c` compiles with tcc; the `.S` files (`crt0.S`, `syscall.S`, `setjmp.S`) hit gaps in tcc's assembler.
-  - **The kernel**: 46 of its 76 C files compile with tcc. The blockers: no `stdint.h` for the freestanding kernel build (tcc's headers expect a libc's); the `__ATOMIC_*` constants; the inline-asm `"K"` constraint (a 5-bit CSR immediate); assembler gaps (`.macro`, `la`, the `fp` register alias, `.dword`, numeric local labels, `.option arch`); and a tcc assertion failure in its floating-point register allocator on `kernel/tests/test_debug.c`. Above all, linking: the kernel's linker script (a higher-half VMA different from the load address, page-aligned regions, `KEEP`ed tables with start and end symbols, `NOLOAD` stacks), which tcc's linker cannot express, and the two-pass link whose symbol table is generated by `tools/gen_ksyms.py`, a Python script.
+  - **The libc**: every `user/lib/*.c` compiles with tcc, and since the assembler work its `.S` files assemble too, to the same bytes as GNU as. Building the whole libc and `/bin` with tcc in the guest is the next step.
+  - **The kernel**: 46 of its 76 C files compile with tcc. The blockers: no `stdint.h` for the freestanding kernel build (tcc's headers expect a libc's); the `__ATOMIC_*` constants; the inline-asm `"K"` constraint (a 5-bit CSR immediate); the assembler gaps (`.macro`, `la`, the `fp` register alias, `.dword`, numeric local labels, `.option arch`), now closed: the kernel's `.S` files assemble identically; and a tcc assertion failure in its floating-point register allocator on `kernel/tests/test_debug.c`. Above all, linking: the kernel's linker script (a higher-half VMA different from the load address, page-aligned regions, `KEEP`ed tables with start and end symbols, `NOLOAD` stacks), which tcc's linker cannot express, and the two-pass link whose symbol table is generated by `tools/gen_ksyms.py`, a Python script.
 - **`make`**: no parallel builds (`-j` is ignored), no archive member syntax (`lib.a(obj.o)`), no `$(eval)`/`$(call)`/`define`; `vpath` and `unexport` lines are accepted and ignored.
 - **Size**: the sysroot adds about 4 MiB to the 32 MiB image (`libtcc1.a` is most of it, because all of libgcc is included).
 
 ## Potential improvements
 
 1. **Line numbers in fault reports** — Have the kernel (or a user-space helper run on a fault) map pcs to file:line through the DWARF line table that `db` already decodes, for programs built with `-g`. Impact: medium. Effort: medium.
-2. **Self-hosting, step by step** — (a) put `third_party/tinycc` in `/usr/src/tcc` with a Makefile, and check that the second generation is byte-identical to the first; (b) fill the assembler gaps the libc's `.S` files need (or rewrite them in tcc's dialect) so the whole libc builds on Eunuchs; (c) for the kernel: a freestanding `stdint.h`, `__ATOMIC_*` definitions, the `"K"` constraint, `.macro`/`la`/`.dword`/numeric labels in tcc's assembler, a fix for the register-allocator assertion; (d) a link path without GNU ld: either teach tcc's linker the few script features the kernel needs (separate VMA and LMA, alignment, keep and start/end symbols, NOLOAD) or have the kernel relocate itself from a flat image; and (e) `gen_ksyms` rewritten in C. Impact: medium. Effort: large.
+2. **Self-hosting, step by step** — (a) **done**: tcc's assembler handles every `.S` file in the tree, byte-identical to GNU as; (b) build the whole libc and every program in `/bin` with tcc on Eunuchs, and run the test suite against them; (c) put `third_party/tinycc` in `/usr/src/tcc` with a Makefile, and check that the second generation is byte-identical to the first; (d) the kernel's C: a freestanding `stdint.h`, `__ATOMIC_*` definitions, the `"K"` constraint, a fix for the register-allocator assertion; (e) a link path without GNU ld: teach tcc's linker the few script features the kernel needs (separate VMA and LMA, alignment, keep and start/end symbols, NOLOAD) or have the kernel relocate itself from a flat image, and rewrite `gen_ksyms` in C. Smaller assembler gaps: `%hi`/`%lo`/`%pcrel_*`, automatic compression, `.cfi` unwind tables, `.irpc`, `\@`. Impact: medium. Effort: large.
 3. **`-run` without `mprotect`** — A fallback that writes the program to `/tmp` and `exec`s it, for kernels or environments without `mprotect`. Impact: low. Effort: small.
 4. **`make -j`** — Run independent recipes in parallel with `fork` and `wait`; Eunuchs has four CPUs by default. Impact: medium. Effort: medium.
 5. **Trim `libtcc1.a`** — Include only the libgcc members that are actually needed (soft `long double`, a few integer helpers) instead of all of them. Impact: low. Effort: small.

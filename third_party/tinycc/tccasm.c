@@ -508,6 +508,263 @@ static void pop_section(TCCState *s1)
     use_section1(s1, prev);
 }
 
+/* GAS macros: .macro NAME [param[=default]][, ...] ... .endm, invoked as
+   NAME arg, ...; and .irp sym, v1, v2 ... .endr. Bodies are recorded as
+   (preprocessed) tokens, spaces included. An expansion turns them back into
+   text with each '\param' replaced by the argument's text, and assembles
+   that, so a parameter can be pasted onto other text (x\n -> x1) as in gas.
+   Arguments are separated by commas. */
+#define ASM_MACRO_MAX_PARAMS 16
+
+typedef struct AsmMacro {
+    struct AsmMacro *next;
+    int name, nparams;
+    int params[ASM_MACRO_MAX_PARAMS];
+    TokenString *defaults[ASM_MACRO_MAX_PARAMS];
+    TokenString *body;
+} AsmMacro;
+
+static AsmMacro *asm_macros;
+
+#ifdef TCC_TARGET_RISCV64
+/* .option pic/nopic, saved by .option push */
+ST_DATA int riscv_asm_pic;
+static int riscv_asm_option_stack[8], riscv_asm_option_sp;
+#endif
+
+static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global);
+
+static AsmMacro *asm_macro_find(int name)
+{
+    AsmMacro *m;
+    for (m = asm_macros; m; m = m->next)
+        if (m->name == name)
+            return m;
+    return NULL;
+}
+
+static void asm_macros_free(void)
+{
+    AsmMacro *m;
+    int i;
+    while ((m = asm_macros) != NULL) {
+        asm_macros = m->next;
+        for (i = 0; i < m->nparams; i++)
+            if (m->defaults[i])
+                tok_str_free(m->defaults[i]);
+        tok_str_free(m->body);
+        tcc_free(m);
+    }
+}
+
+static int asm_end_of_line(void)
+{
+    return tok == TOK_LINEFEED || tok == ';' || tok == TOK_EOF;
+}
+
+static void asm_skip_line(void)
+{
+    while (!asm_end_of_line())
+        next();
+}
+
+/* Record tokens up to the matching END directive (.endm or .endr), keeping
+   count of nested blocks that close with the same directive. */
+static TokenString *asm_record_body(int end)
+{
+    TokenString *body = tok_str_alloc();
+    int depth = 0, saved_parse_flags = parse_flags;
+    parse_flags |= PARSE_FLAG_SPACES;
+    for (;;) {
+        next();
+        if (tok == TOK_EOF || tok == CH_EOF)
+            tcc_error("end of file, %s not found", get_tok_str(end, NULL));
+        if (tok == end && depth-- == 0)
+            break;
+        if (end == TOK_ASMDIR_endr ? (tok == TOK_ASMDIR_rept || tok == TOK_ASMDIR_irp)
+                                   : tok == TOK_ASMDIR_macro)
+            depth++;
+        tok_str_add_tok(body);
+    }
+    parse_flags = saved_parse_flags;
+    tok_str_add(body, TOK_EOF);
+    return body;
+}
+
+/* One macro argument: tokens up to a comma outside parentheses or the end
+   of the line. */
+static TokenString *asm_macro_arg(void)
+{
+    TokenString *arg = tok_str_alloc();
+    int paren = 0, saved_parse_flags = parse_flags;
+    parse_flags |= PARSE_FLAG_SPACES;
+    while (tok == ' ' || tok == '\t')
+        next();
+    while (!asm_end_of_line() && (tok != ',' || paren)) {
+        if (tok == '(')
+            paren++;
+        else if (tok == ')')
+            paren--;
+        tok_str_add_tok(arg);
+        next();
+    }
+    parse_flags = saved_parse_flags;
+    if (tok == ' ' || tok == '\t')
+        next();
+    tok_str_add(arg, TOK_EOF);
+    return arg;
+}
+
+/* Append the text of token string SRC to TEXT. */
+static void asm_str_text(CString *text, TokenString *src)
+{
+    const int *p = src->str;
+    CValue cv;
+    int t;
+    for (;;) {
+        tok_str_get(&t, &p, &cv);
+        if (t == TOK_EOF)
+            break;
+        if (t != TOK_LINENUM)
+            cstr_cat(text, get_tok_str(t, &cv), -1);
+    }
+}
+
+/* Assemble BODY with each '\params[i]' replaced by args[i]. */
+static void asm_expand_body(TCCState *s1, int name, TokenString *body, int nparams,
+                            const int *params, TokenString **args, int global)
+{
+    const int *saved_macro_ptr = macro_ptr;
+    const int *p = body->str;
+    CString text;
+    CValue cv;
+    int t, i;
+
+    cstr_new(&text);
+    for (;;) {
+        tok_str_get(&t, &p, &cv);
+        if (t == TOK_EOF)
+            break;
+        if (t == TOK_LINENUM)
+            continue;
+        if (t == '\\') {
+            tok_str_get(&t, &p, &cv);
+            if (t == '(') {
+                /* '\()' separates a parameter from what follows */
+                tok_str_get(&t, &p, &cv);
+                if (t != ')')
+                    tcc_error("'\\(' without ')' in macro body");
+                continue;
+            }
+            for (i = 0; i < nparams && params[i] != t; i++)
+                ;
+            if (i < nparams) {
+                if (args[i])
+                    asm_str_text(&text, args[i]);
+            } else {
+                /* not ours: a nested .irp's, say */
+                cstr_ccat(&text, '\\');
+                cstr_cat(&text, get_tok_str(t, &cv), -1);
+            }
+            continue;
+        }
+        cstr_cat(&text, get_tok_str(t, &cv), -1);
+    }
+    /* assemble the text like a file of its own (already preprocessed) */
+    tcc_open_bf(s1, get_tok_str(name, NULL), text.size);
+    memcpy(file->buffer, text.data, text.size);
+    cstr_free(&text);
+    macro_ptr = NULL;
+    tcc_assemble_internal(s1, 0, global);
+    tcc_close();
+    macro_ptr = saved_macro_ptr;
+}
+
+/* .macro NAME [p1[=default]][, p2 ...] */
+static void asm_macro_define(TCCState *s1)
+{
+    AsmMacro *m;
+    next();
+    if (tok < TOK_IDENT)
+        expect("macro name");
+    if (asm_macro_find(tok))
+        tcc_error("macro '%s' already defined", get_tok_str(tok, NULL));
+    m = tcc_mallocz(sizeof(*m));
+    m->name = tok;
+    next();
+    if (tok == ',')
+        next();
+    while (!asm_end_of_line()) {
+        if (tok < TOK_IDENT)
+            expect("macro parameter name");
+        if (m->nparams == ASM_MACRO_MAX_PARAMS)
+            tcc_error("too many macro parameters");
+        m->params[m->nparams] = tok;
+        next();
+        if (tok == ':')
+            tcc_error("macro parameter qualifiers (:req, :vararg) are not supported");
+        if (tok == '=') {
+            next();
+            m->defaults[m->nparams] = asm_macro_arg();
+        }
+        m->nparams++;
+        if (tok == ',')
+            next();
+    }
+    m->body = asm_record_body(TOK_ASMDIR_endm);
+    m->next = asm_macros;
+    asm_macros = m;
+    next();
+}
+
+/* Expand macro M; the current token follows its name. */
+static void asm_macro_call(TCCState *s1, AsmMacro *m, int global)
+{
+    TokenString *args[ASM_MACRO_MAX_PARAMS], *given[ASM_MACRO_MAX_PARAMS];
+    int i, n = 0, end;
+    memset(given, 0, sizeof(given));
+    while (!asm_end_of_line()) {
+        if (n == m->nparams)
+            tcc_error("too many arguments to macro '%s'", get_tok_str(m->name, NULL));
+        given[n++] = asm_macro_arg();
+        if (tok == ',')
+            next();
+    }
+    for (i = 0; i < m->nparams; i++)
+        args[i] = given[i] && given[i]->len > 1 ? given[i] : m->defaults[i];
+    end = tok;
+    asm_expand_body(s1, m->name, m->body, m->nparams, m->params, args, global);
+    for (i = 0; i < n; i++)
+        tok_str_free(given[i]);
+    tok = end;
+}
+
+/* .irp SYM, v1, v2, ... : the body once per value with '\SYM' replaced */
+static void asm_irp(TCCState *s1, int global)
+{
+    TokenString *vals[256], *body;
+    int sym, n = 0, i;
+    next();
+    if (tok < TOK_IDENT)
+        expect("identifier");
+    sym = tok;
+    next();
+    while (!asm_end_of_line()) {
+        if (tok == ',')
+            next();
+        if (n == countof(vals))
+            tcc_error("too many .irp values");
+        vals[n++] = asm_macro_arg();
+    }
+    body = asm_record_body(TOK_ASMDIR_endr);
+    for (i = 0; i < n; i++) {
+        asm_expand_body(s1, TOK_ASMDIR_irp, body, 1, &sym, &vals[i], global);
+        tok_str_free(vals[i]);
+    }
+    tok_str_free(body);
+    next();
+}
+
 static void asm_parse_directive(TCCState *s1, int global)
 {
     int n, offset, v, size, tok1, c;
@@ -566,6 +823,8 @@ static void asm_parse_directive(TCCState *s1, int global)
         ind += size;
         break;
     case TOK_ASMDIR_quad:
+    case TOK_ASMDIR_dword:
+    case TOK_ASMDIR_8byte:
 #if PTR_SIZE == 8
 	size = 8;
 	goto asm_data;
@@ -600,12 +859,21 @@ static void asm_parse_directive(TCCState *s1, int global)
     case TOK_ASMDIR_byte:
         size = 1;
         goto asm_data;
+#ifdef TCC_TARGET_RISCV64
+    case TOK_ASMDIR_word:   /* as in gas: a RISC-V word is 4 bytes */
+        size = 4;
+        goto asm_data;
+#else
     case TOK_ASMDIR_word:
+#endif
     case TOK_ASMDIR_short:
+    case TOK_ASMDIR_half:
+    case TOK_ASMDIR_2byte:
         size = 2;
         goto asm_data;
     case TOK_ASMDIR_long:
     case TOK_ASMDIR_int:
+    case TOK_ASMDIR_4byte:
         size = 4;
     asm_data:
         next();
@@ -720,6 +988,37 @@ static void asm_parse_directive(TCCState *s1, int global)
             goto zero_pad;
         }
         break;
+    case TOK_ASMDIR_macro:
+        asm_macro_define(s1);
+        break;
+    case TOK_ASMDIR_endm:
+        tcc_error(".endm without .macro");
+        break;
+    case TOK_ASMDIR_irp:
+        asm_irp(s1, global);
+        break;
+    case TOK_ASMDIR_cfi_startproc:
+    case TOK_ASMDIR_cfi_endproc:
+    case TOK_ASMDIR_cfi_sections:
+    case TOK_ASMDIR_cfi_def_cfa:
+    case TOK_ASMDIR_cfi_def_cfa_offset:
+    case TOK_ASMDIR_cfi_def_cfa_register:
+    case TOK_ASMDIR_cfi_adjust_cfa_offset:
+    case TOK_ASMDIR_cfi_offset:
+    case TOK_ASMDIR_cfi_rel_offset:
+    case TOK_ASMDIR_cfi_restore:
+    case TOK_ASMDIR_cfi_undefined:
+    case TOK_ASMDIR_cfi_same_value:
+    case TOK_ASMDIR_cfi_register:
+    case TOK_ASMDIR_cfi_remember_state:
+    case TOK_ASMDIR_cfi_restore_state:
+    case TOK_ASMDIR_cfi_return_column:
+    case TOK_ASMDIR_cfi_signal_frame:
+        /* no unwind tables are made from assembly */
+        next();
+        asm_skip_line();
+        break;
+    case TOK_ASMDIR_equ:
     case TOK_ASMDIR_set:
 	next();
 	tok1 = tok;
@@ -896,7 +1195,7 @@ static void asm_parse_directive(TCCState *s1, int global)
         {
             char sname[256];
 	    int old_nb_section = s1->nb_sections;
-            int flags = SHF_ALLOC;
+            int flags = SHF_ALLOC, type = SHT_PROGBITS, have_flags = 0;
 
 	    tok1 = tok;
             /* XXX: support more options */
@@ -915,6 +1214,7 @@ static void asm_parse_directive(TCCState *s1, int global)
                 next();
                 if (tok != TOK_STR)
                     expect("string constant");
+                have_flags = 1;
                 for (p = tokc.str.data; *p; ++p) {
                     if (*p == 'w')
                         flags |= SHF_WRITE;
@@ -923,11 +1223,36 @@ static void asm_parse_directive(TCCState *s1, int global)
                 }
                 next();
                 if (tok == ',') {
+                    const char *t;
                     next();
                     if (tok == '@' || tok == '%')
                         next();
+                    t = get_tok_str(tok, &tokc);
+                    if (!strcmp(t, "nobits"))
+                        type = SHT_NOBITS;
+                    else if (!strcmp(t, "note"))
+                        type = SHT_NOTE;
+                    else if (!strcmp(t, "init_array"))
+                        type = SHT_INIT_ARRAY;
+                    else if (!strcmp(t, "fini_array"))
+                        type = SHT_FINI_ARRAY;
+                    else if (!strcmp(t, "preinit_array"))
+                        type = SHT_PREINIT_ARRAY;
                     next();
+                    /* entity size, group name, ...: ignored */
+                    while (tok != ';' && tok != TOK_LINEFEED && tok != TOK_EOF)
+                        next();
                 }
+            }
+            /* like gas, flags and type from the name when none are given */
+            if (!have_flags) {
+                if (!strncmp(sname, ".text", 5))
+                    flags |= SHF_EXECINSTR;
+                else if (!strncmp(sname, ".data", 5) || !strncmp(sname, ".sdata", 6) ||
+                         !strncmp(sname, ".bss", 4) || !strncmp(sname, ".sbss", 5))
+                    flags |= SHF_WRITE;
+                if (!strncmp(sname, ".bss", 4) || !strncmp(sname, ".sbss", 5))
+                    type = SHT_NOBITS;
             }
             last_text_section = cur_text_section;
 	    if (tok1 == TOK_ASMDIR_section)
@@ -944,6 +1269,7 @@ static void asm_parse_directive(TCCState *s1, int global)
                 if (!strcmp(sname, ".init") || !strcmp(sname, ".fini"))
                     flags |= SHF_EXECINSTR;
 	        cur_text_section->sh_flags = flags;
+	        cur_text_section->sh_type = type;
             }
         }
         break;
@@ -988,18 +1314,31 @@ static void asm_parse_directive(TCCState *s1, int global)
         switch(tok){
             case TOK_ASM_rvc:    /* Will be deprecated soon in favor of arch */
             case TOK_ASM_norvc:  /* Will be deprecated soon in favor of arch */
-            case TOK_ASM_pic:
-            case TOK_ASM_nopic:
-            case TOK_ASM_relax:
+            case TOK_ASM_relax:  /* the linker does not relax */
             case TOK_ASM_norelax:
+                next();
+                break;
+            case TOK_ASM_pic:    /* 'la' goes through the GOT */
+            case TOK_ASM_nopic:  /* 'la' is 'lla' (the default) */
+                riscv_asm_pic = tok == TOK_ASM_pic;
+                next();
+                break;
             case TOK_ASM_push:
+                if (riscv_asm_option_sp == countof(riscv_asm_option_stack))
+                    tcc_error(".option push nested too deeply");
+                riscv_asm_option_stack[riscv_asm_option_sp++] = riscv_asm_pic;
+                next();
+                break;
             case TOK_ASM_pop:
-                /* TODO: unimplemented */
+                if (riscv_asm_option_sp == 0)
+                    tcc_error(".option pop without .option push");
+                riscv_asm_pic = riscv_asm_option_stack[--riscv_asm_option_sp];
                 next();
                 break;
             case TOK_ASM_arch:
-                /* TODO: unimplemented, requires extra parsing */
-                tcc_error("unimp .option '.%s'", get_tok_str(tok, NULL));
+                /* all of rv64gc is always available: accept and ignore */
+                next();
+                asm_skip_line();
                 break;
             default:
                 tcc_error("unknown .option '.%s'", get_tok_str(tok, NULL));
@@ -1070,7 +1409,8 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
     int opcode;
     int saved_parse_flags = parse_flags;
 
-    parse_flags = PARSE_FLAG_ASM_FILE | PARSE_FLAG_TOK_STR;
+    /* strays: '\param' in macro bodies */
+    parse_flags = PARSE_FLAG_ASM_FILE | PARSE_FLAG_TOK_STR | PARSE_FLAG_ACCEPT_STRAYS;
     if (do_preprocess)
         parse_flags |= PARSE_FLAG_PREPROCESS;
     for(;;) {
@@ -1088,6 +1428,18 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
         } else
 #endif
         if (tok >= TOK_ASMDIR_FIRST && tok <= TOK_ASMDIR_LAST) {
+            asm_parse_directive(s1, global);
+        } else if (tok == TOK_PPNUM && tokc.str.data[0] == '.') {
+            /* .2byte, .4byte, .8byte look like numbers to the lexer */
+            const char *p = tokc.str.data;
+            if (!strcmp(p, ".2byte"))
+                tok = TOK_ASMDIR_2byte;
+            else if (!strcmp(p, ".4byte"))
+                tok = TOK_ASMDIR_4byte;
+            else if (!strcmp(p, ".8byte"))
+                tok = TOK_ASMDIR_8byte;
+            else
+                tcc_error("unknown assembler directive '%s'", p);
             asm_parse_directive(s1, global);
         } else if (tok == TOK_PPNUM) {
             const char *p;
@@ -1114,7 +1466,11 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
 		set_symbol(s1, opcode);
                 goto redo;
             } else {
-                asm_opcode(s1, opcode);
+                AsmMacro *m = asm_macro_find(opcode);
+                if (m)
+                    asm_macro_call(s1, m, global);
+                else
+                    asm_opcode(s1, opcode);
             }
         }
         /* end of line */
@@ -1137,6 +1493,10 @@ ST_FUNC int tcc_assemble(TCCState *s1, int do_preprocess)
     ind = cur_text_section->data_offset;
     nocode_wanted = 0;
     ret = tcc_assemble_internal(s1, do_preprocess, 1);
+    asm_macros_free();
+#ifdef TCC_TARGET_RISCV64
+    riscv_asm_pic = riscv_asm_option_sp = 0;
+#endif
     cur_text_section->data_offset = ind;
     tcc_debug_end(s1);
     return ret;

@@ -786,6 +786,7 @@ Commands:
   - Macros, `.` and `:normal` cannot drive the `:` and `/` prompts (the prompt reads the terminal directly), so a recorded `:s///` waits for the user on replay. `N.` repeats the whole previous command N times (`3dd` then `2.` deletes six lines). `f`, `t` and `r` take one byte, not one UTF-8 character.
   - Registers `"1`–`"9`, `"_`, `"-` and appending with `"A` are not implemented; any other register name means the unnamed one. Marks do not move when lines are inserted or deleted above them.
   - In emacs, undoing back to the saved text does not clear the modified flag.
+- **Missing commands**: there is no `basename` or `dirname` (in esh use `${f##*/}` and `${f%/*}`, or the `:t` and `:h` modifiers), and no `find`, `xargs`, `sed`, `sort`, `diff` or `cmp`.
 - **`lookup_user` reads only 1023 bytes** of `/etc/passwd` (so does `ps`'s user and group lookup, with 2047).
 - **`httpd`**: files over 64 KiB are truncated; `HEAD` replies say `Content-Length: 0`. The directory-listing loop stops only when `len` reaches `sizeof(body) - 300`, but one entry can add almost 400 bytes, so a listing that long could make `sizeof(body) - len` wrap and overflow `body`. An empty path (`GET  HTTP/1.0`) reads `path[-1]`.
 - **`echod`'s header comment** says it logs every connection and datagram; the code logs nothing after start-up. **`eutils.c`'s header comment** omits `crc32` and `profile`.

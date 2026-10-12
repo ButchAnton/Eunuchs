@@ -151,6 +151,8 @@
  DEF_ASM(ft11)
  /* not in the ABI */
  DEF_ASM(pc)
+ /* the frame pointer, another name for s0 */
+ DEF_ASM(fp)
 
 /*   Loads */
 
@@ -270,6 +272,10 @@
  /* enough implemented for musl */
  DEF_ASM_WITH_SUFFIX(fsgnj, s)
  DEF_ASM_WITH_SUFFIX(fsgnj, d)
+ DEF_ASM_WITH_SUFFIX(fsgnjn, s)
+ DEF_ASM_WITH_SUFFIX(fsgnjn, d)
+ DEF_ASM_WITH_SUFFIX(fsgnjx, s)
+ DEF_ASM_WITH_SUFFIX(fsgnjx, d)
  DEF_ASM_WITH_SUFFIX(fadd, s)
  DEF_ASM_WITH_SUFFIX(fadd, d)
  DEF_ASM_WITH_SUFFIX(fsub, s)
@@ -280,6 +286,16 @@
  DEF_ASM_WITH_SUFFIX(fdiv, d)
  DEF_ASM_WITH_SUFFIX(fmadd, s)
  DEF_ASM_WITH_SUFFIX(fmadd, d)
+ DEF_ASM_WITH_SUFFIX(fmsub, s)
+ DEF_ASM_WITH_SUFFIX(fmsub, d)
+ DEF_ASM_WITH_SUFFIX(fnmsub, s)
+ DEF_ASM_WITH_SUFFIX(fnmsub, d)
+ DEF_ASM_WITH_SUFFIX(fnmadd, s)
+ DEF_ASM_WITH_SUFFIX(fnmadd, d)
+ DEF_ASM_WITH_SUFFIXES(fmv, x, w)
+ DEF_ASM_WITH_SUFFIXES(fmv, w, x)
+ DEF_ASM_WITH_SUFFIXES(fmv, x, d)
+ DEF_ASM_WITH_SUFFIXES(fmv, d, x)
  DEF_ASM_WITH_SUFFIX(fmax, s)
  DEF_ASM_WITH_SUFFIX(fmax, d)
  DEF_ASM_WITH_SUFFIX(fmin, s)
@@ -424,6 +440,11 @@
  DEF_ASM(mrth)
  DEF_ASM(hrts)
  DEF_ASM(wfi)
+ DEF_ASM(sret)
+ DEF_ASM(mret)
+ DEF_ASM_WITH_SUFFIX(sfence, vma)
+ DEF_ASM_WITH_SUFFIX(fence, tso)
+ DEF_ASM(unimp)
 
 /* pseudoinstructions */
  DEF_ASM(beqz)
@@ -585,6 +606,7 @@
  DEF_ASM(rdn)
  DEF_ASM(rup)
  DEF_ASM(rmm)
+ DEF_ASM(dyn)
 
  /* `fence` arguments */
 /* NOTE: Order is important */

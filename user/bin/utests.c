@@ -1276,9 +1276,7 @@ static void fp_clobber_handler(int sig)
 {
     (void)sig;
     /* use the FP registers the interrupted code was using */
-    /* fmv.d.x ft0, zero; fmv.d.x fs1, zero, encoded: tcc's assembler lacks them
-       (.long is 4 bytes in both assemblers; tcc's .word is 2) */
-    asm volatile(".long 0xf2000053\n\t.long 0xf20004d3" ::: "ft0", "fs1");
+    asm volatile("fmv.d.x ft0, zero\n\tfmv.d.x fs1, zero" ::: "ft0", "fs1");
 }
 
 static void t_float(void)

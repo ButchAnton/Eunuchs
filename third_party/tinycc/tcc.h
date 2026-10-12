@@ -1389,6 +1389,8 @@ ST_FUNC void tok_str_free(TokenString *s);
 ST_FUNC void tok_str_free_str(int *str);
 ST_FUNC void tok_str_add(TokenString *s, int t);
 ST_FUNC void tok_str_add_tok(TokenString *s);
+ST_FUNC void tok_str_add_val(TokenString *s, int t, CValue *cv);
+ST_FUNC void tok_str_get(int *t, const int **pp, CValue *cv);
 ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg);
 ST_FUNC void define_undef(Sym *s);
 ST_INLN Sym *define_find(int v);
@@ -1750,6 +1752,9 @@ ST_FUNC int find_constraint(ASMOperand *operands, int nb_operands, const char *n
 ST_FUNC Sym* get_asm_sym(int name, Sym *csym);
 ST_FUNC void asm_expr(TCCState *s1, ExprValue *pe);
 ST_FUNC int asm_int_expr(TCCState *s1);
+#ifdef TCC_TARGET_RISCV64
+ST_DATA int riscv_asm_pic; /* .option pic: 'la' loads from the GOT */
+#endif
 #if PTR_SIZE == 8
 ST_FUNC void gen_expr64(ExprValue *pe);
 #endif

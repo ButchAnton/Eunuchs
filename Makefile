@@ -462,10 +462,12 @@ $(BUILD)/host/%: tests/host/%.c
 	$(call msg,HOSTCC,$@)
 	$(Q)$(HOSTCC) $(HOST_CFLAGS) $(if $(filter %test_tcp,$@),-DNET_HOST_TEST) -o $@ $^
 
-test-host: $(HOST_TESTS) $(MKFS) $(BUILD)/user/bin/hello
+test-host: $(HOST_TESTS) $(MKFS) $(BUILD)/user/bin/hello $(XTCC)
 	@for t in $(HOST_TESTS); do echo "== $$t"; $$t || exit 1; done
 	@echo "== tests/host/test_fsck.py"
 	@$(PYTHON) tests/host/test_fsck.py $(MKFS) $(BUILD)/user/bin/hello
+	@echo "== tests/host/test_tcc_asm.py"
+	@$(PYTHON) tests/host/test_tcc_asm.py $(XTCC) $(TCC_SRC) $(CROSS)
 
 clean:
 	rm -rf $(BUILD)

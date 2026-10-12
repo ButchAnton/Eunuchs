@@ -24,6 +24,7 @@ enum {
     OPT_REG,
     OPT_IM12S,
     OPT_IM32,
+    OPT_SYM,
 };
 // Registers go from 0 to 31. We use next bit to choose general/float
 #define REG_FLOAT_MASK 0x20
@@ -38,6 +39,9 @@ enum {
 #define OP_IM12S (1 << OPT_IM12S)
 #define OP_IM32 (1 << OPT_IM32)
 #define OP_REG (1 << OPT_REG)
+/* a reference to a symbol (plus e.v): only pseudo-instructions, jumps and
+   branches accept one, and they emit the relocations */
+#define OP_SYM (1 << OPT_SYM)
 
 typedef struct Operand {
     uint32_t type;
@@ -70,6 +74,9 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
 static void asm_nullary_opcode(TCCState *s1, int token);
 ST_FUNC void asm_opcode(TCCState *s1, int token);
 static int asm_parse_csrvar(int t);
+static uint32_t asm_csr_num(int token, const Operand *op);
+static int asm_fcvt_rm(TCCState *s1);
+static void asm_fcsr_write_opcode(TCCState *s1, int token, int csr);
 ST_FUNC int asm_parse_regvar(int t);
 static void asm_ternary_opcode(TCCState *s1, int token);
 static void asm_unary_opcode(TCCState *s1, int token);
@@ -80,16 +87,7 @@ static void parse_branch_offset_operand(TCCState *s1, Operand *op);
 static void parse_operands(TCCState *s1, Operand *ops, int count);
 static void parse_mem_access_operands(TCCState *s1, Operand* ops);
 ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier);
-/* C extension */
-static void asm_emit_ca(int token, uint16_t opcode, const Operand *rd, const Operand *rs2);
-static void asm_emit_cb(int token, uint16_t opcode, const Operand *rs1, const Operand *imm);
-static void asm_emit_ci(int token, uint16_t opcode, const Operand *rd, const Operand *imm);
-static void asm_emit_ciw(int token, uint16_t opcode, const Operand *rd, const Operand *imm);
-static void asm_emit_cj(int token, uint16_t opcode, const Operand *imm);
-static void asm_emit_cl(int token, uint16_t opcode, const Operand *rd, const Operand *rs1, const Operand *imm);
-static void asm_emit_cr(int token, uint16_t opcode, const Operand *rd, const Operand *rs2);
-static void asm_emit_cs(int token, uint16_t opcode, const Operand *rs2, const Operand *rs1, const Operand *imm);
-static void asm_emit_css(int token, uint16_t opcode, const Operand *rs2, const Operand *imm);
+static void asm_c_opcode(TCCState *s1, int token);
 
 /* XXX: make it faster ? */
 ST_FUNC void g(int c)
@@ -160,19 +158,21 @@ static void asm_nullary_opcode(TCCState *s1, int token)
     case TOK_ASM_wfi:
         asm_emit_opcode((0x1C << 2) | 3 | (0x105 << 20));
         return;
+    case TOK_ASM_sret:
+        asm_emit_opcode((0x1C << 2) | 3 | (0x102 << 20));
+        return;
+    case TOK_ASM_mret:
+        asm_emit_opcode((0x1C << 2) | 3 | (0x302 << 20));
+        return;
+    case TOK_ASM_unimp:
+        /* csrrw zero, cycle, zero: always illegal */
+        asm_emit_opcode((0x1C << 2) | 3 | (1 << 12) | (0xc00 << 20));
+        return;
 
     /* Pseudoinstructions */
     case TOK_ASM_ret:
         /* jalr zero, x1, 0 */
         asm_emit_opcode( 0x67 | (0 << 12) | ENCODE_RS1(1) );
-        return;
-
-    /* C extension */
-    case TOK_ASM_c_ebreak:
-        asm_emit_cr(token, 2 | (9 << 12), &zero, &zero);
-        return;
-    case TOK_ASM_c_nop:
-        asm_emit_ci(token, 1, &zero, &zimm);
         return;
 
     default:
@@ -184,7 +184,6 @@ static void asm_nullary_opcode(TCCState *s1, int token)
 static void parse_operand(TCCState *s1, Operand *op)
 {
     ExprValue e = {0};
-    Sym label = {0};
     int8_t reg;
 
     op->type = 0;
@@ -202,77 +201,61 @@ static void parse_operand(TCCState *s1, Operand *op)
     } else {
         asm_expr(s1, &e);
     }
-    op->type = OP_IM32;
     op->e = e;
-    /* compare against unsigned 12-bit maximum */
-    if (!op->e.sym) {
-        if ((int) op->e.v >= -0x1000 && (int) op->e.v < 0x1000)
-            op->type = OP_IM12S;
-    } else if (op->e.sym->type.t & (VT_EXTERN | VT_STATIC)) {
-        /* see also: "RISC-V ABIs Specification" V1.0
-
-           section 5.2 recommends using a GOT for
-           "possibly-undefined weak symbols"
-
-           section 5.3: "Medium position independent code model"
-           if this is a non-local symbol: use a GOT
-           non-local: outside of a pc-relative +- 2 GiB range
-        */
-
-        label.type.t = VT_VOID | VT_STATIC;
-
-        /* use the medium PIC model: GOT, auipc, lw */
-        if (op->e.sym->type.t & VT_STATIC)
-            greloca(cur_text_section, op->e.sym, ind, R_RISCV_PCREL_HI20, 0);
-        else
-            greloca(cur_text_section, op->e.sym, ind, R_RISCV_GOT_HI20, 0);
-        put_extern_sym(&label, cur_text_section, ind, 0);
-        greloca(cur_text_section, &label, ind+4, R_RISCV_PCREL_LO12_I, 0);
-
+    if (e.sym)
+        op->type = OP_SYM;
+    else if ((int64_t) e.v >= -0x1000 && (int64_t) e.v < 0x1000)
         op->type = OP_IM12S;
-        op->e.v = 0;
-    } else {
-        expect("operand");
-    }
+    else
+        op->type = OP_IM32;
 }
 
+/* branch and jump targets: like any operand, but never registers */
 static void parse_branch_offset_operand(TCCState *s1, Operand *op){
     ExprValue e = {0};
 
     asm_expr(s1, &e);
-    op->type = OP_IM32;
     op->e = e;
-    /* compare against unsigned 12-bit maximum */
-    if (!op->e.sym) {
-        if ((int) op->e.v >= -0x1000 && (int) op->e.v < 0x1000)
-            op->type = OP_IM12S;
-    } else if (op->e.sym->type.t & (VT_EXTERN | VT_STATIC)) {
-        /* For extern/static symbols, always use far-branch expansion
-           since linker relaxation (R_RISCV_RELAX) is not implemented. */
+    if (e.sym)
+        op->type = OP_SYM;
+    else if ((int64_t) e.v >= -0x1000 && (int64_t) e.v < 0x1000)
+        op->type = OP_IM12S;
+    else
         op->type = OP_IM32;
-        op->e.v = 0;
-    } else {
-        expect("operand");
-    }
 }
 
-static void parse_jump_offset_operand(TCCState *s1, Operand *op){
-    ExprValue e = {0};
+#define parse_jump_offset_operand parse_branch_offset_operand
 
-    asm_expr(s1, &e);
-    op->type = OP_IM32;
-    op->e = e;
-    /* compare against unsigned 12-bit maximum */
-    if (!op->e.sym) {
-        if ((int) op->e.v >= -0x1000 && (int) op->e.v < 0x1000)
-            op->type = OP_IM12S;
-    } else if (op->e.sym->type.t & (VT_EXTERN | VT_STATIC)) {
-        greloca(cur_text_section, op->e.sym, ind, R_RISCV_JAL, 0);
-        op->type = OP_IM12S;
-        op->e.v = 0;
-    } else {
-        expect("operand");
-    }
+/* The pc-relative offset to a symbol operand that is already defined, local,
+   and in the current section; otherwise emit relocation TYPE for it at the
+   current position and return 0 (the linker fills the field in). */
+static int64_t asm_sym_offset(const Operand *op, int type)
+{
+    Sym *sym = op->e.sym;
+    ElfSym *esym = elfsym(sym);
+    if ((sym->type.t & VT_STATIC) && esym && esym->st_shndx == cur_text_section->sh_num)
+        return (int64_t)(esym->st_value + op->e.v) - ind;
+    greloca(cur_text_section, sym, ind, type, op->e.v);
+    return 0;
+}
+
+/* Relocations for an auipc at the current position and the instruction
+   after it that refer to op's symbol: HITYPE on the auipc, and LOTYPE on the
+   next instruction, pointing back at the auipc through a local label as the
+   psABI requires. */
+static void asm_pcrel_relocs(const Operand *op, int hitype, int lotype)
+{
+    Sym label = {0};
+    greloca(cur_text_section, op->e.sym, ind, hitype, hitype == R_RISCV_GOT_HI20 ? 0 : op->e.v);
+    label.type.t = VT_VOID | VT_STATIC;
+    put_extern_sym(&label, cur_text_section, ind, 0);
+    greloca(cur_text_section, &label, ind + 4, lotype, 0);
+}
+
+static void asm_need_sym(int token, const Operand *op)
+{
+    if (op->type != OP_SYM)
+        tcc_error("'%s': expected a symbol", get_tok_str(token, NULL));
 }
 
 static void parse_operands(TCCState *s1, Operand* ops, int count){
@@ -332,50 +315,43 @@ static void asm_jal_opcode(TCCState *s1, int token){
     asm_emit_j(token, 0x6f, &ops[0], &ops[1]);
 }
 
-/* This is special: It can be a pseudointruction or a instruction */
-static void asm_jalr_opcode(TCCState *s1, int token){
-    Operand ops[3];
-    Operand op;
-
-    parse_operand(s1, &ops[0]);
-    if ( tok == ',')
+/* The target of jr/jalr: "rs", "rs, imm", "imm(rs)" or "(rs)". */
+static void parse_jump_target(TCCState *s1, Operand *rs, Operand *imm)
+{
+    *imm = zimm;
+    if (tok == '(') {
         next();
-    else {
-        /* no more operands, it's the pseudoinstruction:
-         *  jalr rs
-         * Expand to:
-         *  jalr ra, 0(rs)
-         */
-        asm_emit_i(token, 0x67 | (0 << 12), &ra, &ops[0], &zimm);
-        return;
-    }
-
-    if ( tok == '(') {
-        /* `X, (Y)` case*/
-        next();
-        parse_operand(s1, &ops[1]);
+        parse_operand(s1, rs);
         skip(')');
-        ops[2] = zimm;
-    } else {
-        parse_operand(s1, &ops[2]);
-        if ( tok == '('){
-            /* `X, imm(Y)` case*/
+    } else if (asm_parse_regvar(tok) != -1) {
+        parse_operand(s1, rs);
+        if (tok == ',') {
             next();
-            parse_operand(s1, &ops[1]);
-            skip(')');
-        } else {
-            /* `X, Y` case*/
-            /* we parsed Y thinking it was imm, swap and default imm to zero */
-            op = ops[2];
-            ops[1] = ops[2];
-            ops[2] = op;
-            ops[2] = zimm;
+            parse_operand(s1, imm);
         }
+    } else {
+        parse_operand(s1, imm);
+        skip('(');
+        parse_operand(s1, rs);
+        skip(')');
     }
-    /* jalr(RD, RS1, IMM); I-format */
-    asm_emit_i(token, 0x67 | (0 << 12), &ops[0], &ops[1], &ops[2]);
 }
 
+/* jalr target (rd = ra) or jalr rd, target */
+static void asm_jalr_opcode(TCCState *s1, int token){
+    Operand rd = ra, rs, imm;
+    if (asm_parse_regvar(tok) != -1) {
+        parse_operand(s1, &rd);
+        if (tok != ',') {
+            /* jalr rs */
+            asm_emit_i(token, 0x67, &ra, &rd, &zimm);
+            return;
+        }
+        next();
+    }
+    parse_jump_target(s1, &rs, &imm);
+    asm_emit_i(token, 0x67, &rd, &rs, &imm);
+}
 
 static void asm_unary_opcode(TCCState *s1, int token)
 {
@@ -416,37 +392,21 @@ static void asm_unary_opcode(TCCState *s1, int token)
         asm_emit_opcode(opcode | (0x003 << 20) | ENCODE_RD(op.reg));
         return;
 
-    case TOK_ASM_jr:
-        /* jalr zero, 0(rs)*/
-        asm_emit_i(token, 0x67 | (0 << 12), &zero, &op, &zimm);
-        return;
     case TOK_ASM_call:
+        asm_need_sym(token, &op);
         /* auipc ra, 0 */
-        greloca(cur_text_section, op.e.sym, ind, R_RISCV_CALL, 0);
+        greloca(cur_text_section, op.e.sym, ind, R_RISCV_CALL_PLT, op.e.v);
         asm_emit_opcode(3 | (5 << 2) | ENCODE_RD(1));
-        /* jalr zero, 0(ra) */
-        asm_emit_opcode(0x67 | (0 << 12) | ENCODE_RS1(1));
+        /* jalr ra, 0(ra) */
+        asm_emit_opcode(0x67 | (0 << 12) | ENCODE_RD(1) | ENCODE_RS1(1));
         return;
     case TOK_ASM_tail:
+        asm_need_sym(token, &op);
         /* auipc x6, 0 */
-        greloca(cur_text_section, op.e.sym, ind, R_RISCV_CALL, 0);
+        greloca(cur_text_section, op.e.sym, ind, R_RISCV_CALL_PLT, op.e.v);
         asm_emit_opcode(3 | (5 << 2) | ENCODE_RD(6));
         /* jalr zero, 0(x6) */
         asm_emit_opcode(0x67 | (0 << 12) | ENCODE_RS1(6));
-        return;
-
-    /* C extension */
-    case TOK_ASM_c_j:
-        asm_emit_cj(token, 1 | (5 << 13), &op);
-        return;
-    case TOK_ASM_c_jal: /* RV32C-only */
-        asm_emit_cj(token, 1 | (1 << 13), &op);
-        return;
-    case TOK_ASM_c_jalr:
-        asm_emit_cr(token, 2 | (9 << 12), &op, &zero);
-        return;
-    case TOK_ASM_c_jr:
-        asm_emit_cr(token, 2 | (8 << 12), &op, &zero);
         return;
 
     default:
@@ -471,14 +431,21 @@ static void asm_emit_u(int token, uint32_t opcode, const Operand* rd, const Oper
     gen_le32(opcode | ENCODE_RD(rd->reg) | (rs2->e.v << 12));
 }
 
+/* a fence operand: some of i, o, r, w (in that order) */
 static int parse_fence_operand(){
-    int t = tok;
-    if ( tok == TOK_ASM_or ){
-        // we are in a fence instruction, parse as output read
-        t = TOK_ASM_or_fence;
+    const char *p = get_tok_str(tok, NULL), *order = "iorw";
+    int bits = 0;
+    if (tok < TOK_IDENT)
+        return -1;
+    for (; *p; p++) {
+        const char *c = strchr(order, *p);
+        if (!c)
+            return -1;
+        bits |= 8 >> (c - "iorw");
+        order = c + 1;
     }
     next();
-    return t - (TOK_ASM_w_fence - 1);
+    return bits;
 }
 
 static void asm_fence_opcode(TCCState *s1, int token){
@@ -499,6 +466,48 @@ static void asm_fence_opcode(TCCState *s1, int token){
     asm_emit_opcode((0x3 << 2) | 3 | (0 << 12) | succ<<20 | pred<<24);
 }
 
+/* fence.tso: fence rw, rw with fm = 1000 */
+static void asm_fence_tso_opcode(void){
+    asm_emit_opcode((0x3 << 2) | 3 | (0x8u << 28) | 0x3 << 24 | 0x3 << 20);
+}
+
+/* li rd, VAL: the same sequence as GNU as (load_const): lui and/or addiw
+   for a sign-extended 32-bit value, otherwise the upper part built
+   recursively, shifted into place, plus the low 12 bits. A small value on
+   its own is addi rd, zero, val; inside a longer sequence gas uses addiw. */
+static void asm_emit_li(int token, const Operand *rd, int64_t val, int nested)
+{
+    Operand imm = { OP_IM12S };
+    int64_t lo = (int64_t)((uint64_t)val << 52) >> 52;
+    uint64_t up = (uint64_t)val - lo;
+    int shift = 12;
+
+    if (val != (int32_t)val) {
+        while (!((up >> shift) & 1))
+            shift++;
+        asm_emit_li(token, rd, (int64_t)up >> shift, 1);
+        imm.e.v = shift;
+        /* slli rd, rd, shift */
+        asm_emit_i(token, (4 << 2) | 3 | (1 << 12), rd, rd, &imm);
+        if (lo) {
+            imm.e.v = lo;
+            /* addi rd, rd, lo */
+            asm_emit_i(token, (4 << 2) | 3, rd, rd, &imm);
+        }
+        return;
+    }
+    if (up) {
+        imm.e.v = (uint32_t)up >> 12;
+        /* lui rd, up */
+        asm_emit_u(token, (0xD << 2) | 3, rd, &imm);
+    }
+    if (lo || !up) {
+        imm.e.v = lo;
+        /* addiw rd, rd, lo (or addi rd, zero, lo) */
+        asm_emit_i(token, (up || nested ? 6 << 2 : 4 << 2) | 3, rd, up ? rd : &zero, &imm);
+    }
+}
+
 static void asm_binary_opcode(TCCState* s1, int token)
 {
     Operand imm = { OP_IM12S };
@@ -515,156 +524,53 @@ static void asm_binary_opcode(TCCState* s1, int token)
         asm_emit_u(token, (0x05 << 2) | 3, &ops[0], &ops[1]);
         return;
 
-    /* C extension */
-    case TOK_ASM_c_add:
-        asm_emit_cr(token, 2 | (9 << 12), ops, ops + 1);
-        return;
-    case TOK_ASM_c_mv:
-        asm_emit_cr(token, 2 | (8 << 12), ops, ops + 1);
-        return;
-
-    case TOK_ASM_c_addi16sp:
-        asm_emit_ci(token, 1 | (3 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_addi:
-        asm_emit_ci(token, 1, ops, ops + 1);
-        return;
-    case TOK_ASM_c_addiw:
-        asm_emit_ci(token, 1 | (1 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_fldsp:
-        asm_emit_ci(token, 2 | (1 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_flwsp: /* RV32FC-only */
-        asm_emit_ci(token, 2 | (3 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_ldsp:
-        asm_emit_ci(token, 2 | (3 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_li:
-        asm_emit_ci(token, 1 | (2 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_lui:
-        asm_emit_ci(token, 1 | (3 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_lwsp:
-        asm_emit_ci(token, 2 | (2 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_slli:
-        asm_emit_ci(token, 2, ops, ops + 1);
-        return;
-
-    case TOK_ASM_c_addi4spn:
-        asm_emit_ciw(token, 0, ops, ops + 1);
-        return;
-
-#define CA (1 | (3 << 10) | (4 << 13))
-    case TOK_ASM_c_addw:
-        asm_emit_ca(token, CA | (1 << 5) | (1 << 12), ops, ops + 1);
-        return;
-    case TOK_ASM_c_and:
-        asm_emit_ca(token, CA | (3 << 5), ops, ops + 1);
-        return;
-    case TOK_ASM_c_or:
-        asm_emit_ca(token, CA | (2 << 5), ops, ops + 1);
-        return;
-    case TOK_ASM_c_sub:
-        asm_emit_ca(token, CA, ops, ops + 1);
-        return;
-    case TOK_ASM_c_subw:
-        asm_emit_ca(token, CA | (1 << 12), ops, ops + 1);
-        return;
-    case TOK_ASM_c_xor:
-        asm_emit_ca(token, CA | (1 << 5), ops, ops + 1);
-        return;
-#undef CA
-
-    case TOK_ASM_c_andi:
-        asm_emit_cb(token, 1 | (2 << 10) | (4 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_beqz:
-        asm_emit_cb(token, 1 | (6 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_bnez:
-        asm_emit_cb(token, 1 | (7 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_srai:
-        asm_emit_cb(token, 1 | (1 << 10) | (4 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_srli:
-        asm_emit_cb(token, 1 | (4 << 13), ops, ops + 1);
-        return;
-
-    case TOK_ASM_c_sdsp:
-        asm_emit_css(token, 2 | (7 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_swsp:
-        asm_emit_css(token, 2 | (6 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_fswsp: /* RV32FC-only */
-        asm_emit_css(token, 2 | (7 << 13), ops, ops + 1);
-        return;
-    case TOK_ASM_c_fsdsp:
-        asm_emit_css(token, 2 | (5 << 13), ops, ops + 1);
-        return;
-
     /* F/D extension */
     case TOK_ASM_fsqrt_d:
-        asm_emit_fb(token, 0x53 | (11 << 27) | (1 << 25) | (7 << 12), ops, ops + 1);
+        asm_emit_fb(token, 0x53 | (11 << 27) | (1 << 25) | (asm_fcvt_rm(s1) << 12), ops, ops + 1);
         return;
+    case TOK_ASM_fmv_x_w:
+    case TOK_ASM_fmv_w_x:
+    case TOK_ASM_fmv_x_d:
+    case TOK_ASM_fmv_d_x: {
+        int to_int = token == TOK_ASM_fmv_x_w || token == TOK_ASM_fmv_x_d;
+        int dbl = token == TOK_ASM_fmv_x_d || token == TOK_ASM_fmv_d_x;
+        if (ops[0].type != OP_REG || ops[1].type != OP_REG ||
+            !REG_IS_FLOAT(ops[0].reg) == !to_int || !REG_IS_FLOAT(ops[1].reg) == to_int)
+            tcc_error("'%s': wrong register types", get_tok_str(token, NULL));
+        asm_emit_opcode(0x53 | ((to_int ? 0x70 : 0x78) + dbl) << 25 | ENCODE_RD(ops[0].reg) | ENCODE_RS1(ops[1].reg));
+        return;
+    }
     case TOK_ASM_fsqrt_s:
-        asm_emit_fb(token, 0x53 | (11 << 27) | (0 << 25) | (7 << 12), ops, ops + 1);
+        asm_emit_fb(token, 0x53 | (11 << 27) | (0 << 25) | (asm_fcvt_rm(s1) << 12), ops, ops + 1);
         return;
 
     /* pseudoinstructions */
     /* rd, sym */
     case TOK_ASM_la:
-        /* auipc rd, 0 */
-        asm_emit_u(token, 3 | (5 << 2), ops, ops + 1);
-        /* lw rd, rd, 0 */
-        asm_emit_i(token, 3 | (2 << 12), ops, ops, ops + 1);
-        return;
     case TOK_ASM_lla:
-        /* auipc rd, 0 */
-        asm_emit_u(token, 3 | (5 << 2), ops, ops + 1);
-        /* addi rd, rd, 0 */
-        asm_emit_i(token, 3 | (4 << 2), ops, ops, ops + 1);
+        /* auipc rd, %pcrel_hi(sym); addi rd, rd, %pcrel_lo(.) -- or with
+           .option pic, la loads the address from the GOT:
+           auipc rd, %got_pcrel_hi(sym); ld rd, %pcrel_lo(.)(rd) */
+        asm_need_sym(token, &ops[1]);
+        if (ops[0].type != OP_REG || REG_IS_FLOAT(ops[0].reg))
+            tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
+        imm.e.v = 0;
+        if (token == TOK_ASM_la && riscv_asm_pic) {
+            asm_pcrel_relocs(&ops[1], R_RISCV_GOT_HI20, R_RISCV_PCREL_LO12_I);
+            asm_emit_u(token, 3 | (5 << 2), ops, &imm);
+            asm_emit_i(token, 3 | (3 << 12), ops, ops, &imm);
+        } else {
+            asm_pcrel_relocs(&ops[1], R_RISCV_PCREL_HI20, R_RISCV_PCREL_LO12_I);
+            asm_emit_u(token, 3 | (5 << 2), ops, &imm);
+            asm_emit_i(token, 3 | (4 << 2), ops, ops, &imm);
+        }
         return;
     case TOK_ASM_li:
-        if(ops[1].type != OP_IM32 && ops[1].type != OP_IM12S){
-            tcc_error("'%s': Expected first source operand that is an immediate value between 0 and 0xFFFFFFFFFFFFFFFF", get_tok_str(token, NULL));
-        }
-        lo = ops[1].e.v;
-        hi = (int64_t)ops[1].e.v >> 32;
-        if(lo < 0){
-            hi += 1;
-        }
-        imm.e.v = ((hi + 0x800) & 0xfffff000) >> 12;
-        /* lui rd, HI_20(HI_32(imm)) */
-        asm_emit_u(token, (0xD << 2) | 3, &ops[0], &imm);
-        /* addi rd, rd, LO_12(HI_32(imm)) */
-        imm.e.v = (int32_t)hi<<20>>20;
-        asm_emit_i(token, 3 | (4 << 2), &ops[0], &ops[0], &imm);
-        /* slli rd, rd, 12 */
-        imm.e.v = 12;
-        asm_emit_i(token, (4 << 2) | 3 | (1 << 12), &ops[0], &ops[0], &imm);
-        /* addi rd, rd, HI_12(LO_32(imm)) */
-        imm.e.v = (lo + (1<<19)) >> 20;
-        asm_emit_i(token, 3 | (4 << 2), &ops[0], &ops[0], &imm);
-        /* slli rd, rd, 12 */
-        imm.e.v = 12;
-        asm_emit_i(token, (4 << 2) | 3 | (1 << 12), &ops[0], &ops[0], &imm);
-        /* addi rd, rd, HI_12(LO_20(LO_32imm)) */
-        lo = lo << 12 >> 12;
-        imm.e.v = lo >> 8;
-        asm_emit_i(token, 3 | (4 << 2), &ops[0], &ops[0], &imm);
-        /* slli rd, rd,  8 */
-        imm.e.v = 8;
-        asm_emit_i(token, (4 << 2) | 3 | (1 << 12), &ops[0], &ops[0], &imm);
-        /* addi rd, rd, LO_8(LO_20(LO_32imm)) */
-        lo &= 0xff;
-        imm.e.v = lo << 20 >> 20;
-        asm_emit_i(token, 3 | (4 << 2), &ops[0], &ops[0], &imm);
+        if (ops[0].type != OP_REG || REG_IS_FLOAT(ops[0].reg))
+            tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
+        if (ops[1].type != OP_IM32 && ops[1].type != OP_IM12S)
+            tcc_error("'%s': Expected an immediate value", get_tok_str(token, NULL));
+        asm_emit_li(token, &ops[0], ops[1].e.v, 0);
         return;
     case TOK_ASM_mv:
         /* addi rd, rs, 0 */
@@ -708,11 +614,13 @@ static void asm_binary_opcode(TCCState* s1, int token)
        fcvt.w.s rd, rs1 [, rtz/rne/...) */
 
     case TOK_ASM_jump:
-        /* auipc x5, 0 */
-        asm_emit_opcode(3 | (5 << 2) | ENCODE_RD(5));
-        greloca(cur_text_section, ops->e.sym, ind, R_RISCV_CALL, 0);
-        /* jalr zero, 0(x5) */
-        asm_emit_opcode(0x67 | (0 << 12) | ENCODE_RS1(5));
+        /* jump sym, temp: auipc temp, 0; jalr zero, 0(temp) */
+        asm_need_sym(token, &ops[0]);
+        if (ops[1].type != OP_REG || REG_IS_FLOAT(ops[1].reg))
+            tcc_error("'%s': expected a temporary register", get_tok_str(token, NULL));
+        greloca(cur_text_section, ops[0].e.sym, ind, R_RISCV_CALL_PLT, ops[0].e.v);
+        asm_emit_opcode(3 | (5 << 2) | ENCODE_RD(ops[1].reg));
+        asm_emit_opcode(0x67 | (0 << 12) | ENCODE_RS1(ops[1].reg));
         return;
     case TOK_ASM_seqz:
         /* sltiu rd, rs, 1 */
@@ -745,39 +653,31 @@ static void asm_binary_opcode(TCCState* s1, int token)
     /* CSR pseudo-instructions */
     case TOK_ASM_csrr:
         /* csrrs rd, csr, x0 */
-        asm_emit_opcode(0x73 | (2 << 12) | (ops[1].e.v << 20) | ENCODE_RD(ops[0].reg));
+        asm_emit_opcode(0x73 | (2 << 12) | (asm_csr_num(token, &ops[1]) << 20) | ENCODE_RD(ops[0].reg));
         return;
     case TOK_ASM_csrw:
         /* csrrw x0, csr, rs */
-        asm_emit_opcode(0x73 | (1 << 12) | (ops[0].e.v << 20) | ENCODE_RS1(ops[1].reg));
+        asm_emit_opcode(0x73 | (1 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(ops[1].reg));
         return;
     case TOK_ASM_csrs:
         /* csrrs x0, csr, rs */
-        asm_emit_opcode(0x73 | (2 << 12) | (ops[0].e.v << 20) | ENCODE_RS1(ops[1].reg));
+        asm_emit_opcode(0x73 | (2 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(ops[1].reg));
         return;
     case TOK_ASM_csrc:
         /* csrrc x0, csr, rs */
-        asm_emit_opcode(0x73 | (3 << 12) | (ops[0].e.v << 20) | ENCODE_RS1(ops[1].reg));
-        return;
-    case TOK_ASM_fsrm:
-        /* csrrw rd, frm, rs */
-        asm_emit_opcode(0x73 | (1 << 12) | (2 << 20) | ENCODE_RD(ops[0].reg) | ENCODE_RS1(ops[1].reg));
-        return;
-    case TOK_ASM_fscsr:
-        /* csrrw rd, fcsr, rs */
-        asm_emit_opcode(0x73 | (1 << 12) | (3 << 20) | ENCODE_RD(ops[0].reg) | ENCODE_RS1(ops[1].reg));
+        asm_emit_opcode(0x73 | (3 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(ops[1].reg));
         return;
     case TOK_ASM_csrwi:
         /* csrrwi x0, csr, uimm */
-        asm_emit_opcode(0x73 | (5 << 12) | (ops[0].e.v << 20) | ENCODE_RS1(ops[1].e.v));
+        asm_emit_opcode(0x73 | (5 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(ops[1].e.v));
         return;
     case TOK_ASM_csrsi:
         /* csrrsi x0, csr, uimm */
-        asm_emit_opcode(0x73 | (6 << 12) | (ops[0].e.v << 20) | ENCODE_RS1(ops[1].e.v));
+        asm_emit_opcode(0x73 | (6 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(ops[1].e.v));
         return;
     case TOK_ASM_csrci:
         /* csrrci x0, csr, uimm */
-        asm_emit_opcode(0x73 | (7 << 12) | (ops[0].e.v << 20) | ENCODE_RS1(ops[1].e.v));
+        asm_emit_opcode(0x73 | (7 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(ops[1].e.v));
         return;
     default:
         expect("binary instruction");
@@ -902,14 +802,16 @@ static void asm_emit_j(int token, uint32_t opcode, const Operand* rd, const Oper
     if (rd->type != OP_REG) {
         tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
     }
-    if (rs2->type != OP_IM12S && rs2->type != OP_IM32) {
+    if (rs2->type == OP_SYM) {
+        imm = asm_sym_offset(rs2, R_RISCV_JAL);
+    } else if (rs2->type != OP_IM12S && rs2->type != OP_IM32) {
         tcc_error("'%s': Expected second source operand that is an immediate value", get_tok_str(token, NULL));
+    } else {
+        imm = rs2->e.v;
     }
 
-    imm = rs2->e.v;
-
     /* even offsets in a +- 1 MiB range */
-    if ((int)imm > (1 << 20) -1 || (int)imm <= -1 * ((1 << 20) -1)) {
+    if ((int)imm > (1 << 20) -1 || (int)imm < -(1 << 20)) {
         tcc_error("'%s': Expected second source operand that is an immediate value between 0 and 0x1fffff", get_tok_str(token, NULL));
     }
 
@@ -932,19 +834,28 @@ static void asm_mem_access_opcode(TCCState *s1, int token)
     Operand ops[3];
     parse_mem_access_operands(s1, &ops[0]);
 
-    /* Pseudoinstruction: inst reg, label
-     * expand to:
-     *   auipc reg, 0
-     *   inst reg, 0(reg)
-     * And with the proper relocation to label
+    /* Pseudoinstructions with a symbol:
+     *   l{b,h,w,d}[u] rd, sym      auipc rd, %pcrel_hi(sym); l rd, %pcrel_lo(rd)
+     *   fld/s{b,h,w,d}/fsd r, sym, rt  auipc rt, ...; s r, %pcrel_lo(rt)
      */
-    if (ops[1].type == OP_IM32 && ops[1].e.sym && ops[1].e.sym->type.t & VT_STATIC){
-        ops[1] = ops[0];
-        /* set the offset to zero */
+    if (ops[1].type == OP_SYM) {
+        Operand sym = ops[1], base = ops[0];
+        int is_store = token == TOK_ASM_sb || token == TOK_ASM_sh || token == TOK_ASM_sw ||
+                       token == TOK_ASM_sd || token == TOK_ASM_fsd || token == TOK_ASM_fsw;
+        if (is_store || REG_IS_FLOAT(ops[0].reg)) {
+            skip(',');
+            parse_operand(s1, &base);
+        }
+        if (base.type != OP_REG || REG_IS_FLOAT(base.reg))
+            tcc_error("'%s': expected an integer register for the address", get_tok_str(token, NULL));
+        ops[1] = base;
         ops[2].type = OP_IM12S;
         ops[2].e.v  = 0;
-        /* auipc reg, 0 */
-        asm_emit_u(token, (0x05 << 2) | 3, &ops[0], &ops[2]);
+        ops[2].e.sym = NULL;
+        asm_pcrel_relocs(&sym, R_RISCV_PCREL_HI20,
+                         is_store ? R_RISCV_PCREL_LO12_S : R_RISCV_PCREL_LO12_I);
+        /* auipc base, 0 */
+        asm_emit_u(token, (0x05 << 2) | 3, &base, &ops[2]);
     }
 
     switch (token) {
@@ -973,6 +884,9 @@ static void asm_mem_access_opcode(TCCState *s1, int token)
     case TOK_ASM_fld:
          asm_emit_i(token, (0x1 << 2) | 3 | (3 << 12), &ops[0], &ops[1], &ops[2]);
          return;
+    case TOK_ASM_flw:
+         asm_emit_i(token, (0x1 << 2) | 3 | (2 << 12), &ops[0], &ops[1], &ops[2]);
+         return;
 
     // s{b|h|w|d} rs2, imm(rs1); S-format (with rsX swapped)
     case TOK_ASM_sb:
@@ -989,6 +903,9 @@ static void asm_mem_access_opcode(TCCState *s1, int token)
          return;
     case TOK_ASM_fsd:
          asm_emit_s(token, (0x9 << 2) | 3 | (3 << 12), &ops[1], &ops[0], &ops[2]);
+         return;
+    case TOK_ASM_fsw:
+         asm_emit_s(token, (0x9 << 2) | 3 | (2 << 12), &ops[1], &ops[0], &ops[2]);
          return;
     }
 }
@@ -1043,12 +960,12 @@ static void asm_branch_opcode(TCCState *s1, int token, int argc)
         asm_emit_b(token, 0x63 | (0 << 12), &ops[0], &zero, &ops[1]);
         return;
     case TOK_ASM_blez:
-        /* bge rs, zero, offset */
-        asm_emit_b(token, 0x63 | (5 << 12), &ops[0], &zero, &ops[1]);
-        return;
-    case TOK_ASM_bgez:
         /* bge zero, rs, offset */
         asm_emit_b(token, 0x63 | (5 << 12), &zero, &ops[0], &ops[1]);
+        return;
+    case TOK_ASM_bgez:
+        /* bge rs, zero, offset */
+        asm_emit_b(token, 0x63 | (5 << 12), &ops[0], &zero, &ops[1]);
         return;
     case TOK_ASM_bltz:
         /* blt rs, zero, offset */
@@ -1074,7 +991,7 @@ static void asm_ternary_opcode(TCCState *s1, int token)
         asm_emit_i(token, (4 << 2) | 3 | (1 << 12), &ops[0], &ops[1], &ops[2]);
         return;
     case TOK_ASM_srl:
-        asm_emit_r(token, (0xC << 2) | 3 | (4 << 12), &ops[0], &ops[1], &ops[2]);
+        asm_emit_r(token, (0xC << 2) | 3 | (5 << 12), &ops[0], &ops[1], &ops[2]);
         return;
     case TOK_ASM_srli:
         asm_emit_i(token, (0x4 << 2) | 3 | (5 << 12), &ops[0], &ops[1], &ops[2]);
@@ -1098,10 +1015,10 @@ static void asm_ternary_opcode(TCCState *s1, int token)
         asm_emit_i(token, (0x6 << 2) | 3 | (5 << 12), &ops[0], &ops[1], &ops[2]);
         return;
     case TOK_ASM_sraw:
-        asm_emit_r(token, (0xE << 2) | 3 | (5 << 12), &ops[0], &ops[1], &ops[2]);
+        asm_emit_r(token, (0xE << 2) | 3 | (5 << 12) | (32 << 25), &ops[0], &ops[1], &ops[2]);
         return;
     case TOK_ASM_sraiw:
-        asm_emit_i(token, (0x6 << 2) | 3 | (5 << 12), &ops[0], &ops[1], &ops[2]);
+        asm_emit_i(token, (0x6 << 2) | 3 | (5 << 12) | (32 << 25), &ops[0], &ops[1], &ops[2]);
         return;
 
     // Arithmetic (RD,RS1,(RS2|IMM)); R-format, I-format or U-format
@@ -1226,57 +1143,37 @@ static void asm_ternary_opcode(TCCState *s1, int token)
         asm_emit_i(token, 0x73 | (5 << 12), ops, ops + 2, ops + 1);
         return;
 
-    /* C extension */
-    /* register-based loads and stores (RD, RS1, IMM); CL-format */
-    case TOK_ASM_c_fld:
-        asm_emit_cl(token, 1 << 13, ops, ops + 1, ops + 2);
-        return;
-    case TOK_ASM_c_flw: /* RV32FC-only */
-        asm_emit_cl(token, 3 << 13, ops, ops + 1, ops + 2);
-        return;
-    case TOK_ASM_c_fsd:
-        asm_emit_cs(token, 5 << 13, ops, ops + 1, ops + 2);
-        return;
-    case TOK_ASM_c_fsw: /* RV32FC-only */
-        asm_emit_cs(token, 7 << 13, ops, ops + 1, ops + 2);
-        return;
-    case TOK_ASM_c_ld:
-        asm_emit_cl(token, 3 << 13, ops, ops + 1, ops + 2);
-        return;
-    case TOK_ASM_c_lw:
-        asm_emit_cl(token, 2 << 13, ops, ops + 1, ops + 2);
-        return;
-    case TOK_ASM_c_sd:
-        asm_emit_cs(token, 7 << 13, ops, ops + 1, ops + 2);
-        return;
-    case TOK_ASM_c_sw:
-        asm_emit_cs(token, 6 << 13, ops, ops + 1, ops + 2);
-        return;
-
     /* F/D extension */
+    case TOK_ASM_fsgnjn_s:
+    case TOK_ASM_fsgnjn_d:
+    case TOK_ASM_fsgnjx_s:
+    case TOK_ASM_fsgnjx_d:
+        asm_emit_f(token, 0x53 | (4 << 27) | ((token == TOK_ASM_fsgnjn_d || token == TOK_ASM_fsgnjx_d) << 25)
+                   | ((token == TOK_ASM_fsgnjn_s || token == TOK_ASM_fsgnjn_d ? 1 : 2) << 12), ops, ops + 1, ops + 2);
+        return;
     case TOK_ASM_fadd_d:
-        asm_emit_f(token, 0x53 | (0 << 27) | (1 << 25) | (7 << 12), ops, ops + 1, ops + 2);
+        asm_emit_f(token, 0x53 | (0 << 27) | (1 << 25) | (asm_fcvt_rm(s1) << 12), ops, ops + 1, ops + 2);
         return;
     case TOK_ASM_fadd_s:
-        asm_emit_f(token, 0x53 | (0 << 27) | (0 << 25) | (7 << 12), ops, ops + 1, ops + 2);
+        asm_emit_f(token, 0x53 | (0 << 27) | (0 << 25) | (asm_fcvt_rm(s1) << 12), ops, ops + 1, ops + 2);
         return;
     case TOK_ASM_fsub_d:
-        asm_emit_f(token, 0x53 | (1 << 27) | (1 << 25) | (7 << 12), ops, ops + 1, ops + 2);
+        asm_emit_f(token, 0x53 | (1 << 27) | (1 << 25) | (asm_fcvt_rm(s1) << 12), ops, ops + 1, ops + 2);
         return;
     case TOK_ASM_fsub_s:
-        asm_emit_f(token, 0x53 | (1 << 27) | (0 << 25) | (7 << 12), ops, ops + 1, ops + 2);
+        asm_emit_f(token, 0x53 | (1 << 27) | (0 << 25) | (asm_fcvt_rm(s1) << 12), ops, ops + 1, ops + 2);
         return;
     case TOK_ASM_fmul_d:
-        asm_emit_f(token, 0x53 | (2 << 27) | (1 << 25) | (7 << 12), ops, ops + 1, ops + 2);
+        asm_emit_f(token, 0x53 | (2 << 27) | (1 << 25) | (asm_fcvt_rm(s1) << 12), ops, ops + 1, ops + 2);
         return;
     case TOK_ASM_fmul_s:
-        asm_emit_f(token, 0x53 | (2 << 27) | (0 << 25) | (7 << 12), ops, ops + 1, ops + 2);
+        asm_emit_f(token, 0x53 | (2 << 27) | (0 << 25) | (asm_fcvt_rm(s1) << 12), ops, ops + 1, ops + 2);
         return;
     case TOK_ASM_fdiv_d:
-        asm_emit_f(token, 0x53 | (3 << 27) | (1 << 25) | (7 << 12), ops, ops + 1, ops + 2);
+        asm_emit_f(token, 0x53 | (3 << 27) | (1 << 25) | (asm_fcvt_rm(s1) << 12), ops, ops + 1, ops + 2);
         return;
     case TOK_ASM_fdiv_s:
-        asm_emit_f(token, 0x53 | (3 << 27) | (0 << 25) | (7 << 12), ops, ops + 1, ops + 2);
+        asm_emit_f(token, 0x53 | (3 << 27) | (0 << 25) | (asm_fcvt_rm(s1) << 12), ops, ops + 1, ops + 2);
         return;
     case TOK_ASM_fsgnj_d:
         asm_emit_f(token, 0x53 | (4 << 27) | (1 << 25) | (0 << 12), ops, ops + 1, ops + 2);
@@ -1328,12 +1225,22 @@ static void asm_quaternary_opcode(TCCState *s1, int token)
     parse_operands(s1, &ops[0], 4);
 
     switch (token) {
-    case TOK_ASM_fmadd_d:
-        asm_emit_fq(token, 0x43 | (1 << 25) | (7 << 12), ops, ops + 1, ops + 2, ops + 3);
+    case TOK_ASM_fmadd_s:  case TOK_ASM_fmadd_d:
+    case TOK_ASM_fmsub_s:  case TOK_ASM_fmsub_d:
+    case TOK_ASM_fnmsub_s: case TOK_ASM_fnmsub_d:
+    case TOK_ASM_fnmadd_s: case TOK_ASM_fnmadd_d: {
+        static const struct { int tok; uint32_t op; } fma[] = {
+            { TOK_ASM_fmadd_s, 0x43 }, { TOK_ASM_fmadd_d, 0x43 | 1 << 25 },
+            { TOK_ASM_fmsub_s, 0x47 }, { TOK_ASM_fmsub_d, 0x47 | 1 << 25 },
+            { TOK_ASM_fnmsub_s, 0x4b }, { TOK_ASM_fnmsub_d, 0x4b | 1 << 25 },
+            { TOK_ASM_fnmadd_s, 0x4f }, { TOK_ASM_fnmadd_d, 0x4f | 1 << 25 },
+        };
+        int i;
+        for (i = 0; fma[i].tok != token; i++)
+            ;
+        asm_emit_fq(token, fma[i].op | (asm_fcvt_rm(s1) << 12), ops, ops + 1, ops + 2, ops + 3);
         return;
-    case TOK_ASM_fmadd_s:
-        asm_emit_fq(token, 0x43 | (0 << 25) | (7 << 12), ops, ops + 1, ops + 2, ops + 3);
-        return;
+    }
 
     default:
         expect("quaternary instruction");
@@ -1360,55 +1267,55 @@ static void asm_atomic_opcode(TCCState *s1, int token)
 
     switch(token){
         case TOK_ASM_lr_w:
-            asm_emit_a(token, 0x2F | 0x2<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 0, 0);
+            asm_emit_a(token, 0x2F | 0x2<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 0, 0);
             break;
         case TOK_ASM_lr_w_aq:
-            asm_emit_a(token, 0x2F | 0x2<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 1, 0);
+            asm_emit_a(token, 0x2F | 0x2<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 1, 0);
             break;
         case TOK_ASM_lr_w_rl:
-            asm_emit_a(token, 0x2F | 0x2<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 0, 1);
+            asm_emit_a(token, 0x2F | 0x2<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 0, 1);
             break;
         case TOK_ASM_lr_w_aqrl:
-            asm_emit_a(token, 0x2F | 0x2<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 1, 1);
+            asm_emit_a(token, 0x2F | 0x2<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 1, 1);
             break;
 
         case TOK_ASM_lr_d:
-            asm_emit_a(token, 0x2F | 0x3<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 0, 0);
+            asm_emit_a(token, 0x2F | 0x3<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 0, 0);
             break;
         case TOK_ASM_lr_d_aq:
-            asm_emit_a(token, 0x2F | 0x3<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 1, 0);
+            asm_emit_a(token, 0x2F | 0x3<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 1, 0);
             break;
         case TOK_ASM_lr_d_rl:
-            asm_emit_a(token, 0x2F | 0x3<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 0, 1);
+            asm_emit_a(token, 0x2F | 0x3<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 0, 1);
             break;
         case TOK_ASM_lr_d_aqrl:
-            asm_emit_a(token, 0x2F | 0x3<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 1, 1);
+            asm_emit_a(token, 0x2F | 0x3<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 1, 1);
             break;
 
         case TOK_ASM_sc_w:
-            asm_emit_a(token, 0x2F | 0x2<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 0);
+            asm_emit_a(token, 0x2F | 0x2<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 0, 0);
             break;
         case TOK_ASM_sc_w_aq:
-            asm_emit_a(token, 0x2F | 0x2<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 1, 0);
+            asm_emit_a(token, 0x2F | 0x2<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 1, 0);
             break;
         case TOK_ASM_sc_w_rl:
-            asm_emit_a(token, 0x2F | 0x2<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 1);
+            asm_emit_a(token, 0x2F | 0x2<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 0, 1);
             break;
         case TOK_ASM_sc_w_aqrl:
-            asm_emit_a(token, 0x2F | 0x2<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 1, 1);
+            asm_emit_a(token, 0x2F | 0x2<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 1, 1);
             break;
 
         case TOK_ASM_sc_d:
-            asm_emit_a(token, 0x2F | 0x3<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 0);
+            asm_emit_a(token, 0x2F | 0x3<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 0, 0);
             break;
         case TOK_ASM_sc_d_aq:
-            asm_emit_a(token, 0x2F | 0x3<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 1, 0);
+            asm_emit_a(token, 0x2F | 0x3<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 1, 0);
             break;
         case TOK_ASM_sc_d_rl:
-            asm_emit_a(token, 0x2F | 0x3<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 1);
+            asm_emit_a(token, 0x2F | 0x3<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 0, 1);
             break;
         case TOK_ASM_sc_d_aqrl:
-            asm_emit_a(token, 0x2F | 0x3<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 1, 1);
+            asm_emit_a(token, 0x2F | 0x3<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 1, 1);
             break;
 
         /* AMO instructions (base, aq=0 rl=0) */
@@ -1425,9 +1332,9 @@ static void asm_atomic_opcode(TCCState *s1, int token)
         case TOK_ASM_amoand_d:
             asm_emit_a(token, 0x2F | 0x3<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
         case TOK_ASM_amoor_w:
-            asm_emit_a(token, 0x2F | 0x2<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
+            asm_emit_a(token, 0x2F | 0x2<<12 | 0x8<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
         case TOK_ASM_amoor_d:
-            asm_emit_a(token, 0x2F | 0x3<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
+            asm_emit_a(token, 0x2F | 0x3<<12 | 0x8<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
         case TOK_ASM_amoxor_w:
             asm_emit_a(token, 0x2F | 0x2<<12 | 0x4<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
         case TOK_ASM_amoxor_d:
@@ -1620,31 +1527,18 @@ static void asm_emit_b(int token, uint32_t opcode, const Operand *rs1, const Ope
     if (rs2->type != OP_REG) {
         tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
     }
-    if (imm->type == OP_IM32 && imm->e.sym) {
-        /* far branch: expand to inverted short branch + auipc + jalr */
-        int b_ofs = ind;
-        uint32_t inv_func3 = ((opcode >> 12) & 7) ^ 1;
-        uint32_t inv_opcode = (opcode & ~(7 << 12)) | (inv_func3 << 12);
-        /* b<inverse> .+8 */
-        asm_emit_opcode(inv_opcode | ENCODE_RS1(rs1->reg)
-                        | ENCODE_RS2(rs2->reg) | (1 << 8));
-        /* auipc t0, 0 */
-        greloca(cur_text_section, imm->e.sym, ind, R_RISCV_CALL, 0);
-        asm_emit_opcode(0x17 | ENCODE_RD(5));
-        /* jalr x0, 0(t0) */
-        write32le(cur_text_section->data + b_ofs,
-                  read32le(cur_text_section->data + b_ofs)
-                  | (((ind - b_ofs) >> 1) & 0xf) << 8
-                  | (((ind - b_ofs) >> 5) & 0x3f) << 25
-                  | (((ind - b_ofs) >> 11) & 1) << 7
-                  | (((ind - b_ofs) >> 12) & 1) << 31);
-        return;
-    }
-    if (imm->type != OP_IM12S) {
+    if (imm->type == OP_SYM) {
+        /* a label: resolved here if it is behind us in this section,
+           otherwise by the linker (a +-4 KiB range either way) */
+        int64_t off = asm_sym_offset(imm, R_RISCV_BRANCH);
+        if (off < -0x1000 || off >= 0x1000)
+            tcc_error("'%s': branch target out of range", get_tok_str(token, NULL));
+        offset = off;
+    } else if (imm->type != OP_IM12S) {
         tcc_error("'%s': Expected second source operand that is an immediate value between 0 and 8191", get_tok_str(token, NULL));
+    } else {
+        offset = imm->e.v;
     }
-
-    offset = imm->e.v;
 
     /* B-type instruction:
     31      imm[12]
@@ -1655,7 +1549,7 @@ static void asm_emit_b(int token, uint32_t opcode, const Operand *rs1, const Ope
     8...11  imm[4:1]
     7       imm[11]
     6...0   opcode */
-    asm_emit_opcode(opcode | ENCODE_RS1(rs1->reg) | ENCODE_RS2(rs2->reg) | (((offset >> 1) & 0xF) << 8) | (((offset >> 5) & 0x1f) << 25) | (((offset >> 11) & 1) << 7) | (((offset >> 12) & 1) << 31));
+    asm_emit_opcode(opcode | ENCODE_RS1(rs1->reg) | ENCODE_RS2(rs2->reg) | (((offset >> 1) & 0xF) << 8) | (((offset >> 5) & 0x3f) << 25) | (((offset >> 11) & 1) << 7) | (((offset >> 12) & 1) << 31));
 }
 
 /* FCVT helper: parse optional rounding mode operand (GNU as syntax:
@@ -1671,6 +1565,7 @@ static int asm_fcvt_rm(TCCState *s1)
             case TOK_ASM_rdn: rm = 2; next(); break;
             case TOK_ASM_rup: rm = 3; next(); break;
             case TOK_ASM_rmm: rm = 4; next(); break;
+            case TOK_ASM_dyn: rm = 7; next(); break;
             default: expect("rounding mode"); break;
         }
     }
@@ -1693,20 +1588,20 @@ static void asm_fcvt_opcode(TCCState *s1, int token)
         case TOK_ASM_fcvt_wu_s: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x60 << 25) | (rm << 12) | (1 << 20); break;
         case TOK_ASM_fcvt_l_s:  rm = asm_fcvt_rm(s1); enc = 0x53 | (0x60 << 25) | (rm << 12) | (2 << 20); break;
         case TOK_ASM_fcvt_lu_s: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x60 << 25) | (rm << 12) | (3 << 20); break;
-        case TOK_ASM_fcvt_s_w:  enc = 0x53 | (0x68 << 25) | (7 << 12); break;
-        case TOK_ASM_fcvt_s_wu: enc = 0x53 | (0x68 << 25) | (7 << 12) | (1 << 20); break;
-        case TOK_ASM_fcvt_s_l:  enc = 0x53 | (0x68 << 25) | (7 << 12) | (2 << 20); break;
-        case TOK_ASM_fcvt_s_lu: enc = 0x53 | (0x68 << 25) | (7 << 12) | (3 << 20); break;
+        case TOK_ASM_fcvt_s_w: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x68 << 25) | (rm << 12); break;
+        case TOK_ASM_fcvt_s_wu: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x68 << 25) | (rm << 12) | (1 << 20); break;
+        case TOK_ASM_fcvt_s_l: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x68 << 25) | (rm << 12) | (2 << 20); break;
+        case TOK_ASM_fcvt_s_lu: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x68 << 25) | (rm << 12) | (3 << 20); break;
         case TOK_ASM_fcvt_w_d:  rm = asm_fcvt_rm(s1); enc = 0x53 | (0x61 << 25) | (rm << 12); break;
         case TOK_ASM_fcvt_wu_d: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x61 << 25) | (rm << 12) | (1 << 20); break;
         case TOK_ASM_fcvt_l_d:  rm = asm_fcvt_rm(s1); enc = 0x53 | (0x61 << 25) | (rm << 12) | (2 << 20); break;
         case TOK_ASM_fcvt_lu_d: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x61 << 25) | (rm << 12) | (3 << 20); break;
-        case TOK_ASM_fcvt_d_w:  enc = 0x53 | (0x69 << 25) | (7 << 12); break;
-        case TOK_ASM_fcvt_d_wu: enc = 0x53 | (0x69 << 25) | (7 << 12) | (1 << 20); break;
-        case TOK_ASM_fcvt_d_l:  enc = 0x53 | (0x69 << 25) | (7 << 12) | (2 << 20); break;
-        case TOK_ASM_fcvt_d_lu: enc = 0x53 | (0x69 << 25) | (7 << 12) | (3 << 20); break;
-        case TOK_ASM_fcvt_s_d:  enc = 0x53 | (0x20 << 25) | (7 << 12) | (1 << 20); break;
-        case TOK_ASM_fcvt_d_s:  enc = 0x53 | (0x21 << 25) | (7 << 12); break;
+        case TOK_ASM_fcvt_d_w: enc = 0x53 | (0x69 << 25) /* exact: rm = 0 */; break;
+        case TOK_ASM_fcvt_d_wu: enc = 0x53 | (0x69 << 25) /* exact: rm = 0 */ | (1 << 20); break;
+        case TOK_ASM_fcvt_d_l: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x69 << 25) | (rm << 12) | (2 << 20); break;
+        case TOK_ASM_fcvt_d_lu: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x69 << 25) | (rm << 12) | (3 << 20); break;
+        case TOK_ASM_fcvt_s_d: rm = asm_fcvt_rm(s1); enc = 0x53 | (0x20 << 25) | (rm << 12) | (1 << 20); break;
+        case TOK_ASM_fcvt_d_s: enc = 0x53 | (0x21 << 25) /* exact: rm = 0 */; break;
         case TOK_ASM_fclass_s:  enc = 0x53 | (0x70 << 25) | (1 << 12); break;
         case TOK_ASM_fclass_d:  enc = 0x53 | (0x71 << 25) | (1 << 12); break;
         default: expect("fcvt/fclass instruction"); return;
@@ -1716,6 +1611,11 @@ static void asm_fcvt_opcode(TCCState *s1, int token)
 
 ST_FUNC void asm_opcode(TCCState *s1, int token)
 {
+    /* the c.* tokens are contiguous in riscv64-tok.h */
+    if (token >= TOK_ASM_c_nop && token <= TOK_ASM_c_ebreak) {
+        asm_c_opcode(s1, token);
+        return;
+    }
     switch (token) {
     case TOK_ASM_ebreak:
     case TOK_ASM_ecall:
@@ -1724,11 +1624,34 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
     case TOK_ASM_mrth:
     case TOK_ASM_mrts:
     case TOK_ASM_wfi:
+    case TOK_ASM_sret:
+    case TOK_ASM_mret:
+    case TOK_ASM_unimp:
         asm_nullary_opcode(s1, token);
         return;
 
+    case TOK_ASM_sfence_vma: {
+        /* sfence.vma [vaddr[, asid]] */
+        Operand ops[2] = { zero, zero };
+        if (tok != TOK_LINEFEED && tok != ';' && tok != TOK_EOF) {
+            parse_operand(s1, &ops[0]);
+            if (tok == ',') {
+                next();
+                parse_operand(s1, &ops[1]);
+            }
+        }
+        if (ops[0].type != OP_REG || ops[1].type != OP_REG ||
+            REG_IS_FLOAT(ops[0].reg) || REG_IS_FLOAT(ops[1].reg))
+            tcc_error("'%s': expected integer registers", get_tok_str(token, NULL));
+        asm_emit_opcode((0x1C << 2) | 3 | (0x09 << 25) | ENCODE_RS1(ops[0].reg) | ENCODE_RS2(ops[1].reg));
+        return;
+    }
+
     case TOK_ASM_fence:
         asm_fence_opcode(s1, token);
+        return;
+    case TOK_ASM_fence_tso:
+        asm_fence_tso_opcode();
         return;
 
     case TOK_ASM_rdcycle:
@@ -1744,6 +1667,10 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
     case TOK_ASM_auipc:
     case TOK_ASM_fsqrt_s:
     case TOK_ASM_fsqrt_d:
+    case TOK_ASM_fmv_x_w:
+    case TOK_ASM_fmv_w_x:
+    case TOK_ASM_fmv_x_d:
+    case TOK_ASM_fmv_d_x:
         asm_binary_opcode(s1, token);
         return;
 
@@ -1784,6 +1711,8 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
     case TOK_ASM_sw:
     case TOK_ASM_sd:
     case TOK_ASM_fsd:
+    case TOK_ASM_flw:
+    case TOK_ASM_fsw:
         asm_mem_access_opcode(s1, token);
         break;
 
@@ -1847,6 +1776,10 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
     case TOK_ASM_csrrw:
     case TOK_ASM_csrrwi:
     /* F/D extension */
+    case TOK_ASM_fsgnjn_s:
+    case TOK_ASM_fsgnjn_d:
+    case TOK_ASM_fsgnjx_s:
+    case TOK_ASM_fsgnjx_d:
     case TOK_ASM_fadd_s:
     case TOK_ASM_fadd_d:
     case TOK_ASM_fsub_s:
@@ -1871,6 +1804,12 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
         return;
     case TOK_ASM_fmadd_d:
     case TOK_ASM_fmadd_s:
+    case TOK_ASM_fmsub_s:
+    case TOK_ASM_fmsub_d:
+    case TOK_ASM_fnmsub_s:
+    case TOK_ASM_fnmsub_d:
+    case TOK_ASM_fnmadd_s:
+    case TOK_ASM_fnmadd_d:
         asm_quaternary_opcode(s1, token);
         return;
 
@@ -1884,68 +1823,19 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
         asm_branch_opcode(s1, token, 3);
         break;
 
-    /* C extension */
-    case TOK_ASM_c_ebreak:
-    case TOK_ASM_c_nop:
-        asm_nullary_opcode(s1, token);
-        return;
-
-    case TOK_ASM_c_j:
-    case TOK_ASM_c_jal:
-    case TOK_ASM_c_jalr:
-    case TOK_ASM_c_jr:
-        asm_unary_opcode(s1, token);
-        return;
-
-    case TOK_ASM_c_add:
-    case TOK_ASM_c_addi16sp:
-    case TOK_ASM_c_addi4spn:
-    case TOK_ASM_c_addi:
-    case TOK_ASM_c_addiw:
-    case TOK_ASM_c_addw:
-    case TOK_ASM_c_and:
-    case TOK_ASM_c_andi:
-    case TOK_ASM_c_beqz:
-    case TOK_ASM_c_bnez:
-    case TOK_ASM_c_fldsp:
-    case TOK_ASM_c_flwsp:
-    case TOK_ASM_c_fsdsp:
-    case TOK_ASM_c_fswsp:
-    case TOK_ASM_c_ldsp:
-    case TOK_ASM_c_li:
-    case TOK_ASM_c_lui:
-    case TOK_ASM_c_lwsp:
-    case TOK_ASM_c_mv:
-    case TOK_ASM_c_or:
-    case TOK_ASM_c_sdsp:
-    case TOK_ASM_c_slli:
-    case TOK_ASM_c_srai:
-    case TOK_ASM_c_srli:
-    case TOK_ASM_c_sub:
-    case TOK_ASM_c_subw:
-    case TOK_ASM_c_swsp:
-    case TOK_ASM_c_xor:
-        asm_binary_opcode(s1, token);
-        return;
-
-    case TOK_ASM_c_fld:
-    case TOK_ASM_c_flw:
-    case TOK_ASM_c_fsd:
-    case TOK_ASM_c_fsw:
-    case TOK_ASM_c_ld:
-    case TOK_ASM_c_lw:
-    case TOK_ASM_c_sd:
-    case TOK_ASM_c_sw:
-        asm_ternary_opcode(s1, token);
-        return;
-
     /* pseudoinstructions */
     case TOK_ASM_nop:
     case TOK_ASM_ret:
         asm_nullary_opcode(s1, token);
         return;
 
-    case TOK_ASM_jr:
+    case TOK_ASM_jr: {
+        /* jalr zero, target */
+        Operand rs, imm;
+        parse_jump_target(s1, &rs, &imm);
+        asm_emit_i(token, 0x67, &zero, &rs, &imm);
+        return;
+    }
     case TOK_ASM_call:
     case TOK_ASM_tail:
     case TOK_ASM_frflags:
@@ -1980,9 +1870,16 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
     case TOK_ASM_csrwi:
     case TOK_ASM_csrsi:
     case TOK_ASM_csrci:
-    case TOK_ASM_fsrm:
-    case TOK_ASM_fscsr:
         asm_binary_opcode(s1, token);
+        return;
+    case TOK_ASM_fscsr:
+        asm_fcsr_write_opcode(s1, token, 3);
+        return;
+    case TOK_ASM_fsrm:
+        asm_fcsr_write_opcode(s1, token, 2);
+        return;
+    case TOK_ASM_fsflags:
+        asm_fcsr_write_opcode(s1, token, 1);
         return;
 
     case TOK_ASM_bnez:
@@ -2124,8 +2021,56 @@ static int asm_parse_csrvar(int t)
     case TOK_ASM_timeh:
         return 0xc81;
     default:
+        if (t >= TOK_IDENT) {
+            /* the other standard CSRs, by name */
+            static const struct { const char *name; short num; } csrs[] = {
+                { "sstatus", 0x100 }, { "sie", 0x104 }, { "stvec", 0x105 },
+                { "scounteren", 0x106 }, { "senvcfg", 0x10a }, { "sscratch", 0x140 },
+                { "sepc", 0x141 }, { "scause", 0x142 }, { "stval", 0x143 },
+                { "sbadaddr", 0x143 }, { "sip", 0x144 }, { "stimecmp", 0x14d },
+                { "satp", 0x180 }, { "sptbr", 0x180 },
+                { "mstatus", 0x300 }, { "misa", 0x301 }, { "medeleg", 0x302 },
+                { "mideleg", 0x303 }, { "mie", 0x304 }, { "mtvec", 0x305 },
+                { "mcounteren", 0x306 }, { "menvcfg", 0x30a }, { "mscratch", 0x340 },
+                { "mepc", 0x341 }, { "mcause", 0x342 }, { "mtval", 0x343 },
+                { "mip", 0x344 }, { "pmpcfg0", 0x3a0 }, { "pmpaddr0", 0x3b0 },
+                { "mcycle", 0xb00 }, { "minstret", 0xb02 }, { "mvendorid", 0xf11 },
+                { "marchid", 0xf12 }, { "mimpid", 0xf13 }, { "mhartid", 0xf14 },
+            };
+            const char *name = get_tok_str(t, NULL);
+            int i;
+            for (i = 0; i < countof(csrs); i++)
+                if (!strcmp(name, csrs[i].name))
+                    return csrs[i].num;
+        }
         return -1;
     }
+}
+
+/* The CSR number in operand OP (a name or a constant). */
+static uint32_t asm_csr_num(int token, const Operand *op)
+{
+    if ((op->type != OP_IM12S && op->type != OP_IM32) || op->e.v > 0xfff)
+        tcc_error("'%s': expected a CSR name or number", get_tok_str(token, NULL));
+    return op->e.v;
+}
+
+/* fscsr/fsrm/fsflags [rd,] rs: csrrw rd, CSR, rs (rd defaults to zero) */
+static void asm_fcsr_write_opcode(TCCState *s1, int token, int csr)
+{
+    Operand ops[2];
+    parse_operand(s1, &ops[0]);
+    if (tok == ',') {
+        next();
+        parse_operand(s1, &ops[1]);
+    } else {
+        ops[1] = ops[0];
+        ops[0] = zero;
+    }
+    if (ops[0].type != OP_REG || ops[1].type != OP_REG ||
+        REG_IS_FLOAT(ops[0].reg) || REG_IS_FLOAT(ops[1].reg))
+        tcc_error("'%s': expected integer registers", get_tok_str(token, NULL));
+    asm_emit_opcode(0x73 | (1 << 12) | (csr << 20) | ENCODE_RD(ops[0].reg) | ENCODE_RS1(ops[1].reg));
 }
 
 ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
@@ -2645,6 +2590,8 @@ ST_FUNC void asm_clobber(uint8_t *clobber_regs, const char *str)
 
 ST_FUNC int asm_parse_regvar (int t)
 {
+    if (t == TOK_ASM_fp)
+        return 8;
     /* PC register not implemented */
     if (t >= TOK_ASM_pc || t < TOK_ASM_x0)
         return -1;
@@ -2663,395 +2610,265 @@ ST_FUNC int asm_parse_regvar (int t)
 }
 
 /*************************************************************/
-/* C extension */
+/* C extension (RV64C), in gas syntax: c.lw rd', off(rs1'), c.lwsp rd,
+   off(sp), c.addi4spn rd', sp, imm, c.beqz rs1', label, ... Registers
+   written r' must be x8-x15 (f8-f15 for c.fld/c.fsd). The RV32-only
+   c.flw, c.fsw, c.flwsp, c.fswsp and c.jal share encodings with RV64's
+   c.ld, c.sd, c.ldsp, c.sdsp and c.addiw, so they are rejected. */
 
-/* caller: Add funct6, funct2 into opcode */
-static void asm_emit_ca(int token, uint16_t opcode, const Operand *rd, const Operand *rs2)
+static void c_error(int token, const char *what)
 {
-    uint8_t dst, src;
-
-    if (rd->type != OP_REG) {
-        tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
-    }
-
-    if (rs2->type != OP_REG) {
-        tcc_error("'%s': Expected source operand that is a register", get_tok_str(token, NULL));
-    }
-
-    /* subtract index of x8 */
-    dst = rd->reg - 8;
-    src = rs2->reg - 8;
-
-    /* only registers {x,f}8 to {x,f}15 are valid (3-bit) */
-    if (dst > 7) {
-        tcc_error("'%s': Expected destination operand that is a valid C-extension register", get_tok_str(token, NULL));
-    }
-
-    if (src > 7) {
-        tcc_error("'%s': Expected source operand that is a valid C-extension register", get_tok_str(token, NULL));
-    }
-
-    /* CA-type instruction:
-    15...10 funct6
-    9...7   rd'/rs1'
-    6..5    funct2
-    4...2   rs2'
-    1...0   opcode */
-
-    gen_le16(opcode | C_ENCODE_RS2(src) | C_ENCODE_RS1(dst));
+    tcc_error("'%s': %s", get_tok_str(token, NULL), what);
 }
 
-static void asm_emit_cb(int token, uint16_t opcode, const Operand *rs1, const Operand *imm)
+/* a full register number (0-31), integer or (fp) float */
+static int c_reg(int token, const Operand *op, int fp)
 {
-    uint32_t offset;
-    uint8_t src;
-
-    if (rs1->type != OP_REG) {
-        tcc_error("'%s': Expected source operand that is a register", get_tok_str(token, NULL));
-    }
-
-    if (imm->type != OP_IM12S && imm->type != OP_IM32) {
-        tcc_error("'%s': Expected source operand that is an immediate value", get_tok_str(token, NULL));
-    }
-
-    offset = imm->e.v;
-
-    if (offset & 1) {
-        tcc_error("'%s': Expected source operand that is an even immediate value", get_tok_str(token, NULL));
-    }
-
-    src = rs1->reg - 8;
-
-    if (src > 7) {
-        tcc_error("'%s': Expected source operand that is a valid C-extension register", get_tok_str(token, NULL));
-    }
-
-    /* CB-type instruction:
-    15...13 funct3
-    12...10 offset
-    9..7    rs1'
-    6...2   offset
-    1...0   opcode */
-
-    /* non-branch also using CB:
-    15...13 funct3
-    12      imm
-    11..10  funct2
-    9...7   rd'/rs1'
-    6..2    imm
-    1...0   opcode */
-
-    switch (token) {
-    case TOK_ASM_c_beqz:
-    case TOK_ASM_c_bnez:
-        gen_le16(opcode | C_ENCODE_RS1(src) | ((NTH_BIT(offset, 5) | (((offset >> 1) & 3) << 1) | (((offset >> 6) & 3) << 3)) << 2) | ((((offset >> 3) & 3) | NTH_BIT(offset, 8)) << 10));
-        return;
-    default:
-        gen_le16(opcode | C_ENCODE_RS1(src) | ((offset & 0x1f) << 2) | (NTH_BIT(offset, 5) << 12));
-        return;
-    }
+    if (op->type != OP_REG || !REG_IS_FLOAT(op->reg) != !fp)
+        c_error(token, fp ? "expected a floating-point register" : "expected an integer register");
+    return REG_VALUE(op->reg);
 }
 
-static void asm_emit_ci(int token, uint16_t opcode, const Operand *rd, const Operand *imm)
+/* a register x8-x15 (f8-f15) as its 3-bit number */
+static int c_reg3(int token, const Operand *op, int fp)
 {
-    uint32_t immediate;
+    int r = c_reg(token, op, fp);
+    if (r < 8 || r > 15)
+        c_error(token, fp ? "expected a register f8-f15" : "expected a register x8-x15 (s0, s1, a0-a5)");
+    return r - 8;
+}
 
-    if (rd->type != OP_REG) {
-        tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
-    }
+/* an immediate in [lo, hi], a multiple of align */
+static int64_t c_imm(int token, const Operand *op, int64_t lo, int64_t hi, int align)
+{
+    int64_t v;
+    if (op->type != OP_IM12S && op->type != OP_IM32)
+        c_error(token, "expected an immediate value");
+    v = (int64_t)op->e.v;
+    if (v < lo || v > hi || (v & (align - 1)))
+        tcc_error("'%s': immediate %lld not in [%lld, %lld]%s", get_tok_str(token, NULL),
+                  (long long)v, (long long)lo, (long long)hi,
+                  align > 1 ? (align == 2 ? " or odd" : " or misaligned") : "");
+    return v;
+}
 
-    if (imm->type != OP_IM12S && imm->type != OP_IM32) {
-        tcc_error("'%s': Expected source operand that is an immediate value", get_tok_str(token, NULL));
-    }
+/* a branch or jump target: a label (resolved here or by the linker) or an
+   offset */
+static int64_t c_target(int token, const Operand *op, int reloc, int64_t range)
+{
+    int64_t v;
+    if (op->type == OP_SYM)
+        v = asm_sym_offset(op, reloc);
+    else if (op->type == OP_IM12S || op->type == OP_IM32)
+        v = (int64_t)op->e.v;
+    else
+        c_error(token, "expected a label or offset");
+    if (v < -range || v >= range || (v & 1))
+        c_error(token, "branch target out of range");
+    return v;
+}
 
-    immediate = imm->e.v;
+/* "rd, off(base)" or "rd, (base)" */
+static void c_parse_mem(TCCState *s1, Operand *r, Operand *base, Operand *off)
+{
+    parse_operand(s1, r);
+    skip(',');
+    if (tok == '(')
+        *off = zimm;
+    else
+        parse_operand(s1, off);
+    skip('(');
+    parse_operand(s1, base);
+    skip(')');
+}
 
-    /* CI-type instruction:
-    15...13 funct3
-    12      imm
-    11...7  rd/rs1
-    6...2   imm
-    1...0   opcode */
+static void asm_c_opcode(TCCState *s1, int token)
+{
+    Operand ops[3];
+    int64_t v;
+    int rd, rs, f3;
 
     switch (token) {
+    case TOK_ASM_c_nop:
+        gen_le16(0x0001);
+        return;
+    case TOK_ASM_c_ebreak:
+        gen_le16(0x9002);
+        return;
+
+    /* quadrant 0 */
+    case TOK_ASM_c_addi4spn:
+        parse_operands(s1, ops, 3);
+        rd = c_reg3(token, &ops[0], 0);
+        if (c_reg(token, &ops[1], 0) != 2)
+            c_error(token, "expected sp as the second operand");
+        v = c_imm(token, &ops[2], 4, 1020, 4);
+        gen_le16((((v >> 4) & 3) << 11) | (((v >> 6) & 15) << 7) | (((v >> 2) & 1) << 6)
+                 | (((v >> 3) & 1) << 5) | (rd << 2));
+        return;
+    case TOK_ASM_c_lw:
+    case TOK_ASM_c_sw:
+        c_parse_mem(s1, &ops[0], &ops[1], &ops[2]);
+        rd = c_reg3(token, &ops[0], 0);
+        rs = c_reg3(token, &ops[1], 0);
+        v = c_imm(token, &ops[2], 0, 124, 4);
+        gen_le16(((token == TOK_ASM_c_lw ? 2 : 6) << 13) | (((v >> 3) & 7) << 10) | (rs << 7)
+                 | (((v >> 2) & 1) << 6) | (((v >> 6) & 1) << 5) | (rd << 2));
+        return;
+    case TOK_ASM_c_ld:
+    case TOK_ASM_c_sd:
+    case TOK_ASM_c_fld:
+    case TOK_ASM_c_fsd:
+        c_parse_mem(s1, &ops[0], &ops[1], &ops[2]);
+        rd = c_reg3(token, &ops[0], token == TOK_ASM_c_fld || token == TOK_ASM_c_fsd);
+        rs = c_reg3(token, &ops[1], 0);
+        v = c_imm(token, &ops[2], 0, 248, 8);
+        f3 = token == TOK_ASM_c_fld ? 1 : token == TOK_ASM_c_ld ? 3 : token == TOK_ASM_c_fsd ? 5 : 7;
+        gen_le16((f3 << 13) | (((v >> 3) & 7) << 10) | (rs << 7) | (((v >> 6) & 3) << 5) | (rd << 2));
+        return;
+
+    /* quadrant 1 */
     case TOK_ASM_c_addi:
     case TOK_ASM_c_addiw:
     case TOK_ASM_c_li:
-    case TOK_ASM_c_slli:
-        gen_le16(opcode | ((immediate & 0x1f) << 2) | ENCODE_RD(rd->reg) | (NTH_BIT(immediate, 5) << 12));
+        parse_operands(s1, ops, 2);
+        rd = c_reg(token, &ops[0], 0);
+        if (rd == 0 && token != TOK_ASM_c_addi)
+            c_error(token, "the destination cannot be zero");
+        v = c_imm(token, &ops[1], -32, 31, 1);
+        f3 = token == TOK_ASM_c_addi ? 0 : token == TOK_ASM_c_addiw ? 1 : 2;
+        gen_le16((f3 << 13) | (((v >> 5) & 1) << 12) | (rd << 7) | ((v & 31) << 2) | 1);
         return;
     case TOK_ASM_c_addi16sp:
-        gen_le16(opcode | NTH_BIT(immediate, 5) << 2 | (((immediate >> 7) & 3) << 3) | NTH_BIT(immediate, 6) << 5 | NTH_BIT(immediate, 4) << 6 | ENCODE_RD(rd->reg) | (NTH_BIT(immediate, 9) << 12));
+        parse_operands(s1, ops, 2);
+        if (c_reg(token, &ops[0], 0) != 2)
+            c_error(token, "expected sp as the first operand");
+        v = c_imm(token, &ops[1], -512, 496, 16);
+        if (!v)
+            c_error(token, "the immediate cannot be zero");
+        gen_le16((3 << 13) | (((v >> 9) & 1) << 12) | (2 << 7) | (((v >> 4) & 1) << 6)
+                 | (((v >> 6) & 1) << 5) | (((v >> 7) & 3) << 3) | (((v >> 5) & 1) << 2) | 1);
         return;
     case TOK_ASM_c_lui:
-        gen_le16(opcode | (((immediate >> 12) & 0x1f) << 2) | ENCODE_RD(rd->reg) | (NTH_BIT(immediate, 17) << 12));
+        /* the operand is the upper 20 bits, like lui: 1-31 or 0xfffe0-0xfffff */
+        parse_operands(s1, ops, 2);
+        rd = c_reg(token, &ops[0], 0);
+        if (rd == 0 || rd == 2)
+            c_error(token, "the destination cannot be zero or sp");
+        v = c_imm(token, &ops[1], 1, 0xfffff, 1);
+        if (v > 31 && v < 0xfffe0)
+            c_error(token, "immediate not in [1, 31] or [0xfffe0, 0xfffff]");
+        gen_le16((3 << 13) | (((v >> 5) & 1) << 12) | (rd << 7) | ((v & 31) << 2) | 1);
         return;
-    case TOK_ASM_c_fldsp:
-    case TOK_ASM_c_ldsp:
-        gen_le16(opcode | (((immediate >> 6) & 7) << 2) | (((immediate >> 3) & 2) << 5) | ENCODE_RD(rd->reg) | (NTH_BIT(immediate, 5) << 12));
+    case TOK_ASM_c_srli:
+    case TOK_ASM_c_srai:
+    case TOK_ASM_c_andi:
+        parse_operands(s1, ops, 2);
+        rd = c_reg3(token, &ops[0], 0);
+        if (token == TOK_ASM_c_andi)
+            v = c_imm(token, &ops[1], -32, 31, 1);
+        else
+            v = c_imm(token, &ops[1], 1, 63, 1);
+        f3 = token == TOK_ASM_c_srli ? 0 : token == TOK_ASM_c_srai ? 1 : 2;
+        gen_le16((4 << 13) | (((v >> 5) & 1) << 12) | (f3 << 10) | (rd << 7) | ((v & 31) << 2) | 1);
         return;
-    case TOK_ASM_c_flwsp:
+    case TOK_ASM_c_sub:
+    case TOK_ASM_c_xor:
+    case TOK_ASM_c_or:
+    case TOK_ASM_c_and:
+    case TOK_ASM_c_subw:
+    case TOK_ASM_c_addw:
+        parse_operands(s1, ops, 2);
+        rd = c_reg3(token, &ops[0], 0);
+        rs = c_reg3(token, &ops[1], 0);
+        f3 = token == TOK_ASM_c_sub || token == TOK_ASM_c_subw ? 0 : token == TOK_ASM_c_xor
+             || token == TOK_ASM_c_addw ? 1 : token == TOK_ASM_c_or ? 2 : 3;
+        gen_le16((4 << 13) | ((token == TOK_ASM_c_subw || token == TOK_ASM_c_addw) << 12)
+                 | (3 << 10) | (rd << 7) | (f3 << 5) | (rs << 2) | 1);
+        return;
+    case TOK_ASM_c_j:
+        parse_branch_offset_operand(s1, &ops[0]);
+        v = c_target(token, &ops[0], R_RISCV_RVC_JUMP, 2048);
+        gen_le16((5 << 13) | (((v >> 11) & 1) << 12) | (((v >> 4) & 1) << 11) | (((v >> 8) & 3) << 9)
+                 | (((v >> 10) & 1) << 8) | (((v >> 6) & 1) << 7) | (((v >> 7) & 1) << 6)
+                 | (((v >> 1) & 7) << 3) | (((v >> 5) & 1) << 2) | 1);
+        return;
+    case TOK_ASM_c_beqz:
+    case TOK_ASM_c_bnez:
+        parse_operand(s1, &ops[0]);
+        skip(',');
+        parse_branch_offset_operand(s1, &ops[1]);
+        rs = c_reg3(token, &ops[0], 0);
+        v = c_target(token, &ops[1], R_RISCV_RVC_BRANCH, 256);
+        gen_le16(((token == TOK_ASM_c_beqz ? 6 : 7) << 13) | (((v >> 8) & 1) << 12) | (((v >> 3) & 3) << 10)
+                 | (rs << 7) | (((v >> 6) & 3) << 5) | (((v >> 1) & 3) << 3) | (((v >> 5) & 1) << 2) | 1);
+        return;
+
+    /* quadrant 2 */
+    case TOK_ASM_c_slli:
+        parse_operands(s1, ops, 2);
+        rd = c_reg(token, &ops[0], 0);
+        if (rd == 0)
+            c_error(token, "the destination cannot be zero");
+        v = c_imm(token, &ops[1], 1, 63, 1);
+        gen_le16((((v >> 5) & 1) << 12) | (rd << 7) | ((v & 31) << 2) | 2);
+        return;
     case TOK_ASM_c_lwsp:
-        gen_le16(opcode | (((immediate >> 6) & 3) << 2) | (((immediate >> 2) & 7) << 4) | ENCODE_RD(rd->reg) | (NTH_BIT(immediate, 5) << 12));
+        c_parse_mem(s1, &ops[0], &ops[1], &ops[2]);
+        rd = c_reg(token, &ops[0], 0);
+        if (rd == 0 || c_reg(token, &ops[1], 0) != 2)
+            c_error(token, "expected rd, off(sp) with rd not zero");
+        v = c_imm(token, &ops[2], 0, 252, 4);
+        gen_le16((2 << 13) | (((v >> 5) & 1) << 12) | (rd << 7) | (((v >> 2) & 7) << 4) | (((v >> 6) & 3) << 2) | 2);
         return;
-    case TOK_ASM_c_nop:
-        gen_le16(opcode);
+    case TOK_ASM_c_ldsp:
+    case TOK_ASM_c_fldsp:
+        c_parse_mem(s1, &ops[0], &ops[1], &ops[2]);
+        rd = c_reg(token, &ops[0], token == TOK_ASM_c_fldsp);
+        if ((rd == 0 && token == TOK_ASM_c_ldsp) || c_reg(token, &ops[1], 0) != 2)
+            c_error(token, "expected rd, off(sp) with rd not zero");
+        v = c_imm(token, &ops[2], 0, 504, 8);
+        gen_le16(((token == TOK_ASM_c_fldsp ? 1 : 3) << 13) | (((v >> 5) & 1) << 12) | (rd << 7)
+                 | (((v >> 3) & 3) << 5) | (((v >> 6) & 7) << 2) | 2);
         return;
-    default:
-        expect("known instruction");
-    }
-}
-
-/* caller: Add funct3 into opcode */
-static void asm_emit_ciw(int token, uint16_t opcode, const Operand *rd, const Operand *imm)
-{
-    uint32_t nzuimm;
-    uint8_t dst;
-
-    if (rd->type != OP_REG) {
-        tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
-    }
-
-    if (imm->type != OP_IM12S && imm->type != OP_IM32) {
-        tcc_error("'%s': Expected source operand that is an immediate value", get_tok_str(token, NULL));
-    }
-
-    dst = rd->reg - 8;
-
-    if (dst > 7) {
-        tcc_error("'%s': Expected destination operand that is a valid C-extension register", get_tok_str(token, NULL));
-    }
-
-    nzuimm = imm->e.v;
-
-    if (nzuimm > 0x3fc) {
-        tcc_error("'%s': Expected source operand that is an immediate value between 0 and 0x3ff", get_tok_str(token, NULL));
-    }
-
-    if (nzuimm & 3) {
-        tcc_error("'%s': Expected source operand that is a non-zero immediate value divisible by 4", get_tok_str(token, NULL));
-    }
-
-    /* CIW-type instruction:
-    15...13 funct3
-    12...5  imm
-    4...2   rd'
-    1...0   opcode */
-
-    gen_le16(opcode | ENCODE_RS2(rd->reg) | ((NTH_BIT(nzuimm, 3) | (NTH_BIT(nzuimm, 2) << 1) | (((nzuimm >> 6) & 0xf) << 2) | (((nzuimm >> 4) & 3) << 6)) << 5));
-}
-
-/* caller: Add funct3 into opcode */
-static void asm_emit_cj(int token, uint16_t opcode, const Operand *imm)
-{
-    uint32_t offset;
-
-    /* +-2 KiB range */
-    if (imm->type != OP_IM12S) {
-        tcc_error("'%s': Expected source operand that is a 12-bit immediate value", get_tok_str(token, NULL));
-    }
-
-    offset = imm->e.v;
-
-    if (offset & 1) {
-        tcc_error("'%s': Expected source operand that is an even immediate value", get_tok_str(token, NULL));
-    }
-
-    /* CJ-type instruction:
-    15...13 funct3
-    12...2  offset[11|4|9:8|10|6|7|3:1|5]
-    1...0   opcode */
-
-    gen_le16(opcode | (NTH_BIT(offset, 5) << 2) | (((offset >> 1) & 7) << 3) | (NTH_BIT(offset, 7) << 6) | (NTH_BIT(offset, 6) << 7) | (NTH_BIT(offset, 10) << 8) | (((offset >> 8) & 3) << 9) | (NTH_BIT(offset, 4) << 11) | (NTH_BIT(offset, 11) << 12));
-}
-
-/* caller: Add funct3 into opcode */
-static void asm_emit_cl(int token, uint16_t opcode, const Operand *rd, const Operand *rs1, const Operand *imm)
-{
-    uint32_t offset;
-    uint8_t dst, src;
-
-    if (rd->type != OP_REG) {
-        tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
-    }
-
-    if (rs1->type != OP_REG) {
-        tcc_error("'%s': Expected source operand that is a register", get_tok_str(token, NULL));
-    }
-
-    if (imm->type != OP_IM12S && imm->type != OP_IM32) {
-        tcc_error("'%s': Expected source operand that is an immediate value", get_tok_str(token, NULL));
-    }
-
-    dst = rd->reg - 8;
-    src = rs1->reg - 8;
-
-    if (dst > 7) {
-        tcc_error("'%s': Expected destination operand that is a valid C-extension register", get_tok_str(token, NULL));
-    }
-
-    if (src > 7) {
-        tcc_error("'%s': Expected source operand that is a valid C-extension register", get_tok_str(token, NULL));
-    }
-
-    offset = imm->e.v;
-
-    if (offset > 0xff) {
-        tcc_error("'%s': Expected source operand that is an immediate value between 0 and 0xff", get_tok_str(token, NULL));
-    }
-
-    if (offset & 3) {
-        tcc_error("'%s': Expected source operand that is an immediate value divisible by 4", get_tok_str(token, NULL));
-    }
-
-    /* CL-type instruction:
-    15...13 funct3
-    12...10 imm
-    9...7   rs1'
-    6...5   imm
-    4...2   rd'
-    1...0   opcode */
-
-    switch (token) {
-    /* imm variant 1 */
-    case TOK_ASM_c_flw:
-    case TOK_ASM_c_lw:
-        gen_le16(opcode | C_ENCODE_RS2(dst) | C_ENCODE_RS1(src) | (NTH_BIT(offset, 6) << 5) | (NTH_BIT(offset, 2) << 6) | (((offset >> 3) & 7) << 10));
-        return;
-    /* imm variant 2 */
-    case TOK_ASM_c_fld:
-    case TOK_ASM_c_ld:
-        gen_le16(opcode | C_ENCODE_RS2(dst) | C_ENCODE_RS1(src) | (((offset >> 6) & 3) << 5) | (((offset >> 3) & 7) << 10));
-        return;
-    default:
-        expect("known instruction");
-    }
-}
-
-/* caller: Add funct4 into opcode */
-static void asm_emit_cr(int token, uint16_t opcode, const Operand *rd, const Operand *rs2)
-{
-    if (rd->type != OP_REG) {
-        tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
-    }
-
-    if (rs2->type != OP_REG) {
-        tcc_error("'%s': Expected source operand that is a register", get_tok_str(token, NULL));
-    }
-
-    /* CR-type instruction:
-    15...12 funct4
-    11..7   rd/rs1
-    6...2   rs2
-    1...0   opcode */
-
-    gen_le16(opcode | C_ENCODE_RS1(rd->reg) | C_ENCODE_RS2(rs2->reg));
-}
-
-/* caller: Add funct3 into opcode */
-static void asm_emit_cs(int token, uint16_t opcode, const Operand *rs2, const Operand *rs1, const Operand *imm)
-{
-    uint32_t offset;
-    uint8_t base, src;
-
-    if (rs2->type != OP_REG) {
-        tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
-    }
-
-    if (rs1->type != OP_REG) {
-        tcc_error("'%s': Expected source operand that is a register", get_tok_str(token, NULL));
-    }
-
-    if (imm->type != OP_IM12S && imm->type != OP_IM32) {
-        tcc_error("'%s': Expected source operand that is an immediate value", get_tok_str(token, NULL));
-    }
-
-    base = rs1->reg - 8;
-    src = rs2->reg - 8;
-
-    if (base > 7) {
-        tcc_error("'%s': Expected destination operand that is a valid C-extension register", get_tok_str(token, NULL));
-    }
-
-    if (src > 7) {
-        tcc_error("'%s': Expected source operand that is a valid C-extension register", get_tok_str(token, NULL));
-    }
-
-    offset = imm->e.v;
-
-    if (offset > 0xff) {
-        tcc_error("'%s': Expected source operand that is an immediate value between 0 and 0xff", get_tok_str(token, NULL));
-    }
-
-    if (offset & 3) {
-        tcc_error("'%s': Expected source operand that is an immediate value divisible by 4", get_tok_str(token, NULL));
-    }
-
-    /* CS-type instruction:
-    15...13 funct3
-    12...10 imm
-    9...7   rs1'
-    6...5   imm
-    4...2   rs2'
-    1...0   opcode */
-    switch (token) {
-    /* imm variant 1 */
-    case TOK_ASM_c_fsw:
-    case TOK_ASM_c_sw:
-        gen_le16(opcode | C_ENCODE_RS2(base) | C_ENCODE_RS1(src) | (NTH_BIT(offset, 6) << 5) | (NTH_BIT(offset, 2) << 6) | (((offset >> 3) & 7) << 10));
-        return;
-    /* imm variant 2 */
-    case TOK_ASM_c_fsd:
-    case TOK_ASM_c_sd:
-        gen_le16(opcode | C_ENCODE_RS2(base) | C_ENCODE_RS1(src) | (((offset >> 6) & 3) << 5) | (((offset >> 3) & 7) << 10));
-        return;
-    default:
-        expect("known instruction");
-    }
-}
-
-/* caller: Add funct3 into opcode */
-static void asm_emit_css(int token, uint16_t opcode, const Operand *rs2, const Operand *imm)
-{
-    uint32_t offset;
-
-    if (rs2->type != OP_REG) {
-        tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
-    }
-
-    if (imm->type != OP_IM12S && imm->type != OP_IM32) {
-        tcc_error("'%s': Expected source operand that is an immediate value", get_tok_str(token, NULL));
-    }
-
-    offset = imm->e.v;
-
-    if (offset > 0xff) {
-        tcc_error("'%s': Expected source operand that is an immediate value between 0 and 0xff", get_tok_str(token, NULL));
-    }
-
-    if (offset & 3) {
-        tcc_error("'%s': Expected source operand that is an immediate value divisible by 4", get_tok_str(token, NULL));
-    }
-
-    /* CSS-type instruction:
-    15...13 funct3
-    12...7  imm
-    6...2   rs2
-    1...0   opcode */
-
-    switch (token) {
-    /* imm variant 1 */
-    case TOK_ASM_c_fswsp:
     case TOK_ASM_c_swsp:
-        gen_le16(opcode | ENCODE_RS2(rs2->reg) | (((offset >> 6) & 3) << 7) | (((offset >> 2) & 0xf) << 9));
+        c_parse_mem(s1, &ops[0], &ops[1], &ops[2]);
+        rs = c_reg(token, &ops[0], 0);
+        if (c_reg(token, &ops[1], 0) != 2)
+            c_error(token, "expected rs2, off(sp)");
+        v = c_imm(token, &ops[2], 0, 252, 4);
+        gen_le16((6 << 13) | (((v >> 2) & 15) << 9) | (((v >> 6) & 3) << 7) | (rs << 2) | 2);
         return;
-    /* imm variant 2 */
-    case TOK_ASM_c_fsdsp:
     case TOK_ASM_c_sdsp:
-        gen_le16(opcode | ENCODE_RS2(rs2->reg) | (((offset >> 6) & 7) << 7) | (((offset >> 3) & 7) << 10));
+    case TOK_ASM_c_fsdsp:
+        c_parse_mem(s1, &ops[0], &ops[1], &ops[2]);
+        rs = c_reg(token, &ops[0], token == TOK_ASM_c_fsdsp);
+        if (c_reg(token, &ops[1], 0) != 2)
+            c_error(token, "expected rs2, off(sp)");
+        v = c_imm(token, &ops[2], 0, 504, 8);
+        gen_le16(((token == TOK_ASM_c_fsdsp ? 5 : 7) << 13) | (((v >> 3) & 7) << 10) | (((v >> 6) & 7) << 7)
+                 | (rs << 2) | 2);
         return;
+    case TOK_ASM_c_jr:
+    case TOK_ASM_c_jalr:
+        parse_operand(s1, &ops[0]);
+        rs = c_reg(token, &ops[0], 0);
+        if (rs == 0)
+            c_error(token, "the register cannot be zero");
+        gen_le16((4 << 13) | ((token == TOK_ASM_c_jalr) << 12) | (rs << 7) | 2);
+        return;
+    case TOK_ASM_c_mv:
+    case TOK_ASM_c_add:
+        parse_operands(s1, ops, 2);
+        rd = c_reg(token, &ops[0], 0);
+        rs = c_reg(token, &ops[1], 0);
+        if (rd == 0 || rs == 0)
+            c_error(token, "the registers cannot be zero");
+        gen_le16((4 << 13) | ((token == TOK_ASM_c_add) << 12) | (rd << 7) | (rs << 2) | 2);
+        return;
+
     default:
-        expect("known instruction");
+        c_error(token, "not an RV64C instruction");
     }
 }
 

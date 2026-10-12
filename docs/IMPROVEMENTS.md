@@ -297,7 +297,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
   - split windows, visual block mode, numbered and append registers, `fill-paragraph`, emacs keyboard macros (M/L);
   - safer saving: `fsync`, owner and umask, warn when the file changed on disk (M/S);
   - smaller: `SIGWINCH`, marks that follow edits, wide-character widths, more syntax modes (e.g. Markdown, assembly) (L/M).
-- Smaller items: eutils arguments; consistent `execvp` limits; safer signal handlers; unwind information for `__restore_rt`.
+- Smaller items: a `basename` (and `dirname`) command, which does not exist yet; eutils arguments; consistent `execvp` limits; safer signal handlers; unwind information for `__restore_rt`.
 
 ### [The shell](subsystems/12-shell.md#potential-improvements)
 - Regular expressions for `[[ =~ ]]` (M/S now that libc has `regcomp`).
@@ -309,7 +309,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
 
 ### [The native toolchain](subsystems/13-toolchain.md#potential-improvements)
 - Line numbers from `-g` DWARF in kernel fault reports (M/M).
-- Self-hosting roadmap (M/L): tcc already compiles itself and every libc C file from `/mnt/host`; next, tcc's sources in `/usr/src` with a byte-identical second generation; the libc's `.S` files (tcc assembler gaps); the kernel's C (30 of 76 files blocked by `stdint.h`, `__ATOMIC_*`, the `"K"` constraint, assembler gaps and a register-allocator assertion); and the link (the kernel's linker script and the Python `gen_ksyms` two-pass link).
+- Self-hosting roadmap (M/L): step 1 is done (tcc's assembler handles all our `.S` files, byte-identical to GNU as, tested against it). Next: build the libc and `/bin` with tcc in the guest; tcc's own sources in `/usr/src` with a byte-identical second generation; the kernel's C (blocked by `stdint.h`, `__ATOMIC_*`, the `"K"` constraint and a register-allocator assertion); the link (the kernel's linker script and the Python `gen_ksyms` two-pass link). Remaining assembler gaps: `%hi`/`%lo`/`%pcrel_*`, automatic compression, `.cfi` unwind tables, `.irpc`, `\@`.
 - `make -j` (M/M); more GNU make (`define`, `$(call)`, `$(eval)`, `vpath`) (M/M).
 - `tcc -run` without `mprotect` (a fallback through `/tmp` and `exec`) (L/S); a smaller `libtcc1.a` (L/S).
 
@@ -342,6 +342,7 @@ Bigger projects that would each change what the system can do. They are listed r
 - **A real C library.** Buffered `FILE` stdio, `printf` with floating point, `scanf`, `strto*`, `qsort`, `getopt`, `math.h`, `strftime`, `setjmp`/`sigsetjmp`, and POSIX regular expressions (BRE and ERE) ([10](subsystems/10-user-space.md#stdio-streams)).
 - **Several disks and a persistent `/home`.** Up to four virtio disks, a buffer cache keyed by disk, a log per filesystem, volume labels, and `home.img`, which survives rebuilds ([06](subsystems/06-filesystems.md#boot-and-mounting)).
 - **A native C toolchain.** TinyCC runs on Eunuchs (`/bin/tcc`, with `tcc -run` through the new `mprotect`), with a sysroot in `/usr`, a POSIX `make`, and the sources of every program in `/usr/src`, rebuilt in about 6 seconds in the guest ([13](subsystems/13-toolchain.md)).
+- **tcc's assembler fixed and completed** (self-hosting step 1): macros, `.irp`, section types, gas-compatible `la`/`li`/`call`, every S- and M-mode CSR, the missing instructions, rewritten compressed instructions, and a dozen silent mis-encodings fixed; checked byte for byte against GNU as by a host test ([13](subsystems/13-toolchain.md#the-assembler)).
 - **The Mac's files in the guest.** A virtio-9p transport and a 9P2000.L client (9pfs) mount the project directory on `/mnt/host` under `make run`: edit on the Mac, build and run on Eunuchs ([06](subsystems/06-filesystems.md#9pfs-host-directories)).
 - **A native debugger.** `ptrace` in the kernel (tracing stops on signal delivery, register, FP and memory access, `exec` and breakpoint SIGTRAPs) and `db`, a gdb-like source-level debugger with its own DWARF 4/5 reader, software single-stepping and an RV64GC disassembler ([14](subsystems/14-debugger.md)). A user `ebreak` is now a SIGTRAP instead of freezing the machine in the monitor.
 - **A text editor.** `edit`, with a vi personality (operators, text objects, visual mode, registers, macros, ex commands) and an emacs one (kill ring, incremental search, query-replace, `M-x`) ([10](subsystems/10-user-space.md#the-editor-vi-and-emacs)).
