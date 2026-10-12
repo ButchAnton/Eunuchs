@@ -132,14 +132,14 @@ def main():
     def fsck(name, **kw):
         return stage(name, [a.mkfs, "--check", img], **kw)
 
-    def interactive(name, steps):
+    def interactive(name, steps, extra=()):
         """steps: (send, expect[, prompt]) tuples. send is a command line (then we
         wait for `expect` and the next prompt, unless prompt=False) or bytes for
         raw keys like ^C (sent after a short pause so the target is running)."""
         t0 = time.time()
         logpath = os.path.join(logs, name + ".log")
         with open(logpath, "w") as log:
-            con = Console(qemu + ["-append", "panic=shutdown lockdep=panic " + a.append], log)
+            con = Console(qemu + list(extra) + ["-append", "panic=shutdown lockdep=panic " + a.append], log)
             problem = None
             try:
                 con.expect("root@eunuchs:/# ", 20)
@@ -326,6 +326,8 @@ def main():
         ("kill %1", "[1]  + terminated  sleep 30"),    # reported as soon as it happens
         ("sleep 1 &", "[1] "), ("wait", None),
         ("V=hi sh -c 'echo inner=$V'", "inner=hi"),
+        ("mkdir -p /tmp/p/q/r && mkdir -p /tmp/p/q && touch /tmp/p/q/r/f && ls /tmp/p/q/r", "f"),
+        ("rm -rf /tmp/p && rm -f /tmp/nonexistent && ls /tmp/p", "cannot access '/tmp/p'"),
         ("false || echo or-ok && echo and-ok", "and-ok"),
         ("nosuch", "esh: command not found: nosuch"),
         ("segv null", "esh: segmentation fault (core dumped)  segv null"),
@@ -374,6 +376,55 @@ def main():
          "Breakpoint 1, add (a=2, b=3) at /tmp/d.c:3", False),
         (None, "#1  0x", False), (None, "Value returned is $1 = 5", False), (None, "exited normally"),
     ])
+
+    # A Mac directory shared through virtio-9p, mounted on /mnt/host: the guest
+    # reads what the Mac wrote, and the Mac sees what the guest wrote.
+    share = os.path.join(build, "test-share")
+    shutil.rmtree(share, ignore_errors=True)
+    os.makedirs(os.path.join(share, "sub"))
+    with open(os.path.join(share, "from-mac.txt"), "w") as f:
+        f.write("made on the mac\n")
+    with open(os.path.join(share, "gone.txt"), "w") as f:
+        f.write("delete me\n")
+    interactive("host share (9p)", [
+        ("cat /mnt/host/from-mac.txt", "made on the mac"),
+        ("echo made in eunuchs > /mnt/host/from-guest.txt && mkdir /mnt/host/d && "
+         "mv /mnt/host/from-guest.txt /mnt/host/d/g.txt && ls /mnt/host/d", "g.txt"),
+        ("cp /bin/cat /mnt/host/cat.bin && rm /mnt/host/gone.txt && chmod 600 /mnt/host/from-mac.txt", None),
+        ("cd /mnt/host/sub && pwd; cd /", "/mnt/host/sub"),
+        ("tcc -o /mnt/host/hello /usr/src/echod.c && ls -l /mnt/host/hello", "/mnt/host/hello"),
+        # a second listing must not come from the first one's buffered entries
+        ("mkdir -p /mnt/host/t/u && touch /mnt/host/t/keep1 /mnt/host/t/gone1 /mnt/host/t/u/f && "
+         "ls /mnt/host/t > /dev/null && rm /mnt/host/t/gone1 && echo count=$(ls /mnt/host/t | grep -c one)",
+         "count=0"),
+        ("rm -rf /mnt/host/t && echo removed", "removed"),
+    ], extra=["-fsdev", "local,id=hostfs,path=%s,security_model=none" % share,
+              "-device", "virtio-9p-device,fsdev=hostfs,mount_tag=host"])
+    t0 = time.time()
+    problems = []
+    try:
+        if open(os.path.join(share, "d", "g.txt")).read() != "made in eunuchs\n":
+            problems.append("d/g.txt has the wrong contents")
+    except OSError as e:
+        problems.append("d/g.txt: %s" % e)
+    try:
+        if open(os.path.join(share, "cat.bin"), "rb").read() != \
+                open(os.path.join(build, "user", "stripped", "cat"), "rb").read():
+            problems.append("cat.bin differs from /bin/cat")
+    except OSError as e:
+        problems.append("cat.bin: %s" % e)
+    if os.path.exists(os.path.join(share, "gone.txt")):
+        problems.append("gone.txt was not removed")
+    if os.path.exists(os.path.join(share, "from-mac.txt")) and \
+            os.stat(os.path.join(share, "from-mac.txt")).st_mode & 0o777 != 0o600:
+        problems.append("chmod did not reach the Mac")
+    if os.path.exists(os.path.join(share, "t")):
+        problems.append("rm -rf left t/ behind")
+    if not os.path.exists(os.path.join(share, "hello")) or open(os.path.join(share, "hello"), "rb").read(4) != b"\x7fELF":
+        problems.append("the program tcc built is missing")
+    results.append(("host share, Mac side", not problems, time.time() - t0))
+    print("  %-22s %s  (%.1fs)" % ("host share, Mac side", "ok" if not problems else "FAILED: " + "; ".join(problems),
+                                   time.time() - t0), flush=True)
 
     # Networking through QEMU's user-mode network: ping, HTTP from the Mac,
     # UDP, 1 MiB each way with CRC checks; then with 5% packet loss (over

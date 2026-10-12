@@ -142,7 +142,7 @@ Watch: `procs`, `ubt <pid>`, `vm <pid>`, `files <pid>` and `strace <pid>` in the
 
 *Details: [Filesystems](subsystems/06-filesystems.md).*
 
-The **VFS** (`fs/vfs.c`) has an in-memory inode cache (each inode with a mutex), path lookup with mount points (`/home`, `/dev`, `/proc`) and permission checks. **File objects** (`file.c`) hold a reference count, an offset and flags. Each process has a 32-entry descriptor table with close-on-exec flags.
+The **VFS** (`fs/vfs.c`) has an in-memory inode cache (each inode with a mutex), path lookup with mount points (`/home`, `/dev`, `/proc`, `/mnt/host`) and permission checks. **File objects** (`file.c`) hold a reference count, an offset and flags. Each process has a 32-entry descriptor table with close-on-exec flags.
 
 **efs** (`fs/efs.c`, layout in `include/efs_format.h`):
 
@@ -163,6 +163,7 @@ The **VFS** (`fs/vfs.c`) has an in-memory inode cache (each inode with a mutex),
 
 **Other file types:**
 - **pipes** (4 KiB rings);
+- **9pfs** (`ninep.c`): a 9P2000.L client over virtio-9p; `make run` shares the project directory, mounted on `/mnt/host` (read-write: it is the real checkout);
 - **devfs** (`/dev/console`, `null`, `zero`, `kmsg`, `disk0`, `disk1`, `tty`);
 - **procfs**: text files generated on open from the same print functions the monitor uses.
 
@@ -179,6 +180,7 @@ Watch: `mounts`, `bcache`, `icache`, `pipes` and `blk` in the monitor; `make fsc
 | UART 16550 | `drivers/uart16550.c` | Polled output, interrupt-driven input. `Ctrl-]` goes to the monitor; everything else goes to the TTY. |
 | TTY | `drivers/tty.c` | Canonical and raw modes, echo, `^C ^Z ^\ ^D`, termios (Linux layout), foreground process group, `SIGTTIN`. |
 | virtio-mmio | `drivers/virtio.c` | Modern (version 2) transport, split virtqueues of up to 128 descriptors. |
+| virtio-9p | `drivers/virtio_9p.c` | Up to four host directories; one request is a T-message and a reply buffer; callers sleep. |
 | virtio-blk | `drivers/virtio_blk.c` | Up to four disks. Requests sleep until the completion interrupt; many can be in flight. |
 | virtio-net | `drivers/virtio_net.c` | 64 receive buffers kept posted; no offloads. |
 | goldfish RTC | `drivers/goldfish_rtc.c` | Wall-clock time. |

@@ -98,6 +98,16 @@ struct fs_ops {
     void (*begin_op)(struct super_block *sb);
     void (*end_op)(struct super_block *sb);
     void (*stat_fs)(struct super_block *sb, int (*print)(const char *fmt, ...));
+    /*
+     * For filesystems that work by name (9pfs), where alloc_inode + link and
+     * the nlink bookkeeping of unlink and rename don't apply. When present,
+     * the VFS calls these instead.
+     */
+    struct inode *(*create)(struct inode *dir, const char *name, enum itype type, int mode,
+                            int *err);              /* returns the new inode locked */
+    int (*remove)(struct inode *dir, const char *name, bool isdir);
+    int (*rename)(struct inode *odir, const char *oname, struct inode *ndir, const char *nname);
+    int (*refresh)(struct inode *ip);   /* re-read attributes that may have changed elsewhere */
 };
 
 struct fs_type {
@@ -220,7 +230,7 @@ void pipes_print(int (*print)(const char *fmt, ...));
 void files_exec(struct proc *p);            /* close FD_CLOEXEC descriptors */
 
 /* Filesystem types. */
-extern const struct fs_type efs_type, devfs_type, procfs_type;
+extern const struct fs_type efs_type, devfs_type, procfs_type, ninep_type;
 
 /* log.c (efs) */
 struct efs_log;

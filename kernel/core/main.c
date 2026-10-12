@@ -57,6 +57,7 @@ static void kinit(void *arg)
     if (blk_init() == 0)
         panic("no disk: the root filesystem lives on a virtio block device "
               "(make run attaches build/fs.img)");
+    p9_init();                          /* host directories, mounted by vfs_init */
     vfs_init();
     net_init();
 

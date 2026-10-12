@@ -83,7 +83,7 @@ FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(no
            /etc/motd=user/etc/motd /etc/passwd=user/etc/passwd /etc/group=user/etc/group /etc/hostname=user/etc/hostname \
            /etc/eshrc=user/etc/eshrc /dev/ /proc/ /tmp/:0777 \
            /www/ /www/index.html=user/www/index.html \
-           /home/ /home/guest/:0755:1000:1000 \
+           /home/ /home/guest/:0755:1000:1000 /mnt/ /mnt/host/ \
            $(foreach f,$(SYS_FILES),$(patsubst $(SYSROOT)%,%,$(f))=$(f)) \
            $(foreach f,$(filter user/bin/%,$(USR_SRC)),/usr/src/$(patsubst user/bin/%,%,$(f))=$(f)) \
            /usr/src/Makefile=user/usr-src/Makefile
@@ -107,7 +107,14 @@ NETOPTS  = -netdev user,id=net0$(if $(HOSTFWD),$(comma)$(HOSTFWD)) \
 comma := ,
 # make run/debug also attach the /home disk (the test scenarios don't).
 HOMEOPTS = -drive file=$(HOME_IMG),if=none,format=raw,id=hd1 -device virtio-blk-device,drive=hd1
-QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(NETOPTS)
+# make run/debug also share a Mac directory (the project, unless HOSTDIR=...;
+# HOSTDIR= shares nothing) through virtio-9p; the kernel mounts it on
+# /mnt/host. It is the real directory: what the guest writes there changes
+# the Mac's files.
+HOSTDIR  ?= $(CURDIR)
+SHAREOPTS = $(if $(HOSTDIR),-fsdev local$(comma)id=hostfs$(comma)path=$(HOSTDIR)$(comma)security_model=none \
+            -device virtio-9p-device$(comma)fsdev=hostfs$(comma)mount_tag=host)
+QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(SHAREOPTS) $(NETOPTS)
 
 .PHONY: all user fsck clean-home run debug gdb test stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean sysroot
 

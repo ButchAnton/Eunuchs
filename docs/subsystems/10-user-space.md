@@ -648,8 +648,8 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | Name | Usage | Notes |
 |---|---|---|
 | `echo` | `echo [ARG...]` | No options; no escape processing. |
-| `mkdir` | `mkdir DIR...` | Mode 0755. |
-| `rm` | `rm FILE...` | `unlink` only; no `-r`/`-f`. |
+| `mkdir` | `mkdir [-p] DIR...` | Mode 0755. `-p` (only as the first argument) creates missing parents and accepts an existing directory (`mkdir_p`). Before, `mkdir -p` made a directory named `-p`, which is how the `/usr/src` Makefile's `mkdir -p $(BIN)` left a `-p` behind. |
+| `rm` | `rm [-rf] FILE...` | `-r` (or `-R`) removes directories and their contents depth first (`rm_tree`, using `stat`, so it does not follow anything but efs has no symlinks); `-f` ignores missing files; options may be combined (`-rf`, `-fr`) and `--` ends them. Names in a directory are read before any is removed, so the walk does not depend on how the filesystem reorders a directory as it shrinks. There is no `-i`; `rm -r /` is refused. |
 | `rmdir` | `rmdir DIR...` | |
 | `touch` | `touch [-c] FILE...` | Sets the modification time to now (`utimensat`); creates a missing file (0644) unless `-c`. |
 | `ln` | `ln OLD NEW` | Hard links only; exactly two arguments. |
@@ -689,6 +689,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `/bin/sh` | hard link to `/bin/esh` |
 | `/bin/less` | hard link to `/bin/more` |
 | `/bin/vi`, `/bin/view`, `/bin/emacs`, `/bin/em` | hard links to `/bin/edit` |
+| `/mnt/`, `/mnt/host/` | empty; the Mac's shared directory is mounted on `/mnt/host` under `make run` ([06](06-filesystems.md#9pfs-host-directories)) |
 | `/usr/include/` | `user/include/` and `lib/include/` (the headers tcc compiles against) |
 | `/usr/lib/crt1.o`, `crti.o`, `crtn.o`, `libc.a` | the start-up files and the libc as an archive, from `build/sysroot` |
 | `/usr/lib/tcc/` | `libtcc1.a`, `runmain.o` and tcc's own headers |

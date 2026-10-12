@@ -390,6 +390,8 @@ static u64 boot_time_ns(void)
 
 void vfs_stat(struct inode *ip, struct stat *st)
 {
+    if (ip->sb->ops->refresh)           /* attributes another host may have changed (ip is locked) */
+        ip->sb->ops->refresh(ip);
     memset(st, 0, sizeof(*st));
     st->st_ino = ip->ino;
     st->st_mode = ip->mode | (ip->type == I_DIR ? S_IFDIR : ip->type == I_CHR ? S_IFCHR : S_IFREG);
@@ -415,6 +417,10 @@ static struct inode *create_in(struct inode *dp, const char *name, enum itype ty
                                int *err)
 {
     struct super_block *sb = dp->sb;
+    if (sb->ops->create) {
+        struct proc *cp = current_proc();
+        return sb->ops->create(dp, name, type, mode & 07777 & ~(cp ? cp->umask : 0), err);
+    }
     if (!sb->ops->alloc_inode) {
         *err = -EPERM;
         return NULL;
@@ -508,6 +514,13 @@ struct file *vfs_open(const char *path, int flags, int mode, int *err)
     }
 
     int acc = flags & O_ACCMODE;
+    if (ip->valid && ip->sb->ops->refresh) {
+        int rr = ip->sb->ops->refresh(ip);
+        if (rr == -ENOENT || rr == -ESTALE) {
+            *err = rr;                  /* gone on the other side */
+            goto fail;
+        }
+    }
     if (!ip->valid) {
         *err = -EIO;
         goto fail;
@@ -645,6 +658,10 @@ static int unlink_locked(struct inode *dp, const char *name, bool want_dir)
         err = -ENOTDIR;
     } else if (!want_dir && ip->type == I_DIR) {
         err = -EISDIR;
+    } else if (sb->ops->remove) {
+        err = sb->ops->remove(dp, name, want_dir);  /* the server checks emptiness */
+        if (!err)
+            ip->nlink = ip->nlink ? ip->nlink - 1 : 0;
     } else if (want_dir && !dir_empty(ip)) {
         err = -ENOTEMPTY;
     } else {
@@ -673,9 +690,10 @@ int vfs_unlink(const char *path, bool want_dir)
     if (!dp)
         return err;
     struct super_block *sb = dp->sb;
-    if (!strcmp(name, ".") || !strcmp(name, "..") || !sb->ops->unlink) {
+    bool can = sb->ops->unlink || sb->ops->remove;
+    if (!strcmp(name, ".") || !strcmp(name, "..") || !can) {
         iput(dp);
-        return sb->ops->unlink ? -EINVAL : -EPERM;
+        return can ? -EINVAL : -EPERM;
     }
     mutex_lock(&sb->ns_lock);
     fs_begin_op(sb);
@@ -810,6 +828,10 @@ int vfs_rename(const char *oldpath, const char *newpath)
     iunlock(ip);
     if (isdir && is_ancestor(ip, ndp)) {
         err = -EINVAL;                  /* moving a directory into itself */
+        goto out_ip;
+    }
+    if (sb->ops->rename) {
+        err = sb->ops->rename(odp, oname, ndp, nname);   /* replaces a target, as rename(2) */
         goto out_ip;
     }
 
@@ -978,4 +1000,12 @@ void vfs_init(void)
     r = vfs_mount(&procfs_type, "/proc");
     if (r)
         pr_warn("/proc not mounted (%s); create /proc in the image\n", errno_name(-r));
+    /* host directories shared through 9P: /mnt/<tag> */
+    for (int i = 0; i < p9_count(); i++) {
+        char path[48];
+        ksnprintf(path, sizeof(path), "/mnt/%s", p9_tag(i));
+        r = vfs_mount_disk(&ninep_type, path, i);
+        if (r)
+            pr_warn("9p share \"%s\" not mounted on %s: %s\n", p9_tag(i), path, errno_name(-r));
+    }
 }

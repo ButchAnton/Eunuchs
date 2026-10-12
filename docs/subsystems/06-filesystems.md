@@ -1,6 +1,6 @@
 # Files and filesystems
 
-This subsystem turns one or more virtio disks into a Unix file tree. Three filesystem types sit under a small VFS: efs, an on-disk filesystem with a write-ahead log in the xv6 style; devfs, mounted on `/dev`; and procfs, a read-only view of kernel state on `/proc`. It also provides the file objects and per-process descriptor tables behind every `read`/`write`, plus pipes and `ppoll`. A host tool (`tools/mkfs/mkfs.c`) builds efs images and checks them (fsck).
+This subsystem turns one or more virtio disks, and directories shared by the host, into a Unix file tree. Four filesystem types sit under a small VFS: 9pfs, a client for directories on the Mac shared through virtio-9p, mounted on `/mnt/<tag>`; efs, an on-disk filesystem with a write-ahead log in the xv6 style; devfs, mounted on `/dev`; and procfs, a read-only view of kernel state on `/proc`. It also provides the file objects and per-process descriptor tables behind every `read`/`write`, plus pipes and `ppoll`. A host tool (`tools/mkfs/mkfs.c`) builds efs images and checks them (fsck).
 
 ## Responsibilities and scope
 
@@ -12,6 +12,7 @@ This subsystem turns one or more virtio disks into a Unix file tree. Three files
 - **VFS** (`vfs.c`): the inode table, mounts (choosing the root and `/home` disks by volume label), path lookup, permission checks, and the namespace operations (create, mkdir, unlink, link, rename, getcwd).
 - **Files and descriptors** (`file.c`): `struct file`, 32-slot descriptor tables, and the file system calls.
 - **Pipes** (`pipe.c`), **`ppoll`** (`poll.c`), **devfs** (`devfs.c`) and **procfs** (`procfs.c`).
+- **9pfs** (`ninep.c`): a 9P2000.L client for host directories.
 - **Host tools**: `mkfs`/`fsck` (`tools/mkfs/mkfs.c`) and their host test (`tests/host/test_fsck.py`).
 
 **Out of scope (owned by other subsystems):**
@@ -38,6 +39,7 @@ This subsystem turns one or more virtio disks into a Unix file tree. Three files
 | `kernel/fs/pipe.c` | 4 KiB ring pipes, `pipe_create`, `/proc/pipes`. |
 | `kernel/fs/poll.c` | `poll_wait`, `file_poll`, `do_ppoll`. |
 | `kernel/fs/devfs.c` | `/dev`: `console`, `null`, `zero`, `kmsg`, `disk0`, `disk1`, `tty`, `tty0`. |
+| `kernel/fs/ninep.c` | 9pfs: 9P2000.L messages, nodes and fids, the `fs_ops`, `p9_mount` (`ninep_type`). |
 | `kernel/fs/procfs.c` | `/proc`: global files, `/proc/net/*`, `/proc/<pid>/*`, `/proc/self`, `seq_print`. |
 | `kernel/proc/cred.c` | `do_fchmod`, `do_fchmodat`, `do_fchownat`, `do_faccessat` (FS-adjacent). |
 | `tools/mkfs/mkfs.c` | Host `mkfs [--label NAME] IMAGE SIZE_MB specs...` and `mkfs --check IMAGE` (fsck). |
@@ -147,7 +149,7 @@ file block bn            where
   - `mounted`: the filesystem mounted on this directory.
   - `u.efs`: a full copy of the `efs_dinode`, including `addrs`.
 - **`struct efs_info`** (`efs.c`): a copy of the superblock, the log pointer, `bhint` (the next place to look for a free block), and the in-memory counters `nfree_blocks` and `nfree_inodes`. It also has an `alloc_lock`, which is initialized but never taken (see Limitations).
-- **`struct fs_ops`**: `read_inode`, `write_inode`, `alloc_inode`, `free_inode`, `read`, `write`, `truncate`, `lookup`, `link`, `unlink`, `readdir`, `begin_op`, `end_op` and `stat_fs`. Any of them may be `NULL`. devfs and procfs provide only `read_inode`, `lookup` and `readdir`. Because they have no `alloc_inode`, `link`, `unlink` or `write_inode`, the VFS returns `EPERM` for creates, removals, chmod and chown on them.
+- **`struct fs_ops`**: `read_inode`, `write_inode`, `alloc_inode`, `free_inode`, `read`, `write`, `truncate`, `lookup`, `link`, `unlink`, `readdir`, `begin_op`, `end_op` and `stat_fs`, plus four optional hooks for filesystems that work by name rather than by allocating inodes and editing directories (9pfs): `create` (make a file or directory and return it locked), `remove`, `rename`, and `refresh` (re-read attributes that may have changed elsewhere). When present, the VFS calls them instead of its generic code (see Opening and creating, Namespace operations). Any of them may be `NULL`. devfs and procfs provide only `read_inode`, `lookup` and `readdir`. Because they have no `alloc_inode`, `link`, `unlink` or `write_inode`, the VFS returns `EPERM` for creates, removals, chmod and chown on them.
 - **`struct chr_ops`**: `open`, `read`, `write`, `close`, `ioctl` and `poll`. They are used for devices, procfs files, pipes and sockets. When `f->cops->read` or `write` is set, `file_read`/`file_write` call it instead of `fs_ops`.
 
 **The inode "cache" is not a cache.** `iput` frees the in-memory inode as soon as `refcnt` reaches 0 (`kernel/fs/vfs.c: iput`). Every later `iget` + `ilock` therefore re-reads the dinode, which usually comes from the buffer cache. The `icache` list holds exactly the inodes that are referenced (`icache_busy` counts them for leak tests).
@@ -221,6 +223,7 @@ All devfs inodes have uid and gid 0 (they are `kzalloc`ed and never set). `rdev`
    - `vfs_mount` resolves the mount point with `namei`, requires a directory that has nothing mounted on it, and keeps that reference in `sb->covered`.
    - It sets `covered->mounted = sb`.
    - If the directory is missing from the image, it only warns (`/dev not mounted (...); create /dev in the image`).
+6. For each 9P device found by `p9_init` (which `kinit` runs before `vfs_init`), `vfs_mount_disk(&ninep_type, "/mnt/<tag>", i)` (the "disk" number is the 9P device number). The image has `/mnt/host/`, the tag `make run` uses; a share whose directory is missing only warns (`9p share "TAG" not mounted on /mnt/TAG: ...`).
 
 Every block access in `efs.c` goes to its own superblock's disk (the `BREAD(bno)` macro is `bread(sb->disk, bno)`), and each mounted efs has its own `struct efs_log` on its own disk, with its own log area, transactions and recovery. The two filesystems' transactions are independent: an operation never spans them, since `rename` and `link` across mounts fail with `EXDEV`.
 
@@ -421,13 +424,13 @@ Where the checks happen:
 2. Lock `sb->ns_lock`, then `fs_begin_op`, then `ilock(dir)`.
 3. Look up the name.
 4. **If it exists:** release everything. Then `-EEXIST` with `O_EXCL`; otherwise re-resolve the full path with `namei` so that a mount point is crossed.
-5. **If not:** check `W|X` on the directory, then `create_in`:
+5. **If not:** check `W|X` on the directory, then `create_in`. If the filesystem has a `create` hook, `create_in` calls it with `mode & 07777 & ~umask` and returns its (locked) inode; otherwise:
    - `alloc_inode`, `ilock`, `nlink = 1`, `mode = mode & 07777 & ~umask`, uid and gid from the effective ids;
    - for a directory: link `.` and `..`, `nlink = 2`, and `parent->nlink++`;
    - `write_inode`, then link the name into the parent.
    - On failure it sets `nlink = 0` and `iunlockput`s, which frees the inode inside the same transaction.
 
-**Without `O_CREAT`:** `namei` and `ilock`.
+**Without `O_CREAT`:** `namei` and `ilock`. With a `refresh` hook, the attributes are re-read (9pfs: `Tgetattr`) before the checks, so a file changed on the host is seen with its current size and mode; `vfs_stat` does the same.
 
 **Then the common checks:**
 
@@ -452,7 +455,7 @@ All of these take `sb->ns_lock` and run as one transaction, so each is atomic ac
   - It rejects `.` and `..`.
   - `unlink_locked` locks the parent, looks up the name, checks `W|X`, and locks the child.
   - It returns `-EBUSY` for a mount point, `-ENOTDIR`/`-EISDIR` for a type mismatch, and `-ENOTEMPTY` for a directory with entries other than `.` and `..`.
-  - Then it removes the entry. Removing a directory decrements the parent's `nlink` (for the child's `..`) and sets the child's `nlink` to 0; removing a file decrements its `nlink`.
+  - With a `remove` hook the filesystem removes the name (and a server checks emptiness itself), and the child's `nlink` is decremented in memory. Otherwise it removes the entry. Removing a directory decrements the parent's `nlink` (for the child's `..`) and sets the child's `nlink` to 0; removing a file decrements its `nlink`.
   - Finally `iunlockput(child)` frees the inode if that was the last reference.
 - **`vfs_link`**:
   - Both paths must be on the same filesystem (`-EXDEV`), and the target may not be a directory (`-EPERM`).
@@ -464,6 +467,8 @@ All of these take `sb->ns_lock` and run as one transaction, so each is atomic ac
   4. Renaming one name of a file onto another name of the same file does nothing.
   5. An existing target must be a file, and so must the source (`-EISDIR`/`-ENOTDIR` otherwise); the target is removed with `unlink_locked`.
   6. It links the new name, then unlinks the old one. For a directory moved between parents it adjusts both parents' `nlink` and rewrites the directory's `..`.
+
+  With a `rename` hook, steps 1–3 run and then the filesystem renames (replacing an existing target, as `rename(2)` does); steps 4–6 are skipped.
 
   It does not check whether the source is a mount point.
 - **`vfs_getcwd`**: walks up from the directory. At each step it finds `..`, then scans the parent for an entry with the child's inode number, and prepends that name. It climbs out of mounts through `sb->covered`. Depth is limited to 64, and the result to `PATH_MAX`.
@@ -571,6 +576,41 @@ Reads (`proc_read`) and seeks then work on this snapshot, so a reader always see
 **Listing** (`pr_readdir`): the global files, then `net`, then one directory per process (`proc_nth_pid(index)`). Processes that come and go between `getdents` calls can be skipped or listed twice. `self` is not listed.
 
 A pid directory's `read_inode` fails with `-ENOENT` once the process is gone.
+
+### 9pfs: host directories
+
+`kernel/fs/ninep.c` mounts a directory of the Mac, shared by QEMU with `-fsdev local,id=ID,path=DIR,security_model=none -device virtio-9p-device,fsdev=ID,mount_tag=TAG`, on `/mnt/TAG`. It speaks 9P2000.L over the virtio-9p transport ([07](07-devices-and-tty.md#9p-transport-virtio_9pc)). The server is the host: names, permissions, owners and times are the Mac's, and programs on the Mac can change the files at any time.
+
+**Mounting** (`p9_mount`): `Tversion` asking for `msize` 65536 and `9P2000.L` (a server `msize` below 32 KiB + 24 fails the mount with `EINVAL`), then `Tattach` with uname `root` and no numeric uid (QEMU's `security_model=none` decides: files are accessed as the user running QEMU). The root's fid becomes node 1.
+
+**Nodes and fids.** 9P names a file by a 64-bit `qid.path`; the VFS by a 32-bit inode number. Every `qid.path` seen (in a walk, a create or a directory listing) gets a `struct node` with the next small number (the root is 1), found through a 256-bucket hash and a by-number table; nodes are **kept for the life of the mount**. A node holds:
+
+- `fid`: walked to the file (`Twalk`), for `Tgetattr`/`Tsetattr` and as the base of further walks (0 until the file has been looked up);
+- `ofid`: opened for I/O (`Tlopen`), made on the first read or write: read-write if the host allows, otherwise read-only (a later write then reopens and fails with `EACCES`). A file created here starts with one;
+- `dfid` and a buffer: the directory opened for `Treaddir`, and the last batch of entries;
+- the mode, owner and mtime last read or sent, so `write_inode` can send only changes.
+
+A node's fids change only with its inode locked (the VFS holds the lock around lookup, read, write and readdir); the node table is under a spinlock (`fs->lock`). fids are numbered from 2 by a counter and never reused while the mount lives.
+
+**Operations:**
+
+| VFS operation | 9P |
+|---|---|
+| `lookup` | one `Twalk` of one name from the directory's fid; the path walk does this for every component (nothing is cached) |
+| `read_inode`, `refresh` | `Tgetattr` (basic attributes): type (directory or not; everything else, symbolic links included, is a regular file), mode, uid, gid (truncated to 16 bits), nlink, size, mtime, ctime |
+| `read`, `write` | `Tread`/`Twrite` in chunks of 32 KiB (`P9_IOCHUNK`) on the `ofid`; a short reply ends the call |
+| `write_inode` | `Tsetattr` with only the changed mode, uid, gid or mtime (`chmod`, `chown`, `utimensat`); nothing if nothing changed |
+| `truncate` | `Tsetattr` with the size |
+| `readdir` | `Tlopen` of a clone of the directory's fid (once), then `Treaddir` batches of up to 8 KiB from an offset; entries are served from the buffered batch; names longer than `EFS_NAMELEN` (59) are skipped |
+| `create` | `Tmkdir` for a directory; for a file, a clone of the directory's fid becomes the new open file with `Tlcreate` (`O_RDWR\|O_CREAT\|O_EXCL`), then a `Twalk` gives the node its `fid`; the group is the caller's effective gid |
+| `remove` | `Tunlinkat` (with `AT_REMOVEDIR` for a directory) |
+| `rename` | `Trenameat` |
+| `link` | `Tlink` |
+| `stat_fs` | the `mounts` line: tag, `msize`, inodes known, requests, error replies (`Rlerror`, mostly lookups of missing names) and failures (transport or protocol) |
+
+Each request is one `p9_transact`: the message is built in a `kmalloc`ed buffer, sent with a tag from a global counter, and the reply checked for type (`Rlerror` gives `-errno` from the host, Linux numbers; a wrong type is `-EIO` and a warning). A node or fid the client has lost track of gives the new errno `ESTALE` (116, `lib/include/uapi/errno.h`).
+
+**Permissions.** The VFS checks the guest's credentials against the host's owners and modes (the Mac's uid 501 and gid 20, say), so the guest's root can do anything, and `guest` (1000) only what the files' "other" bits allow. Then QEMU, running as the Mac user, applies the Mac's own permissions: guest root can do whatever that Mac user can, and no more.
 
 ### Host mkfs and fsck (`tools/mkfs/mkfs.c`)
 
@@ -730,8 +770,9 @@ Numbers are Linux RISC-V (`lib/include/uapi/syscall.h`).
 
 ### Files
 
+- **`/mnt/host`**: the Mac's directory under `make run` (9pfs).
 - **`/dev`**: `console`, `tty`, `tty0`, `null`, `zero`, `kmsg`, `disk0`, and `disk1` when a second disk is attached.
-- **`/proc`**: `meminfo`, `slabinfo`, `interrupts`, `threads`, `sched`, `procs`, `mounts`, `bcache`, `blk`, `icache`, `trace`, `virtio`, `uptime`, `pipes`, `tty`, `cpus`, `lockdep`, `profile`.
+- **`/proc`**: `meminfo`, `slabinfo`, `interrupts`, `threads`, `sched`, `procs`, `mounts`, `bcache`, `blk`, `icache`, `trace`, `virtio`, `uptime`, `pipes`, `tty`, `cpus`, `lockdep`, `profile`, `9p`.
 - **`/proc/net`**: `dev`, `arp`, `tcp`, `udp`, `stats`.
 - **Per process**: `/proc/<pid>/{status,maps,fds,stack,ustack,cmdline}` and `/proc/self`.
 
@@ -806,6 +847,9 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 | `log header has bad magic ...; not replaying` / `log header claims N blocks; not replaying` | a damaged log header; mounting continues without replay |
 | `fs.crash=P: simulating a power failure during commit S` | an armed crash point fired (QEMU exit status 3) |
 | `efs: not an efs filesystem` / `unsupported block size / version`, then panic `cannot mount the root filesystem` | wrong or damaged image |
+| `mounted 9p on /mnt/host` | a 9P share was found and mounted |
+| `9p share "TAG" not mounted on /mnt/TAG: E` | no `/mnt/TAG` directory in the image (`ENOENT`), or the server refused the session |
+| `9p: reply type R to request type T` | a protocol error; counted as a failure in `mounts` |
 | `/dev not mounted (...)` / `/proc not mounted (...)` | the image lacks the mount-point directory |
 
 ## Limitations and known issues
@@ -856,6 +900,14 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 - The signal mask argument is ignored.
 - At most 64 descriptors.
 - Wait registrations beyond 128 are silently dropped, which would lose wakeups.
+
+**9pfs:**
+- **Nothing is reclaimed**: nodes, and the fids they hold on the server, live until the mount goes away (never), so walking a huge tree uses kernel memory and server fids without bound. Every file seen in a listing gets a node.
+- **No caching**: every path component is a `Twalk` and every `stat` and `open` a `Tgetattr`, so a long path costs one round trip per component. A file deleted on the Mac fails `open` with ENOENT (or ESTALE); `stat` keeps showing its last attributes. A directory's buffered `Treaddir` batch is dropped whenever a listing restarts at offset 0 and after every create, remove, link and rename in it.
+- **Host types and names**: symbolic links, devices, FIFOs and sockets appear as regular files (the type is only "directory or not"); names longer than 59 bytes are skipped in listings (and cannot be looked up through a listing's name); uids and gids above 65535 are truncated.
+- **No `Tfsync`**: `fsync` does nothing on the share either; writes reach the Mac's page cache, not necessarily its disk.
+- **No unmount or remount**, and only tags whose `/mnt/TAG` exists in the image (`host`) are mounted.
+- `st_dev` is 0 here too, so inode numbers collide with the other filesystems'.
 
 **procfs:**
 - Output is truncated at 64 KiB with no indication.
@@ -926,8 +978,9 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 12. **Fix the `getdents64` name truncation**: widen `struct dirent.d_name` to 60 bytes, or reject 59-byte names in `efs_link`, so that every name that can be created can also be listed intact. This is an ABI change (`lib/include/uapi/fs.h`, `user/` libc). Impact: low. Effort: small.
 13. **Harden `vfs_getcwd`**: return `-ENAMETOOLONG` when the depth limit is hit instead of returning a partial path, and do not touch `de` unless an entry was found. Impact: low. Effort: small.
 14. **Restrict the crash-injection hook**: require `euid == 0` for `DBG_FSCRASH` in `kernel/proc/syscall.c`, so unprivileged users (e.g. `guest`) cannot stop the machine. Impact: low. Effort: small.
-15. **A mount table instead of two fixed labels**: read `/etc/fstab` (label → path) from the root filesystem in `vfs_init`, or add a `mount` system call taking a disk number or label; give every disk a `/dev/diskN` node; and report a distinct `st_dev` per superblock so `(st_dev, st_ino)` identifies a file. Impact: medium. Effort: medium.
-16. **Better observability for the log**:
+15. **9pfs follow-ups**: drop a directory's buffered batch when a listing restarts at offset 0 (and on create, remove and rename); reclaim nodes and clunk their fids when their inodes are freed; a short-lived attribute and dentry cache to cut the round trips; map host uids to guest uids (or present the share as owned by one guest user); symbolic links (`Treadlink`, `Tsymlink`); `Tfsync` for `fsync`; names longer than 59 bytes. Impact: medium. Effort: medium.
+16. **A mount table instead of two fixed labels**: read `/etc/fstab` (label → path) from the root filesystem in `vfs_init`, or add a `mount` system call taking a disk number or label; give every disk a `/dev/diskN` node; and report a distinct `st_dev` per superblock so `(st_dev, st_ino)` identifies a file. Impact: medium. Effort: medium.
+17. **Better observability for the log**:
     - Expose the per-transaction block high-water mark per operation type, and the time threads spend in `"log space"`.
     - Add a trace event for `log_begin` waits.
     - Have `eu-files` in `tools/gdb/eunuchs.py` handle `f->ip == NULL` (pipes and sockets) instead of dereferencing it.

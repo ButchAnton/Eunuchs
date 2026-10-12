@@ -81,6 +81,7 @@ static const struct {
     { "icache", icache_print },
     { "trace", gen_trace },
     { "virtio", virtio_print },
+    { "9p", p9_print },
     { "uptime", gen_uptime },
     { "pipes", pipes_print },
     { "tty", tty_print },

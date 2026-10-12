@@ -1,6 +1,6 @@
 # Device drivers and the terminal
 
-This document covers the hardware-facing half of Eunuchs: the PLIC interrupt router, the 16550 UART and the kernel console, the virtio-mmio transport with its split virtqueues, the virtio block and network drivers, the goldfish RTC, the console TTY line discipline, and the device files in `/dev`. All drivers target QEMU's `virt` board. The code is small (about 1,600 lines across the files listed below) and deliberately simple: one console TTY, one disk, one NIC, every device interrupt on cpu0.
+This document covers the hardware-facing half of Eunuchs: the PLIC interrupt router, the 16550 UART and the kernel console, the virtio-mmio transport with its split virtqueues, the virtio block, network and 9P drivers, the goldfish RTC, the console TTY line discipline, and the device files in `/dev`. All drivers target QEMU's `virt` board. The code is small (about 1,600 lines across the files listed below) and deliberately simple: one console TTY, one disk, one NIC, every device interrupt on cpu0.
 
 ## Responsibilities and scope
 
@@ -13,6 +13,7 @@ This document covers the hardware-facing half of Eunuchs: the PLIC interrupt rou
 - Implement the console line discipline, termios ioctls and terminal job control (`kernel/drivers/tty.c`).
 - Implement the virtio-mmio modern transport, device-status handshake and split virtqueues (`kernel/drivers/virtio.c`).
 - Provide a block I/O primitive, `blk_rw(disk, ...)`, for up to four virtio disks, used by the buffer cache and `/dev/disk0`/`disk1` (`kernel/drivers/virtio_blk.c`).
+- Provide a request/reply channel to 9P servers, `p9_transact`, for up to four virtio-9p devices (host directories shared by QEMU), used by the 9P filesystem (`kernel/drivers/virtio_9p.c`).
 - Provide the `eth0` network interface's transmit function and receive path into `netif_rx` (`kernel/drivers/virtio_net.c`).
 - Provide wall-clock time, `rtc_time_ns` (`kernel/drivers/goldfish_rtc.c`).
 - Expose `/dev/console`, `/dev/tty`, `/dev/tty0`, `/dev/null`, `/dev/zero`, `/dev/kmsg`, `/dev/disk0`, `/dev/disk1` (`kernel/fs/devfs.c`).
@@ -39,6 +40,7 @@ This document covers the hardware-facing half of Eunuchs: the PLIC interrupt rou
 | `kernel/include/virtio.h` | 94 | Virtqueue/ring structures, `struct virtio_dev`, transport and block API |
 | `kernel/drivers/virtio.c` | 254 | virtio-mmio transport, feature negotiation, `virtq_*`, `dma_addr`, `/proc/virtio` |
 | `kernel/drivers/virtio_blk.c` | 154 | virtio-blk: `blk_init`, `blk_rw`, completion IRQ, statistics |
+| `kernel/drivers/virtio_9p.c` | 124 | virtio-9p: `p9_init`, mount tags, `p9_transact`, completion IRQ, `/proc/9p` |
 | `kernel/drivers/virtio_net.c` | 123 | virtio-net as `eth0`: RX buffer posting, TX, IRQ |
 | `kernel/drivers/goldfish_rtc.c` | 21 | `rtc_time_ns` |
 | `kernel/mm/vmm.c: ioremap` | — | Map an MMIO range into the direct map |
@@ -238,7 +240,7 @@ From `kernel/core/main.c: kmain` and `kinit`:
 3. `plic_init` maps the PLIC, sets this context's threshold to 0 and sets `SIE_SEIE` in `sie`.
 4. `tty_init` loads the default termios.
 5. `console_enable_irq` registers `uart_irq` for `platform.uart.irq` and enables the UART's receive interrupt. From here on, keystrokes reach the TTY.
-6. `kinit` (first kernel thread) calls `blk_init`, which returns the number of disks found (`kinit` panics if it is 0: `"no disk: the root filesystem lives on a virtio block device ..."`), then `vfs_init` (mounts `/`, `/home` and devfs on `/dev`), then `net_init`, which calls `virtio_net_init`.
+6. `kinit` (first kernel thread) calls `blk_init`, which returns the number of disks found (`kinit` panics if it is 0: `"no disk: the root filesystem lives on a virtio block device ..."`), then `p9_init` (every virtio-9p device; none is fine), then `vfs_init` (mounts `/`, `/home`, devfs on `/dev`, procfs, and each 9P share on `/mnt/<tag>`), then `net_init`, which calls `virtio_net_init`.
 7. `proc_spawn` opens `/dev/console` three times for fds 0–2 of `init`, makes it a session leader and calls `tty_set_ctty`, giving it the console as controlling terminal and its group as the foreground group.
 
 The RTC has no initialization; `rtc_time_ns` maps its page on first use.
@@ -428,6 +430,15 @@ Notes:
 - `buf` is passed as one descriptor of `len` bytes, so the buffer must be physically contiguous. Callers use direct-map memory: the buffer cache's 4 KiB blocks and `/dev/disk0`'s page.
 - No flush command is issued and `VIRTIO_BLK_F_FLUSH` is not negotiated. The filesystem's crash consistency (efs log) relies on writes being durable when they complete.
 
+### 9P transport (`virtio_9p.c`)
+
+QEMU's `-device virtio-9p-device,fsdev=ID,mount_tag=TAG` (device type `VIRTIO_DEV_9P` = 9, named `9p` in `/proc/virtio`) exports a host directory through the 9P protocol. The driver is only a transport; the protocol (9P2000.L) is in `kernel/fs/ninep.c` ([06](06-filesystems.md#9pfs-host-directories)).
+
+- **`p9_init`** finds up to `MAX_9P` = 4 devices with `virtio_find_from`, negotiating `VIRTIO_9P_F_MOUNT_TAG` (bit 0). For each: `virtq_init(…, 0, 64)` (on failure log and skip), read the mount tag, `irq_register(…, "virtio-9p", p9_irq, d)`, `DRIVER_OK`, and log `9pN: host share "TAG"`. It returns the number of devices.
+- **The mount tag** is in config space: a little-endian 16-bit length, then the bytes (cut to `P9_TAG_MAX` = 31). It is read one byte at a time with the new `virtio_config_read8`, because QEMU fails wider reads that run past the end of a short config space (the tag's config is only `2 + len` bytes).
+- **`p9_transact(dev, tx, txlen, rx, rxcap)`** sends one request: a two-descriptor chain, the T-message (device reads) and the reply buffer (device writes). Both must be physically contiguous kernel memory (`kmalloc`). It waits for descriptors on `free_wq` if needed, kicks, and sleeps uninterruptibly on the device's `done_wq` (`wait_what = "9P reply"`) until `p9_irq` marks the request done with the reply length. Many requests can be in flight (up to 32 with a 64-descriptor queue); 9P tags, chosen by the filesystem, are only for the server's bookkeeping. Returns the reply length or `-ENODEV`/`-ENOMEM`.
+- **Statistics**: requests, bytes out and in per device, printed by `p9_print` (`/proc/9p`, and the monitor's `blk` command).
+
 ### Network RX and TX
 
 `virtio_net_init` (from `net_init`):
@@ -536,9 +547,10 @@ Lock order observed in this code: `tty` → `log_lock` (echo and erase output ha
 | `int virtio_find(u32 id, u64 want, struct virtio_dev *)` | `drivers/virtio.c` | virtio drivers |
 | `int virtq_init(dev, q, index, num)`, `void virtio_ready(dev)` | `drivers/virtio.c` | virtio drivers |
 | `int virtq_add(q, bufs, n, cookie)`, `void virtq_kick(dev, q)`, `void *virtq_get(q, &len)` | `drivers/virtio.c` | virtio drivers |
-| `u32 virtio_ack_irq(dev)`, `u32 virtio_config_read32(dev, off)` | `drivers/virtio.c` | virtio drivers |
+| `u32 virtio_ack_irq(dev)`, `u32 virtio_config_read32(dev, off)`, `u8 virtio_config_read8(dev, off)` | `drivers/virtio.c` | virtio drivers |
 | `int blk_init(void)` (returns the number of disks), `int blk_count(void)`, `u64 blk_capacity(int disk)` (sectors; 0 for a bad number) | `drivers/virtio_blk.c` | `kinit`, `vfs_init`, devfs |
 | `int blk_rw(int disk, u64 sector, void *buf, u32 len, bool write)` | `drivers/virtio_blk.c` | `fs/bcache.c`, devfs |
+| `int p9_init(void)`, `int p9_count(void)`, `const char *p9_tag(int i)`, `long p9_transact(int i, const void *tx, u32 txlen, void *rx, u32 rxcap)`, `p9_print` | `drivers/virtio_9p.c` | `kinit`, `vfs_init`, `fs/ninep.c`, procfs, monitor |
 | `int virtio_find_from(int from, u32 id, u64 want, struct virtio_dev *dev)` | `drivers/virtio.c` | `blk_init` (`virtio_find` is the `from = 0` form) |
 | `int virtio_net_init(void)` | `drivers/virtio_net.c` | `net/net.c: net_init` |
 | `void console_init/putc/write`, `console_write_locked`, `console_getc[_nowait]` | `core/console.c`, `core/printk.c` | printk, monitor, TTY |
@@ -559,6 +571,7 @@ No device-specific system calls. Devices are reached through `open`/`read`/`writ
 |---|---|---|
 | `/proc/interrupts` | `irq_print` | per-CPU timer/IPI/external counts; per-PLIC-source count, time (µs), handler symbol; spurious claims |
 | `/proc/blk` | `blk_print` | one block per disk (`diskN: virtio-blk ...`): capacity, queue size and free descriptors, IRQ, reads/writes (count and KiB), errors, average and max latency, in-flight count |
+| `/proc/9p` | `p9_print` | per 9P device: tag, requests, bytes out and in |
 | `/proc/virtio` | `virtio_print` | every virtio slot: base, IRQ, device type, version, status register |
 | `/proc/tty` | `tty_print` | session, foreground group, size, termios flags, line being edited, queued entries and complete lines, in/out/dropped/signals |
 
@@ -567,7 +580,7 @@ No device-specific system calls. Devices are reached through `open`/`read`/`writ
 | Command | Shows |
 |---|---|
 | `irq` | `irq_print` |
-| `blk` | `blk_print` and `virtio_print` |
+| `blk` | `blk_print`, `p9_print` and `virtio_print` |
 | `tty` | `tty_print` |
 | `plat`, `dtb` | platform summary and device tree (where devices are) |
 | `traps` | exception/interrupt counters |
@@ -626,6 +639,7 @@ View with `trace show` in the monitor, `eu-trace` in GDB, or a Perfetto export (
 
 **General**
 
+- 9P requests wait uninterruptibly, like disk I/O: a host that never answers hangs the caller. The reply length is trusted as the device reports it (the filesystem checks message framing). The per-device statistics are not atomic.
 - One UART TTY, up to four virtio-blk devices (only disks 0 and 1 get `/dev` nodes), the first virtio-net device. `blk_init` stops scanning at the first block device that fails the handshake (for example a legacy one), so disks after it are not found. No hotplug, no driver unload, no device reset after errors.
 - Driver initialization is hard-coded in `kmain`, `kinit` and `net_init`; there is no driver registry or device-tree match table for drivers.
 - All device interrupts go to cpu0. Under heavy I/O, cpu0 does all interrupt work.

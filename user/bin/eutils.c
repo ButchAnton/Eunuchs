@@ -4,6 +4,7 @@
  *   echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env
  *   id true false yes kill date dmesg free sleep strace su dbg uname clear
  */
+#include <dirent.h>
 #include <errno.h>
 #include <eunuchs.h>
 #include <fcntl.h>
@@ -22,6 +23,69 @@ static int fail(const char *what)
 {
     eprintf("%s: %s: %s\n", prog, what, strerror(errno));
     return 1;
+}
+
+/* mkdir -p: every missing directory on the way; an existing directory is fine. */
+static int mkdir_p(const char *path)
+{
+    char buf[PATH_MAX];
+    if (!*path) {
+        errno = ENOENT;
+        return -1;
+    }
+    snprintf(buf, sizeof(buf), "%s", path);
+    for (char *p = buf + 1;; p++) {
+        if (*p != '/' && *p)
+            continue;
+        char c = *p;
+        *p = 0;
+        struct stat st;
+        if (mkdir(buf, 0755) < 0 && !(errno == EEXIST && stat(buf, &st) == 0 && S_ISDIR(st.st_mode)))
+            return -1;
+        *p = c;
+        if (!c)
+            return 0;
+        while (p[1] == '/')
+            p++;
+    }
+}
+
+/* rm -r: a directory's contents, then the directory. */
+static int rm_tree(const char *path, int force)
+{
+    struct stat st;
+    if (stat(path, &st) < 0)
+        return force && errno == ENOENT ? 0 : fail(path);
+    if (!S_ISDIR(st.st_mode))
+        return unlink(path) < 0 ? fail(path) : 0;
+    DIR *d = opendir(path);
+    if (!d)
+        return fail(path);
+    /* the names first, then the removals: removing while reading a
+       directory can make the reader skip entries */
+    char **names = 0;
+    int n = 0, cap = 0, rc = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 32;
+            names = realloc(names, cap * sizeof(char *));
+        }
+        names[n++] = strdup(de->d_name);
+    }
+    closedir(d);
+    for (int i = 0; i < n; i++) {
+        char sub[PATH_MAX];
+        snprintf(sub, sizeof(sub), "%s/%s", path, names[i]);
+        rc |= rm_tree(sub, force);
+        free(names[i]);
+    }
+    free(names);
+    if (rmdir(path) < 0)
+        rc = fail(path);
+    return rc;
 }
 
 static int copy(const char *from, const char *to)
@@ -493,13 +557,43 @@ int main(int argc, char **argv)
             printf("%s%s", argv[i], i + 1 < argc ? " " : "");
         printf("\n");
     } else if (!strcmp(prog, "mkdir")) {
-        for (int i = 1; i < argc; i++)
-            if (mkdir(argv[i], 0755) < 0)
+        int i = 1, parents = 0;
+        if (i < argc && !strcmp(argv[i], "-p"))
+            parents = 1, i++;
+        for (; i < argc; i++)
+            if ((parents ? mkdir_p(argv[i]) : mkdir(argv[i], 0755)) < 0)
                 rc = fail(argv[i]);
     } else if (!strcmp(prog, "rm")) {
-        for (int i = 1; i < argc; i++)
-            if (unlink(argv[i]) < 0)
+        /* rm [-r] [-f] (also -rf, -fr, -R): -r removes directories and their contents,
+           -f ignores missing files */
+        int i = 1, recursive = 0, force = 0;
+        for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+            if (!strcmp(argv[i], "--")) {
+                i++;
+                break;
+            }
+            for (const char *o = argv[i] + 1; *o; o++) {
+                if (*o == 'r' || *o == 'R')
+                    recursive = 1;
+                else if (*o == 'f')
+                    force = 1;
+                else {
+                    eprintf("usage: rm [-rf] FILE...\n");
+                    return 2;
+                }
+            }
+        }
+        for (; i < argc; i++) {
+            if (recursive && !strcmp(argv[i], "/")) {
+                eprintf("rm: refusing to remove /\n");
+                rc = 1;
+                continue;
+            }
+            if (recursive)
+                rc |= rm_tree(argv[i], force);
+            else if (unlink(argv[i]) < 0 && !(force && errno == ENOENT))
                 rc = fail(argv[i]);
+        }
     } else if (!strcmp(prog, "rmdir")) {
         for (int i = 1; i < argc; i++)
             if (rmdir(argv[i]) < 0)

@@ -51,6 +51,7 @@ static const char *device_name(u32 id)
     case 0: return "(none)";
     case VIRTIO_DEV_NET: return "net";
     case VIRTIO_DEV_BLOCK: return "block";
+    case VIRTIO_DEV_9P: return "9p";
     case 3: return "console";
     case 4: return "rng";
     case 16: return "gpu";
@@ -245,6 +246,12 @@ u32 virtio_ack_irq(struct virtio_dev *dev)
 u32 virtio_config_read32(struct virtio_dev *dev, u32 off)
 {
     return rd(dev, REG_CONFIG + off);
+}
+
+/* One byte: QEMU fails wider reads that run past the end of a short config space. */
+u8 virtio_config_read8(struct virtio_dev *dev, u32 off)
+{
+    return *(volatile u8 *)(dev->regs + REG_CONFIG + off);
 }
 
 void virtio_print(print_fn print)

@@ -23,7 +23,7 @@ Out of scope: the efs on-disk format and the fsck rules (see the filesystem docu
 | `user/user.ld` | User linker script: static binaries at `0x10000`, three `PT_LOAD` segments (r-x, r--, rw-) |
 | `tools/gen_ksyms.py` | Turns `nm -n` output into `ksyms.S` (the `.ksyms` section); with empty input, an empty table for pass 1 |
 | `tools/mkfs/mkfs.c` | Host tool: `mkfs IMAGE SIZE_MB SPEC...` builds `build/fs.img`; `mkfs --check IMAGE` is fsck |
-| `tools/run_tests.py` | `make test`: the multi-boot scenario (17 stages), console "expect", network harness, logs and pcaps |
+| `tools/run_tests.py` | `make test`: the multi-boot scenario (19 stages), console "expect", network harness, logs and pcaps |
 | `tools/ci.py` | `make ci`: clean build, host tests, `make test` on 4 and 1 CPUs, soak, replay check; summary |
 | `tools/timeout.py` | Runs a command and kills it after N seconds (exit 124); used because QEMU ignores `SIGALRM` |
 | `kernel/include/ktest.h` | `KTEST()` registration macro and the `KT_EXPECT*`/`KT_ASSERT` macros |
@@ -168,7 +168,7 @@ What goes in:
 - hard links to `/bin/eutils` for `echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile true false yes kill date dmesg free sleep strace su dbg uname clear` (`EUTILS_LINKS`);
 - hard links `/bin/sh` → `esh`, `/bin/less` → `more`, and `/bin/vi`, `/bin/view`, `/bin/emacs`, `/bin/em` → `edit`;
 - `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` from `user/etc/`, `/www/index.html` from `user/www/`;
-- empty `/dev/`, `/proc/`, `/tmp/` (mode 0777), `/www/`, `/home/`, and `/home/guest/` (0755, uid 1000, gid 1000);
+- empty `/dev/`, `/proc/`, `/tmp/` (mode 0777), `/www/`, `/home/`, `/home/guest/` (0755, uid 1000, gid 1000), `/mnt/` and `/mnt/host/` (the 9P mount point);
 - the toolchain's sysroot (`SYS_FILES`: everything under `build/sysroot`, at the same path without that prefix: `/usr/include`, `/usr/lib`, `/usr/lib/tcc`) and the program sources (`USR_SRC`: `user/bin/*.c` and `user/bin/*/*.{c,h}` under `/usr/src`, plus `user/usr-src/Makefile` as `/usr/src/Makefile`).
 
 **The home disk.** `home.img` (`HOME_IMG ?= home.img`, in the top directory, not `build/`) is a separate image made by `$(MKFS) --label home home.img $(HOME_MB) /guest/:0755:1000:1000` with `HOME_MB ?= 64`. Its rule has only an order-only dependency on mkfs, so it is created once and never rebuilt: files saved under `/home` survive `make`, `make clean` and kernel changes. `make clean-home` deletes it. `*.img` is in `.gitignore`.
@@ -248,6 +248,15 @@ Home disk (`HOMEOPTS`, part of `QEMUOPTS`, so used by `run`, `debug` and `qemu-l
 -drive file=home.img,if=none,format=raw,id=hd1 -device virtio-blk-device,drive=hd1
 ```
 
+Host share (`SHAREOPTS`, part of `QEMUOPTS`, so `run`, `debug` and `qemu-log`; empty when `HOSTDIR` is empty):
+
+```
+-fsdev local,id=hostfs,path=$(HOSTDIR),security_model=none \
+-device virtio-9p-device,fsdev=hostfs,mount_tag=host
+```
+
+`HOSTDIR` defaults to the project directory (`$(CURDIR)`); the kernel mounts it on `/mnt/host` ([06](06-filesystems.md#9pfs-host-directories)). **This is the real directory, read-write**: whatever the guest writes, renames, `chmod`s or deletes under `/mnt/host` happens to your checkout on the Mac, with the rights of the user running QEMU (guest root is that user there). `make run HOSTDIR=` shares nothing; `make run HOSTDIR=~/scratch` shares another directory.
+
 Network (`NETOPTS`, used by `run`, `debug`, `qemu-log`):
 
 ```
@@ -258,7 +267,7 @@ Network (`NETOPTS`, used by `run`, `debug`, `qemu-log`):
 
 | Target | Command |
 |---|---|
-| `run` | `QEMUBASE + DISKOPTS(build/fs.img) + HOMEOPTS + NETOPTS -append "$(APPEND)"` |
+| `run` | `QEMUBASE + DISKOPTS(build/fs.img) + HOMEOPTS + SHAREOPTS + NETOPTS -append "$(APPEND)"` |
 | `debug` | as `run` plus `-s -S` (GDB stub on TCP 1234, CPUs halted) |
 | `gdb` | `riscv64-elf-gdb -q -x tools/gdb/init.gdb build/kernel.elf` (connects to `localhost:1234`, loads `tools/gdb/eunuchs.py`) |
 | `qemu-log` | as `run` plus `-d int,guest_errors,unimp -D build/qemu.log` |
@@ -331,7 +340,7 @@ python3 tools/run_tests.py --qemu "$(QEMU) $(QEMUBASE)" --image build/fs.img \
     --mkfs build/tools/mkfs --timeout $(TEST_TIMEOUT) --append "$(APPEND)"
 ```
 
-The 17 stages, in order:
+The 19 stages, in order:
 
 | # | Stage | Kind | Options / action | Pass criteria |
 |---|---|---|---|---|
@@ -350,20 +359,24 @@ The 17 stages, in order:
 | 13 | `fsck after stress` | fsck | | `clean`; no `note: log holds` |
 | 14 | `interactive shell` | interactive | see below | every expected string within its timeout |
 | 15 | `toolchain and editors` | interactive | see below | every expected string within its timeout |
-| 16 | `network` | network | `net_basics` | script completes without exception |
-| 17 | `network, 5% loss` | network | `net.drop=5`, `net_lossy` | script completes |
+| 16 | `host share (9p)` | interactive | boots with `build/test-share` shared as `host`; see below | every expected string within its timeout |
+| 17 | `host share, Mac side` | host | checks `build/test-share` on the Mac | see below |
+| 18 | `network` | network | `net_basics` | script completes without exception |
+| 19 | `network, 5% loss` | network | `net.drop=5`, `net_lossy` | script completes |
 
 Every boot gets `panic=shutdown lockdep=panic` first and `--append` last. Stage 1 does not forbid `LOCKDEP` or `HUNG THREAD`, because the kernel self-tests for lockdep and the hung-thread detector trigger those reports on purpose.
 
 The crash stages use `dbg_fscrash()` from `utests` (`scenario`): write `part1`, arm the crash point (`after-commit` or `after-log`), append `part2`. The kernel stops inside that commit with exit status 3. The `-check` boots require `part1part2` (committed, so it must be replayed) or `part1` (not committed, so it must vanish).
 
-**Interactive shell steps** (stage 14): `echo hello | cat`; `ls / | grep bin > /tmp/x; cat /tmp/x`; `echo abc > /tmp/f; wc -c /tmp/f`; `cat` then `^C` and `echo status=$?` → `status=130`; `sleep 30` then `^Z` → `esh: suspended  sleep 30`; `jobs` → `[1]  + suspended  sleep 30`; `kill %1` → `[1]  + terminated  sleep 30` (reported as soon as it happens); `sleep 1 &` and `wait`; `V=hi sh -c 'echo inner=$V'`; `false || echo or-ok && echo and-ok`; `nosuch` → `esh: command not found: nosuch`; `segv null` → `esh: segmentation fault (core dumped)  segv null`; arrays (`x=(a b c); echo ${#x} $x[2] ${(U)x[3]}` → `3 b C`); a function with `return 3`; `for` over `{1..3}`; arithmetic, `${HOME:-none}` and `~`; `[[ abc == a* ]]`; a here-document typed over three lines (`PS2` prompts); `su guest` → prompt `guest@eunuchs:~% `, `id` → `uid=1000(guest)`, `touch /etc/nope` → `Permission denied`, `exit`; `cat /proc/self/status | grep pgid`. A step waits for its expected text, then for the next `@eunuchs:` prompt.
+**Interactive shell steps** (stage 14): `echo hello | cat`; `ls / | grep bin > /tmp/x; cat /tmp/x`; `echo abc > /tmp/f; wc -c /tmp/f`; `cat` then `^C` and `echo status=$?` → `status=130`; `sleep 30` then `^Z` → `esh: suspended  sleep 30`; `jobs` → `[1]  + suspended  sleep 30`; `kill %1` → `[1]  + terminated  sleep 30` (reported as soon as it happens); `sleep 1 &` and `wait`; `V=hi sh -c 'echo inner=$V'`; `mkdir -p /tmp/p/q/r` (and again on an existing path) with a file inside; `rm -rf /tmp/p` and `rm -f` of a missing file, after which `ls /tmp/p` fails; `false || echo or-ok && echo and-ok`; `nosuch` → `esh: command not found: nosuch`; `segv null` → `esh: segmentation fault (core dumped)  segv null`; arrays (`x=(a b c); echo ${#x} $x[2] ${(U)x[3]}` → `3 b C`); a function with `return 3`; `for` over `{1..3}`; arithmetic, `${HOME:-none}` and `~`; `[[ abc == a* ]]`; a here-document typed over three lines (`PS2` prompts); `su guest` → prompt `guest@eunuchs:~% `, `id` → `uid=1000(guest)`, `touch /etc/nope` → `Permission denied`, `exit`; `cat /proc/self/status | grep pgid`. A step waits for its expected text, then for the next `@eunuchs:` prompt.
 
 **Toolchain and editors steps** (stage 15): writes a small C program to `/tmp/h.c` with `echo`; `tcc -o /tmp/h /tmp/h.c && /tmp/h` and `tcc -run /tmp/h.c | cat` must both print `tcc says 42`; `cd /usr/src && make bin/cat && bin/cat /etc/passwd` must show `guest:x:1000`; then `vi /tmp/v.txt` with keys `ihello from vi`, Esc, `yyp:s/vi/ex/`, `:wq`, and `cat` must show both lines; then `emacs /tmp/e.txt`, typing `hello from emacs`, `C-x C-s`, `C-x C-c`, and `cat` must show it; finally `tcc -g` compiles a two-function program and `db -batch -ex 'break add' -ex run -ex bt -ex finish -ex continue` must print `Breakpoint 1, add (a=2, b=3) at /tmp/d.c:3`, a `#1` backtrace frame, `Value returned is $1 = 5` and `exited normally`.
 
-**`net_basics`** (stage 16): `ping -c 2 gateway` and `ping -c 2 localhost` with `0% packet loss`; starts `httpd &` and `echod &`; fetches `/` from the host-forwarded HTTP port and requires `Hello from Eunuchs`; fetches `/proc/net/tcp` and requires `ESTABLISHED`; UDP echo of `udp echo test`; 1 MiB from the Mac to `nc -l 5000 | crc32` with a CRC check (`bulk_to_guest`); the guest sends `/bin/sh` to a listener on the Mac (`nc host PORT < /bin/sh`) and the CRC printed by the guest must match; `netstat -s` must mention `retransmits`.
+**Host share steps** (stage 16): `run_tests.py` first recreates `build/test-share` with `from-mac.txt`, `gone.txt` and an empty `sub/`, and boots with that directory shared (`interactive()` now takes extra QEMU arguments). In the guest: `cat /mnt/host/from-mac.txt`; write `from-guest.txt`, `mkdir d`, `mv` the file into it and `ls` it; `cp /bin/cat` into the share, `rm gone.txt`, `chmod 600 from-mac.txt`; `cd /mnt/host/sub && pwd`; and `tcc -o /mnt/host/hello /usr/src/echod.c`. **Mac side** (stage 17, no boot): `d/g.txt` holds `made in eunuchs`, `cat.bin` is byte-identical to `build/user/stripped/cat`, `gone.txt` is gone, `from-mac.txt` has mode 0600, and `hello` exists and starts with `\x7fELF`.
 
-**`net_lossy`** (stage 17, booted with `net.drop=5`, which drops 5% of received packets on every interface including loopback): concatenates several binaries into `/tmp/big`, sends it over loopback with `nc` (our TCP at both ends) and compares CRCs; sends 128 KiB from the Mac (kept short because QEMU's slirp TCP is the sender); `netstat -s` must mention `dropped on purpose`.
+**`net_basics`** (stage 18): `ping -c 2 gateway` and `ping -c 2 localhost` with `0% packet loss`; starts `httpd &` and `echod &`; fetches `/` from the host-forwarded HTTP port and requires `Hello from Eunuchs`; fetches `/proc/net/tcp` and requires `ESTABLISHED`; UDP echo of `udp echo test`; 1 MiB from the Mac to `nc -l 5000 | crc32` with a CRC check (`bulk_to_guest`); the guest sends `/bin/sh` to a listener on the Mac (`nc host PORT < /bin/sh`) and the CRC printed by the guest must match; `netstat -s` must mention `retransmits`.
+
+**`net_lossy`** (stage 19, booted with `net.drop=5`, which drops 5% of received packets on every interface including loopback): concatenates several binaries into `/tmp/big`, sends it over loopback with `nc` (our TCP at both ends) and compares CRCs; sends 128 KiB from the Mac (kept short because QEMU's slirp TCP is the sender); `netstat -s` must mention `dropped on purpose`.
 
 After the stages, if `build/ktest-trace.bin` exists the runner converts it with `tools/trace/eutrace.py perfetto` to `build/ktest-trace.json`. It prints `N stages, P passed, F failed: ...` and exits 1 if any stage failed. A failing stage does not stop the run.
 
@@ -425,7 +438,7 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 | `gdb` | kernel | Attach GDB with `tools/gdb/init.gdb` |
 | `qemu-log` | kernel, image, `home.img` | As `run`, with QEMU tracing of interrupts, guest errors and unimplemented features to `build/qemu.log` |
 | `disasm` | kernel | `objdump -dS` to `build/kernel.asm` |
-| `test` | kernel, image, mkfs | The 17-stage scenario |
+| `test` | kernel, image, mkfs | The 19-stage scenario |
 | `stress` | kernel, image, mkfs | SMP soak for `STRESS_SECS`, then fsck |
 | `test-host` | host tests, mkfs, `build/user/bin/hello` | Host-native tests |
 | `ci` | | `tools/ci.py $(CI_FLAGS)` |
@@ -456,6 +469,7 @@ Internal file targets you may name directly: `build/tcc/xtcc` (the host cross Ti
 | `TEST_TIMEOUT` | `60` | Seconds per boot/fsck stage in `make test` |
 | `STRESS_SECS` | `120` | Duration of `make stress` (`ci.py` uses 60 unless overridden) |
 | `FS_MB` | `32` | Disk image size |
+| `HOSTDIR` | the project directory | The Mac directory shared read-write on `/mnt/host` by `run`, `debug` and `qemu-log`; empty to share nothing |
 | `HOME_IMG` | `home.img` | The persistent `/home` disk image |
 | `HOME_MB` | `64` | Its size when it is created (an existing image is not resized) |
 | `HTTP_PORT` | `8080` | Host port → guest TCP 80 |
@@ -694,6 +708,7 @@ build/tools/mkfs --check /tmp/t.img
 
 ## Limitations and known issues
 
+- **`make run` shares your checkout read-write.** By default `/mnt/host` in the guest is the project directory itself: an `rm -rf /mnt/host` as guest root deletes the checkout (QEMU runs as you). Use `HOSTDIR=` (nothing) or `HOSTDIR=<scratch dir>` when experimenting; the test stages share only `build/test-share`.
 - **The scenario is all-or-nothing.** `run_tests.py` has no option to run one stage or a range, and stages depend on earlier stages' disk state (stage 3 needs the file from stage 1; the crash checks need the crash writes). A failure early on usually causes more failures later, which can hide the real cause.
 - **User tests cannot be filtered.** `utest=<mode>` selects a scenario, not a test; any unknown mode fails. The only way to run one user test is to edit `tests[]`.
 - **Some tests can hang instead of failing.** Examples: `t_tcp_loopback_echo` loops forever if `poll` keeps timing out (the `CHECK` records a failure but the `while (got < sizeof(in))` loop continues); `stress.c` `tcp_round` blocks in `accept` forever if the sender's `connect` fails; `KTEST(preemption_does_not_lose_wakeups)` hangs by design. In `make test` these become `*** TIMEOUT` after `TEST_TIMEOUT` seconds with no indication of which check failed.
@@ -718,7 +733,7 @@ build/tools/mkfs --check /tmp/t.img
 
 ## Potential improvements
 
-1. **Stage selection in run_tests.py** — Add `--only NAME[,NAME]` / `--from NAME` and `--list`, and declare each stage's prerequisites (e.g. `persistence` needs `kernel+user tests`) so the runner can run the minimal chain. This would make investigating a failure much faster than a full 17-stage run. Impact: high. Effort: medium.
+1. **Stage selection in run_tests.py** — Add `--only NAME[,NAME]` / `--from NAME` and `--list`, and declare each stage's prerequisites (e.g. `persistence` needs `kernel+user tests`) so the runner can run the minimal chain. This would make investigating a failure much faster than a full 19-stage run. Impact: high. Effort: medium.
 2. **Per-test filter for utests** — Accept `utest=only:<prefix>` (or treat a mode that matches a test name prefix as a filter) and have `run_tests.py` pass it through. This mirrors `ktest=prefix` and avoids editing `tests[]`. Impact: medium. Effort: small.
 3. **Turn hangs into failures** — Bound the loops that can spin forever: break out of `t_tcp_loopback_echo` when `poll` times out, use a timed `poll` before `accept` in `stress.c` `tcp_round`, and add a per-test watchdog in `ktest_run` that logs the running test's name when it exceeds N seconds. Then a timeout names the culprit. Impact: high. Effort: small.
 4. **Overall deadline for interactive/network stages** — Wrap `interactive()`/`network()` in the same `--timeout` budget as `boot()` and log `*** TIMEOUT` consistently. After `Console.close()`, run an fsck stage so unclean shutdowns are checked too. Impact: medium. Effort: small.

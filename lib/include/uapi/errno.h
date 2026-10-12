@@ -57,7 +57,8 @@
     X(ECONNREFUSED, 111, "Connection refused")      \
     X(EHOSTUNREACH, 113, "No route to host")        \
     X(EALREADY, 114, "Operation already in progress") \
-    X(EINPROGRESS, 115, "Operation now in progress")
+    X(EINPROGRESS, 115, "Operation now in progress") \
+    X(ESTALE,   116, "Stale file handle")
 
 enum {
 #define X(name, num, desc) name = num,

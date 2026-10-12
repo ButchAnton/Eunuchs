@@ -245,7 +245,8 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Ordered-mode journaling so file data isn't logged (H/L).
 - An inode cache with hashing (M/M).
 - Validate geometry at mount and in fsck; let fsck replay a committed log (M/S).
-- A mount table (`/etc/fstab` or a `mount` call) instead of the two fixed labels, `/dev` nodes for every disk, and a real `st_dev` per filesystem (M/M).
+- A mount table (`/etc/fstab` or a `mount` call) instead of the two fixed labels and the fixed `/mnt/<tag>` 9P mounts, `/dev` nodes for every disk, and a real `st_dev` per filesystem (M/M).
+- 9pfs: reclaim nodes and fids (never freed today); attribute or dentry caching; map host uids; symbolic links; names longer than 59 bytes; `Tfsync` for `fsync` (M/M).
 - Pipe `O_NONBLOCK` and atomic writes (M/S).
 - Smaller items: `getdents64` names; harden `vfs_getcwd`; root-only `DBG_FSCRASH`; `eu-files` for pipes.
 
@@ -308,7 +309,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
 
 ### [The native toolchain](subsystems/13-toolchain.md#potential-improvements)
 - Line numbers from `-g` DWARF in kernel fault reports (M/M).
-- Self-hosting: tcc's own sources in `/usr/src` (M/S).
+- Self-hosting roadmap (M/L): tcc already compiles itself and every libc C file from `/mnt/host`; next, tcc's sources in `/usr/src` with a byte-identical second generation; the libc's `.S` files (tcc assembler gaps); the kernel's C (30 of 76 files blocked by `stdint.h`, `__ATOMIC_*`, the `"K"` constraint, assembler gaps and a register-allocator assertion); and the link (the kernel's linker script and the Python `gen_ksyms` two-pass link).
 - `make -j` (M/M); more GNU make (`define`, `$(call)`, `$(eval)`, `vpath`) (M/M).
 - `tcc -run` without `mprotect` (a fallback through `/tmp` and `exec`) (L/S); a smaller `libtcc1.a` (L/S).
 
@@ -341,6 +342,7 @@ Bigger projects that would each change what the system can do. They are listed r
 - **A real C library.** Buffered `FILE` stdio, `printf` with floating point, `scanf`, `strto*`, `qsort`, `getopt`, `math.h`, `strftime`, `setjmp`/`sigsetjmp`, and POSIX regular expressions (BRE and ERE) ([10](subsystems/10-user-space.md#stdio-streams)).
 - **Several disks and a persistent `/home`.** Up to four virtio disks, a buffer cache keyed by disk, a log per filesystem, volume labels, and `home.img`, which survives rebuilds ([06](subsystems/06-filesystems.md#boot-and-mounting)).
 - **A native C toolchain.** TinyCC runs on Eunuchs (`/bin/tcc`, with `tcc -run` through the new `mprotect`), with a sysroot in `/usr`, a POSIX `make`, and the sources of every program in `/usr/src`, rebuilt in about 6 seconds in the guest ([13](subsystems/13-toolchain.md)).
+- **The Mac's files in the guest.** A virtio-9p transport and a 9P2000.L client (9pfs) mount the project directory on `/mnt/host` under `make run`: edit on the Mac, build and run on Eunuchs ([06](subsystems/06-filesystems.md#9pfs-host-directories)).
 - **A native debugger.** `ptrace` in the kernel (tracing stops on signal delivery, register, FP and memory access, `exec` and breakpoint SIGTRAPs) and `db`, a gdb-like source-level debugger with its own DWARF 4/5 reader, software single-stepping and an RV64GC disassembler ([14](subsystems/14-debugger.md)). A user `ebreak` is now a SIGTRAP instead of freezing the machine in the monitor.
 - **A text editor.** `edit`, with a vi personality (operators, text objects, visual mode, registers, macros, ex commands) and an emacs one (kill ring, incremental search, query-replace, `M-x`) ([10](subsystems/10-user-space.md#the-editor-vi-and-emacs)).
 
@@ -349,7 +351,7 @@ Bigger projects that would each change what the system can do. They are listed r
 | **User threads** (`clone`, futex, per-thread signal masks, TLS via `tp`) | Many threads per `mm`: per-thread kernel state, an `mm` lock for real, TLB shootdowns for user mappings, thread-directed signals | The single-thread-per-process assumption is everywhere (mm locking, signals, `current_proc`); this is the largest structural change |
 | **Page cache and file-backed `mmap`** | Cache file pages instead of whole-program `kmalloc` images; demand paging from disk; shared text; `msync` | Removes the 4 MiB program limit, makes `exec` cheap, enables shared libraries |
 | **Dynamic linking** (an `ld.so`, a shared libc) | Needs the page cache and `mmap` of files | Smaller binaries; a more realistic user space |
-| **A real filesystem alongside efs** (ext2, read-only first) | A second filesystem type through the VFS | Exchange files with the Mac; exercises the VFS boundaries |
+| **A real filesystem alongside efs** (ext2, read-only first) | A second on-disk filesystem type through the VFS | Read disk images made elsewhere (exchanging files with the Mac is now done by 9pfs) |
 | **Networking breadth:** DHCP, a DNS resolver, IPv6 | DHCP and DNS are small user programs on top of UDP; IPv6 is a larger stack addition | Talk to the outside world by name; QEMU's user network provides DHCP and DNS |
 | **Per-CPU scheduling and a better scheduler** | Per-CPU run queues with load balancing, priorities and `nice`, maybe CFS-like fairness | Scales beyond a handful of harts; gives interactive priority |
 | **Power and time:** tickless idle, the Sstc timer, `CLOCK_MONOTONIC_RAW` | Timer rework | Lower host CPU use while idle (QEMU spins less), finer timing |

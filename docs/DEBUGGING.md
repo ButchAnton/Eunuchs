@@ -66,6 +66,8 @@ The root filesystem is **efs** on a virtio disk, `build/fs.img` (volume label `r
 
 `make run` (and `debug`, `qemu-log`) also attaches a second disk, `home.img` in the top directory (label `home`, 64 MiB, with `/guest` owned by uid 1000). The kernel mounts it on `/home`, so files kept there survive rebuilds and `make clean`; `make clean-home` deletes it. The kernel picks disks by label, not order: `/` is the disk labelled `root` (or disk 0), `/home` the one labelled `home`. The boot log says which (`mounted efs (disk1) on /home`). `make test` boots with the root disk only.
 
+**The Mac's files**: `make run` (and `debug`, `qemu-log`) also shares the project directory through virtio-9p; the kernel mounts it on `/mnt/host`. It is the real directory, read-write, so what you do there happens on the Mac (`make run HOSTDIR=` shares nothing, `HOSTDIR=dir` another directory). Inside, `ls /mnt/host`, `cat /mnt/host/kernel/core/main.c`, or build: `cd /mnt/host/user/bin && make -f /usr/src/Makefile BIN=/tmp/bin`. `mounts` shows the 9P request and error counts, and `/proc/9p` (or the monitor's `blk`) the transport's. A `9p share "host" not mounted` line at boot means the image lacks `/mnt/host`.
+
 devfs is mounted on `/dev` (`console null zero kmsg disk0 disk1 tty tty0`; `disk1` only when a second disk is attached); procfs is mounted on `/proc`.
 
 **fsck**: `make fsck` checks `build/fs.img` (`build/tools/mkfs --check IMAGE`; run it by hand on `home.img`, with QEMU stopped). It prints the volume label and reports:

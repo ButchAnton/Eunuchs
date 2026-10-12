@@ -12,6 +12,7 @@
 
 #define VIRTIO_DEV_NET   1
 #define VIRTIO_DEV_BLOCK 2
+#define VIRTIO_DEV_9P    9
 
 #define VIRTQ_DESC_F_NEXT  1
 #define VIRTQ_DESC_F_WRITE 2      /* device writes this buffer */
@@ -82,6 +83,7 @@ void virtq_kick(struct virtio_dev *dev, struct virtqueue *q);
 void *virtq_get(struct virtqueue *q, u32 *len);
 u32 virtio_ack_irq(struct virtio_dev *dev);
 u32 virtio_config_read32(struct virtio_dev *dev, u32 off);
+u8 virtio_config_read8(struct virtio_dev *dev, u32 off);
 uintptr_t dma_addr(const void *va);     /* physical address of a kernel buffer */
 void virtio_print(int (*print)(const char *fmt, ...));
 
@@ -92,5 +94,14 @@ int blk_count(void);
 u64 blk_capacity(int disk);             /* in 512-byte sectors */
 int blk_rw(int disk, u64 sector, void *buf, u32 len, bool write);
 void blk_print(int (*print)(const char *fmt, ...));
+
+/* virtio-9p (virtio_9p.c): channels to 9P servers, used by kernel/fs/ninep.c */
+#define MAX_9P 4
+#define P9_TAG_MAX 31
+int p9_init(void);                      /* finds every 9P device; returns how many */
+int p9_count(void);
+const char *p9_tag(int i);
+long p9_transact(int i, const void *tx, u32 txlen, void *rx, u32 rxcap);   /* reply length or -errno */
+void p9_print(int (*print)(const char *fmt, ...));
 
 #endif

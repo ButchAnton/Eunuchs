@@ -551,6 +551,7 @@ static int cmd_blk(int argc, char **argv)
 {
     (void)argc, (void)argv;
     blk_print(kprintf);
+    p9_print(kprintf);
     virtio_print(kprintf);
     return MON_STAY;
 }
