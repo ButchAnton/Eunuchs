@@ -79,6 +79,7 @@ EUTILS_LINKS = echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod ch
                true false yes kill date dmesg free sleep strace su dbg uname clear
 FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(notdir $(p))) \
            $(foreach l,$(EUTILS_LINKS),/bin/$(l)=@/bin/eutils) /bin/sh=@/bin/esh /bin/less=@/bin/more \
+           /bin/vi=@/bin/edit /bin/view=@/bin/edit /bin/emacs=@/bin/edit /bin/em=@/bin/edit \
            /etc/motd=user/etc/motd /etc/passwd=user/etc/passwd /etc/group=user/etc/group /etc/hostname=user/etc/hostname \
            /etc/eshrc=user/etc/eshrc /dev/ /proc/ /tmp/:0777 \
            /www/ /www/index.html=user/www/index.html \

@@ -101,6 +101,8 @@ static const struct optdesc options[] = {
     { "less", "-s", "squeeze blank lines" },
     { "less", "-F", "quit if it fits on one screen" },
     { "less", "-E", "quit at the end" },
+    { "vi", "-R", "read-only" },
+    { "view", "-R", "read-only (the default for view)" },
     { "kill", "-l", "list signal names" },
     { "kill", "-s", "signal to send" },
     { "echo", "-n", "no trailing newline" },

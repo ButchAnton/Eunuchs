@@ -23,7 +23,7 @@ Out of scope: the efs on-disk format and the fsck rules (see the filesystem docu
 | `user/user.ld` | User linker script: static binaries at `0x10000`, three `PT_LOAD` segments (r-x, r--, rw-) |
 | `tools/gen_ksyms.py` | Turns `nm -n` output into `ksyms.S` (the `.ksyms` section); with empty input, an empty table for pass 1 |
 | `tools/mkfs/mkfs.c` | Host tool: `mkfs IMAGE SIZE_MB SPEC...` builds `build/fs.img`; `mkfs --check IMAGE` is fsck |
-| `tools/run_tests.py` | `make test`: the multi-boot scenario (16 stages), console "expect", network harness, logs and pcaps |
+| `tools/run_tests.py` | `make test`: the multi-boot scenario (17 stages), console "expect", network harness, logs and pcaps |
 | `tools/ci.py` | `make ci`: clean build, host tests, `make test` on 4 and 1 CPUs, soak, replay check; summary |
 | `tools/timeout.py` | Runs a command and kills it after N seconds (exit 124); used because QEMU ignores `SIGALRM` |
 | `kernel/include/ktest.h` | `KTEST()` registration macro and the `KT_EXPECT*`/`KT_ASSERT` macros |
@@ -164,7 +164,7 @@ What goes in:
 
 - every `user/bin/*.c` program as `/bin/<name>` (stripped copy);
 - hard links to `/bin/eutils` for `echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile true false yes kill date dmesg free sleep strace su dbg uname clear` (`EUTILS_LINKS`);
-- hard links `/bin/sh` → `esh` and `/bin/less` → `more`;
+- hard links `/bin/sh` → `esh`, `/bin/less` → `more`, and `/bin/vi`, `/bin/view`, `/bin/emacs`, `/bin/em` → `edit`;
 - `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` from `user/etc/`, `/www/index.html` from `user/www/`;
 - empty `/dev/`, `/proc/`, `/tmp/` (mode 0777), `/www/`, `/home/`, and `/home/guest/` (0755, uid 1000, gid 1000).
 
@@ -328,7 +328,7 @@ python3 tools/run_tests.py --qemu "$(QEMU) $(QEMUBASE)" --image build/fs.img \
     --mkfs build/tools/mkfs --timeout $(TEST_TIMEOUT) --append "$(APPEND)"
 ```
 
-The 16 stages, in order:
+The 17 stages, in order:
 
 | # | Stage | Kind | Options / action | Pass criteria |
 |---|---|---|---|---|
@@ -346,8 +346,9 @@ The 16 stages, in order:
 | 12 | `smp stress` | boot | `utest=stress` (8 workers, 8 s) | `STRESS RESULT: PASS`, `UTEST RESULT: PASS`; no `LOCKDEP`, `HUNG THREAD`, `filesystem error` |
 | 13 | `fsck after stress` | fsck | | `clean`; no `note: log holds` |
 | 14 | `interactive shell` | interactive | see below | every expected string within its timeout |
-| 15 | `network` | network | `net_basics` | script completes without exception |
-| 16 | `network, 5% loss` | network | `net.drop=5`, `net_lossy` | script completes |
+| 15 | `editors` | interactive | see below | every expected string within its timeout |
+| 16 | `network` | network | `net_basics` | script completes without exception |
+| 17 | `network, 5% loss` | network | `net.drop=5`, `net_lossy` | script completes |
 
 Every boot gets `panic=shutdown lockdep=panic` first and `--append` last. Stage 1 does not forbid `LOCKDEP` or `HUNG THREAD`, because the kernel self-tests for lockdep and the hung-thread detector trigger those reports on purpose.
 
@@ -355,9 +356,11 @@ The crash stages use `dbg_fscrash()` from `utests` (`scenario`): write `part1`, 
 
 **Interactive shell steps** (stage 14): `echo hello | cat`; `ls / | grep bin > /tmp/x; cat /tmp/x`; `echo abc > /tmp/f; wc -c /tmp/f`; `cat` then `^C` and `echo status=$?` → `status=130`; `sleep 30` then `^Z` → `esh: suspended  sleep 30`; `jobs` → `[1]  + suspended  sleep 30`; `kill %1` → `[1]  + terminated  sleep 30` (reported as soon as it happens); `sleep 1 &` and `wait`; `V=hi sh -c 'echo inner=$V'`; `false || echo or-ok && echo and-ok`; `nosuch` → `esh: command not found: nosuch`; `segv null` → `esh: segmentation fault (core dumped)  segv null`; arrays (`x=(a b c); echo ${#x} $x[2] ${(U)x[3]}` → `3 b C`); a function with `return 3`; `for` over `{1..3}`; arithmetic, `${HOME:-none}` and `~`; `[[ abc == a* ]]`; a here-document typed over three lines (`PS2` prompts); `su guest` → prompt `guest@eunuchs:~% `, `id` → `uid=1000(guest)`, `touch /etc/nope` → `Permission denied`, `exit`; `cat /proc/self/status | grep pgid`. A step waits for its expected text, then for the next `@eunuchs:` prompt.
 
-**`net_basics`** (stage 15): `ping -c 2 gateway` and `ping -c 2 localhost` with `0% packet loss`; starts `httpd &` and `echod &`; fetches `/` from the host-forwarded HTTP port and requires `Hello from Eunuchs`; fetches `/proc/net/tcp` and requires `ESTABLISHED`; UDP echo of `udp echo test`; 1 MiB from the Mac to `nc -l 5000 | crc32` with a CRC check (`bulk_to_guest`); the guest sends `/bin/sh` to a listener on the Mac (`nc host PORT < /bin/sh`) and the CRC printed by the guest must match; `netstat -s` must mention `retransmits`.
+**Editors steps** (stage 15): `vi /tmp/v.txt` with keys `ihello from vi`, Esc, `yyp:s/vi/ex/`, `:wq`, and `cat` must show both lines; then `emacs /tmp/e.txt`, typing `hello from emacs`, `C-x C-s`, `C-x C-c`, and `cat` must show it.
 
-**`net_lossy`** (stage 16, booted with `net.drop=5`, which drops 5% of received packets on every interface including loopback): concatenates several binaries into `/tmp/big`, sends it over loopback with `nc` (our TCP at both ends) and compares CRCs; sends 128 KiB from the Mac (kept short because QEMU's slirp TCP is the sender); `netstat -s` must mention `dropped on purpose`.
+**`net_basics`** (stage 16): `ping -c 2 gateway` and `ping -c 2 localhost` with `0% packet loss`; starts `httpd &` and `echod &`; fetches `/` from the host-forwarded HTTP port and requires `Hello from Eunuchs`; fetches `/proc/net/tcp` and requires `ESTABLISHED`; UDP echo of `udp echo test`; 1 MiB from the Mac to `nc -l 5000 | crc32` with a CRC check (`bulk_to_guest`); the guest sends `/bin/sh` to a listener on the Mac (`nc host PORT < /bin/sh`) and the CRC printed by the guest must match; `netstat -s` must mention `retransmits`.
+
+**`net_lossy`** (stage 17, booted with `net.drop=5`, which drops 5% of received packets on every interface including loopback): concatenates several binaries into `/tmp/big`, sends it over loopback with `nc` (our TCP at both ends) and compares CRCs; sends 128 KiB from the Mac (kept short because QEMU's slirp TCP is the sender); `netstat -s` must mention `dropped on purpose`.
 
 After the stages, if `build/ktest-trace.bin` exists the runner converts it with `tools/trace/eutrace.py perfetto` to `build/ktest-trace.json`. It prints `N stages, P passed, F failed: ...` and exits 1 if any stage failed. A failing stage does not stop the run.
 
@@ -419,7 +422,7 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 | `gdb` | kernel | Attach GDB with `tools/gdb/init.gdb` |
 | `qemu-log` | kernel, image, `home.img` | As `run`, with QEMU tracing of interrupts, guest errors and unimplemented features to `build/qemu.log` |
 | `disasm` | kernel | `objdump -dS` to `build/kernel.asm` |
-| `test` | kernel, image, mkfs | The 16-stage scenario |
+| `test` | kernel, image, mkfs | The 17-stage scenario |
 | `stress` | kernel, image, mkfs | SMP soak for `STRESS_SECS`, then fsck |
 | `test-host` | host tests, mkfs, `build/user/bin/hello` | Host-native tests |
 | `ci` | | `tools/ci.py $(CI_FLAGS)` |

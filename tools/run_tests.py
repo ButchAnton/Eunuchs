@@ -350,6 +350,16 @@ def main():
         ("cat /proc/self/status | grep pgid", "pgid"),
     ])
 
+    # The editors: both personalities edit and save a file.
+    interactive("editors", [
+        ("vi /tmp/v.txt", None, False), (b"ihello from vi", None, False), (b"\x1b", None, False),
+        (b"yyp:s/vi/ex/\r", None, False), (b":wq\r", None),
+        ("cat /tmp/v.txt", "hello from vi\r\nhello from ex"),
+        ("emacs /tmp/e.txt", None, False), (b"hello from emacs", None, False),
+        (b"\x18\x13", None, False), (b"\x18\x03", None),
+        ("cat /tmp/e.txt", "hello from emacs"),
+    ])
+
     # Networking through QEMU's user-mode network: ping, HTTP from the Mac,
     # UDP, 1 MiB each way with CRC checks; then with 5% packet loss (over
     # loopback, so our TCP is at both ends; and a short transfer from the Mac).

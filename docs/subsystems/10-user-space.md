@@ -1,6 +1,6 @@
 # User space: libc, shell and commands
 
-Everything that runs in U-mode: a small static C library (`user/lib/`), the headers programs compile against (`user/include/` plus the shared ABI in `lib/include/uapi/`), the shell (`esh`, also `/bin/sh`; it has [its own document](12-shell.md)), `init`, the multi-call `eutils` binary and about twenty other programs. Every program is a static ELF linked at `0x10000` with the same startup code and the whole libc, and is copied into the efs disk image at build time. The libc is deliberately small and debugging-oriented: system call wrappers that set `errno`, one line-buffered stdout, a first-fit `malloc` with magic numbers and poisoning, and thin wrappers for signals, sockets and termios.
+Everything that runs in U-mode: a small static C library (`user/lib/`), the headers programs compile against (`user/include/` plus the shared ABI in `lib/include/uapi/`), the shell (`esh`, also `/bin/sh`; it has [its own document](12-shell.md)), `init`, the multi-call `eutils` binary, a text editor (`edit`, also `vi` and `emacs`) and about twenty other programs. Every program is a static ELF linked at `0x10000` with the same startup code and the whole libc, and is copied into the efs disk image at build time. The libc is small and debugging-oriented, but covers most of what ordinary C programs expect: system call wrappers that set `errno`, buffered `FILE` stdio, `printf`/`scanf` with floating point, `strto*`, `qsort`, `getopt`, `math.h`, `time.h` with `strftime`, `setjmp`/`sigsetjmp`, POSIX regular expressions, a first-fit `malloc` with magic numbers and poisoning, and thin wrappers for signals, sockets and termios.
 
 ## Responsibilities and scope
 
@@ -52,6 +52,7 @@ What it does not do:
 | `user/bin/esh/*.c` | The shell (one program from several files; see [12-shell.md](12-shell.md)). |
 | `user/bin/eutils.c` | Multi-call binary: 32 small tools chosen by `argv[0]`. |
 | `user/bin/{ls,cat,grep,more,ps,top}.c` | Standalone file, text and process tools. |
+| `user/bin/edit/*.c` | The text editor, one program with a `vi` and an `emacs` personality (see [The editor](#the-editor-vi-and-emacs)). |
 | `user/bin/{ping,nc,ifconfig,netstat}.c` | Network clients and configuration. |
 | `user/bin/{httpd,rshd,echod}.c` | Network servers. |
 | `user/bin/{utests,stress,segv,spin,exitcode,hello}.c` | Test and demonstration programs. |
@@ -295,6 +296,7 @@ Local time is UTC: `localtime`/`localtime_r` are `gmtime`/`gmtime_r`, `mktime` i
 - **Limits.** Only groups 1–9 are reported (`pmatch[10..]` are set to -1). Each start position gets at most 2,000,000 matching steps; a pattern that exceeds them (catastrophic backtracking) fails to match there rather than hanging. Matching recurses a few C frames per subject character, so very long subjects use deep stack.
 - **Errors.** The standard `REG_E*` codes, with messages from `regerror`.
 
+The editor's searches and substitutions use it; `grep`, `more` and the shell's `[[ =~ ]]` do not (yet).
 
 ### Heap allocation
 
@@ -477,6 +479,56 @@ Lists are comma-separated. A process that matches any of the lists given is sele
 
 Only processes are listed. Kernel threads are in `/proc/threads` and the monitor's `ps`.
 
+### The editor: vi and emacs
+
+`edit` (`user/bin/edit/`, about 6,000 lines) is one program with two personalities. The disk image has `/bin/edit` and the hard links `/bin/vi`, `/bin/view`, `/bin/emacs` and `/bin/em`; `main.c` looks at the basename of `argv[0]`: `vi` (also `vim` and `ex`, if you make such links) starts the vi personality, `view` starts it read-only, and every other name, `edit` included, starts the emacs personality.
+
+**The shared core.**
+
+| File | What it does |
+|---|---|
+| `buffer.c` | A buffer is a growable array of lines (no newline stored), a cursor (line, byte offset), a name and path, and undo/redo stacks. Buffers form a list, so several files can be open. Every edit records an insert or delete; records of one command share a group, which `u`/`C-_` undoes as a unit and redo replays. Loading splits on `\n` (a CR stays visible as `^M`); a file without write permission opens read-only. Saving writes `DIR/.NAME.edit<pid>` and `rename`s it over the file, keeping the old file's mode (new files get 0644); if the temporary file cannot be created, it writes in place. Every saved line ends in `\n`. The syntax is chosen by name: C (`.c .h .cc .cpp .S .js .java`), make (`Makefile`, `makefile`, `*.mk`), Python (`.py`), shell (`.sh .esh`, `eshrc`, `.eshrc`, `esh_profile`), or by a `#!` first line (Python if it mentions `python`, otherwise shell). |
+| `term.c` | Opens `/dev/tty` (falling back to fd 0 if it is a terminal), switches to raw mode (no `ICANON`, `ECHO`, `ISIG`, `IEXTEN`, `ICRNL`, `IXON`; `VMIN` 1) and the alternate screen, and restores both on exit. Keys are decoded from escape sequences: arrows, Home/End, PgUp/PgDn, Insert, Delete, Shift-Tab, Ctrl- and Alt-arrows. A lone ESC is recognized when no byte follows within 30 ms; ESC followed quickly by a key is Meta+key. `^Z` restores the terminal and stops the process; on `SIGCONT` the size is re-read and the screen redrawn. The size comes from `TIOCGWINSZ`, overridden by `LINES`/`COLUMNS`. |
+| `display.c` | Draws the visible lines with soft wrap (no horizontal scrolling), optional line numbers, tabs expanded, control characters as `^X`, and an optional whitespace view. Syntax highlighting for C (keywords, types, preprocessor lines, strings, numbers, `//` and `/* */` comments, the only state carried across lines), shell and make (`#` comments, `$var`/`$(...)`/`${...}`, make targets) and Python (keywords, `#` comments). Search matches and the visual selection or emacs region are highlighted. The bottom rows are the status or mode line and a message line (errors in red). |
+| `prompt.c` | The bottom-line prompt used for `:`, `/`, `M-x`, file names and so on: cursor keys, `^A`/`^E`, `^U`/`^K`/`^W`, a 32-entry history per kind of prompt (Up/Down), and Tab completion of file names, or of command names for `M-x`. Also `run_shell_command`: `fork` and `/bin/sh -c CMD` with stdin from `/dev/null` and stdout and stderr captured through a pipe. |
+| `search.c` | Searching and substitution with the libc's POSIX regular expressions (basic syntax, with GNU extensions such as `\+`, `\?`, `\<` and `\>`, and alternation), case folding with "smart case" (insensitive unless the pattern has a capital), wrapping around the end of the buffer. Replacements understand `&` and `\0` (the match), `\1`–`\9` (groups), `\n` (a line break) and `\X` for a literal `X`. |
+
+**vi** (`vi.c`). `vi [-R] [+N | + | +/PATTERN] [FILE...]`; `view` is `vi -R`. Every file named becomes a buffer.
+
+- **Normal mode.** An optional register (`"a`) and count, then a command.
+  - Motions: `h j k l`, `w b e W B E ge gE`, `0 ^ $ g_ |`, `gg G H M L`, `{ }`, `%` (brackets), `f F t T ; ,`, `n N * #`, `+ - Enter`, and marks `'x` and `` `x `` (`''` and two backquotes go back to the previous position).
+  - Operators `d c y > < gu gU g~`, each with a motion, doubled (`dd`, `guu`, `g~~`) or with a text object: `iw aw iW aW`, quotes `i" a" i' a'` and ``i` a` `` (one line only), brackets `i( a( ib i{ a{ iB i[ a[ i< a<`, and paragraphs `ip ap`.
+  - Changes: `x X D C s S r R J gJ ~ p P`, `i a I A o O` (with autoindent), `.` to repeat the last change, `&` to repeat the last `:s`.
+  - `u` and `^R` undo and redo; `m` sets a mark (`a`–`z`); `q`*x* records keys into a register and `@`*x* / `@@` replays them; `ZZ`, `ZQ`.
+  - Scrolling: `^F ^B ^D ^U ^E ^Y`, `zz zt zb`; `^G` shows the file position, `^L` redraws, `^Z` suspends.
+- **Insert mode.** Typing (UTF-8 included), Enter with autoindent, Backspace (joins lines at column 0), `^W`, `^U`, `^R`*x* to insert a register, `^V` for a literal key, Tab (spaces to the next `shiftwidth` with `expandtab`), arrows. `R` is replace mode, where Backspace restores what was overwritten.
+- **Visual mode.** `v` (characters) and `V` (lines), `gv` to start again at the previous selection's end, `o` to swap ends, motions and text objects to extend it, and `d x y c s > < ~ u U J r p P D X C S R` to act on it. `:` starts an ex command for `'<,'>`.
+- **Registers.** The unnamed register and `"a`–`"z`; `"0` holds the last yank. Yanks and deletes go to the unnamed register as well. Macros are stored in the same registers.
+- **Ex commands.** Addresses are numbers, `.`, `$`, `%`, `'x`, `'<`, `'>`, `/pat/`, `?pat?` and `+N`/`-N` offsets, two at most, separated by `,` or `;`.
+  - Files: `:w [file]`, `:w!`, `:wq`, `:x`, `:q`, `:q!`, `:wa`, `:qa`, `:wqa`, `:e file`, `:e!`, `:r file`, `:r !cmd`, `:f [name]`.
+  - Editing: `:s/pat/rep/[gi]` (any punctuation delimiter; `:s` and `:&` repeat), `:g/pat/cmd` and `:v` (or `:g!`) with `d` or `s` as the command, `:d [x]`, `:y [x]`, `:m addr`, `:t addr` (`:co`), `:j`, `:>`, `:<`, `:=`, `:normal keys`.
+  - Shell: `:!cmd` runs a command; `:{range}!cmd` filters the lines through it.
+  - Buffers: `:bn`, `:bp`, `:ls` (`:buffers`), `:b N` or `:b name`, `:bd`.
+  - Settings: `:set` with `number`/`nu`, `autoindent`/`ai` (on), `ignorecase`/`ic`, `smartcase`/`scs` (on), `hlsearch`/`hls` (on), `list`, `expandtab`/`et` (on), `tabstop`/`ts` (8), `shiftwidth`/`sw` (4) and `syntax`/`syn` (on), with `no` prefixes; `:set` alone shows them. `:noh`, `:syntax on|off`, `:help`, `:version`, `:stop`.
+- **Read-only** (`view`, `-R`, or an unwritable file): insert commands warn, and `:w` refuses (E45) unless forced with `!` or given another file name.
+
+**emacs** (`emacs.c`). `emacs [+LINE] [FILE...]` (also `em` and `edit`); with no file it starts in `*scratch*`.
+
+- **Movement.** `C-f C-b C-n C-p` and arrows, `C-a C-e` and Home/End, `M-f M-b` (and Ctrl/Alt-arrows) by word, `M-a M-e` (also `M-{ M-}`) by paragraph, `C-v M-v` and PgDn/PgUp, `M-< M->`, `M-g g` (goto line), `C-l` (recenter: middle, top, bottom).
+- **Editing.** `C-d`/Delete, DEL/`C-h`, `M-d`, `M-DEL`, `C-k` (with `C-u N`, N whole lines), `C-o`, `C-t`, `M-t`, `M-u M-l M-c`, `C-q` (quoted insert), `M-\` and `M-SPC`, Tab (indent like the previous line, deeper after `{`, `:` or `(`; spaces only), RET and `C-j` (keep the indentation). Numeric arguments with `C-u` (4, 16, ..., or `C-u` and digits, `-` negating) or `M-` digits.
+- **Kill ring.** `C-k`, `C-w`, `M-d`, `M-DEL` and `M-w` save text in a 16-entry ring; consecutive kills append to one entry. `C-y` yanks the newest; `M-y` right after a yank replaces it with the next older entry.
+- **Mark and region.** `C-SPC` (or `C-@`) sets the mark, which makes the region active and highlighted; `C-g` deactivates it. `C-x C-x` exchanges point and mark, `C-x h` marks the whole buffer, `C-x C-u`/`C-x C-l` change the region's case. Region commands need an active region.
+- **Search and replace.** `C-s`/`C-r` search incrementally (smart case): each key extends the string, `C-s`/`C-r` again finds the next or previous match, and pressing it again after a failing search wraps around the buffer. `C-w` adds the next word, DEL backs up, RET or ESC stops at the match, `C-g` returns to the start, and any other key ends the search and runs. `M-%` is query-replace from point to the end: `y`/SPC replaces, `n`/DEL skips, `!` replaces the rest, `.` replaces and stops, `?` shows help, anything else quits. The whole replacement is one undo step.
+- **Files and buffers.** `C-x C-f` find file (prompt starts in the current file's directory, Tab completes), `C-x C-s` save, `C-x C-w` write as, `C-x s` save some buffers, `C-x i` insert file, `C-x C-v` revert, `C-x b` switch buffer, `C-x k` kill buffer, `C-x C-b` list buffers, `C-x Left`/`Right` cycle buffers, `C-x =` show the character and position, `C-x C-c` quit (asking about modified buffers).
+- **Undo.** `C-_` (most terminals send it for `C-/` too) and `C-x u` undo, `M-_` redoes. Each command is one undo step, except that typing groups up to about 20 keys.
+- **Other.** `M-!` runs a shell command (one-line output goes to the echo area, longer output to a `*Shell Command Output*` buffer), `C-z` and `C-x C-z` suspend, `C-g` cancels.
+- **`M-x` commands** (Tab completes the names): `goto-line`, `query-replace`, `query-replace-regexp`, `replace-string`, `replace-regexp`, `save-buffer`, `write-file`, `find-file`, `insert-file`, `kill-buffer`, `switch-to-buffer`, `list-buffers`, `save-some-buffers`, `revert-buffer`, `undo`, `undo-redo`, `set-mark-command`, `exchange-point-and-mark`, `mark-whole-buffer`, `display-line-numbers-mode` (also `linum-mode`), `whitespace-mode`, `font-lock-mode`, `hl-search-mode`, `toggle-case-fold-search`, `count-words`, `what-line`, `shell-command`, `isearch-forward`, `isearch-backward`, `beginning-of-buffer`, `end-of-buffer`, `upcase-region`, `downcase-region`, `kill-region`, `copy-region-as-kill`, `yank`, `delete-trailing-whitespace`, `set-tab-width`, `indent-tabs-mode`, `suspend-emacs`, `save-buffers-kill-emacs`, `kill-emacs`, `help`, `describe-bindings`, `version`. The `-regexp` variants use basic regular expressions, with `&` and `\1`–`\9` in the replacement.
+- **Mode line.** `-UUU:**-  NAME  Top|Bot|All|NN%  L<line> C<column>  (C|Shell-script|Makefile|Python|Fundamental)`; `**` means modified and `%%` read-only.
+
+**Under QEMU.** With `-nographic`, as `make run` uses, QEMU multiplexes the serial console and its own monitor and takes `Ctrl-A` as its escape key: `Ctrl-A X` quits QEMU, and `Ctrl-A Ctrl-A` sends one `Ctrl-A` to the guest. So in emacs, type `C-a` as `Ctrl-A Ctrl-A`, or press Home. `Ctrl-]` still enters the kernel monitor: the console takes it before the terminal line discipline, whatever mode the editor has set.
+
+**Not available.** One window per screen (no `C-x 2`, `:split`), no visual block mode, no `fill-paragraph` (`M-q` says so), no keyboard macros in emacs, no syntax highlighting beyond C, shell, make and Python, no wide-character display widths (every UTF-8 character counts as one column), no `SIGWINCH` (the size is re-read only after a suspend), no auto-save, backup files or detection of changes made by others, and undo granularity of a whole command (or a run of typed characters, backspaces included).
+
 ### eutils
 
 `eutils` (`user/bin/eutils.c`) is one binary. `main` takes the basename of `argv[0]` and dispatches with a chain of `strcmp`s. The disk image has `/bin/eutils` plus one hard link per name in `EUTILS_LINKS`, made by mkfs's `/path=@/existing` syntax. An unknown name prints `eutils: unknown tool 'X'` and exits with 2. Running `/bin/eutils` directly ends up there too. Some tools (`ln`, `mv`, `cp`, `chmod`, `chown`) are only matched when the argument count is right, so a usage error also produces the "unknown tool" message.
@@ -567,6 +619,8 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `grep` | `grep [-v] [-n] [-i] [-c] PATTERN [FILE...]` | Kernighan & Pike matcher: `c . ^ $ *`. Reads one byte per syscall; lines longer than 1023 bytes are truncated. Exit 0 if any match, 1 if none, 2 for usage errors. |
 | `ps` | `ps [options]` | procps-style: dashed options are System V (`-ef`, `-lf`, `-ejH`, `-o pid,args`), undashed are BSD (`aux`, `axjf`), and they mix. See [The `ps` command](#the-ps-command). |
 | `more`, `less` | `more [-NiRsFEd] [-NUM] [+NUM \| +/PAT] [FILE...]` | Pager; see [The `more` and `less` pager](#the-more-and-less-pager). |
+| `vi`, `view` | `vi [-R] [+N \| + \| +/PAT] [FILE...]` | The editor's vi personality; `view` is read-only. See [The editor](#the-editor-vi-and-emacs). |
+| `emacs`, `em`, `edit` | `emacs [+N] [FILE...]` | The same program's emacs personality. |
 | `top` | `top` | Raw mode with `VMIN=0`; shows `/proc/uptime`, 10 lines of `/proc/cpus` and 20 of `/proc/threads` every second; `q` or `^C` quits. |
 | `ping` | `ping [-c N] [-i MS] [-s SIZE] [-W MS] HOST` | Raw ICMP, root only. |
 | `nc` | `nc [-uv] HOST PORT`, `nc -l [-ukv] PORT` | TCP or UDP netcat. |
@@ -628,6 +682,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `/bin/<prog>` for every `user/bin/*.c` and every directory `user/bin/<prog>/` | `build/user/stripped/<prog>` (DWARF stripped, symbols kept) |
 | `/bin/sh` | hard link to `/bin/esh` |
 | `/bin/less` | hard link to `/bin/more` |
+| `/bin/vi`, `/bin/view`, `/bin/emacs`, `/bin/em` | hard links to `/bin/edit` |
 | `/bin/<applet>` for every `EUTILS_LINKS` name | hard link to `/bin/eutils` (`=@/bin/eutils`) |
 | `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` | `user/etc/` |
 | `/dev/`, `/proc/` | empty mount points |
@@ -658,7 +713,7 @@ guest:x:1000:1000:guest:/home/guest:/bin/esh
 
 **A new libc function or system call wrapper:** add the code to the file for its area (`libc.c` for system call wrappers, `net.c` for networking, `stdio.c`, `stdlib.c`, `strings.c`, `math.c`, `time.c`, `unistd2.c`, ...; a new file in `user/lib/` is picked up by the `ULIB` wildcard) and the prototype to the right header in `user/include`. A new system call also needs an entry in `SYSCALLS` in `lib/include/uapi/syscall.h` and a kernel implementation. A new shell builtin is a function in `user/bin/esh/builtins.c` plus an entry (with its one-line help) in the `builtins[]` table.
 
-**A program from several files:** put the sources in `user/bin/NAME/`; the `UMULTI` rule links every `.c` there into `/bin/NAME`.
+**A program from several files:** put the sources in `user/bin/NAME/`; the `UMULTI` rule links every `.c` there into `/bin/NAME` (`esh` and `edit` are built this way). Extra names are hard links added to `FS_FILES`, as for `vi`.
 
 ## Debugging and observability
 
@@ -714,6 +769,11 @@ Commands:
 - **`tail -n 0`** prints the whole input: the loop `++lines == n` never matches 0. `tail` also ignores a failed `realloc`.
 - **Usage errors in `ln`, `mv`, `cp`, `chmod` and `chown`** produce `eutils: unknown tool 'X'` because the argument-count check is part of the dispatch condition.
 - **Commands read one byte per system call**: `head`, `grep` (they could use stdio now), and `esh` when reading commands from a pipe or the `read` builtin (so that input meant for later commands stays unread). `top` writes one byte per call. This is slow, and very visible under `strace`.
+- **The editor** (beyond the missing features listed in [its section](#the-editor-vi-and-emacs)):
+  - `:{range}w FILE` writes the whole buffer, and `:w !cmd` writes a file named `!cmd` (use `:{range}!cmd` to filter instead). `:g` runs only `d`, `s` and `p` (the default, which reports the count).
+  - Macros, `.` and `:normal` cannot drive the `:` and `/` prompts (the prompt reads the terminal directly), so a recorded `:s///` waits for the user on replay. `N.` repeats the whole previous command N times (`3dd` then `2.` deletes six lines). `f`, `t` and `r` take one byte, not one UTF-8 character.
+  - Registers `"1`–`"9`, `"_`, `"-` and appending with `"A` are not implemented; any other register name means the unnamed one. Marks do not move when lines are inserted or deleted above them.
+  - In emacs, undoing back to the saved text does not clear the modified flag.
 - **`lookup_user` reads only 1023 bytes** of `/etc/passwd` (so does `ps`'s user and group lookup, with 2047).
 - **`httpd`**: files over 64 KiB are truncated; `HEAD` replies say `Content-Length: 0`. The directory-listing loop stops only when `len` reaches `sizeof(body) - 300`, but one entry can add almost 400 bytes, so a listing that long could make `sizeof(body) - len` wrap and overflow `body`. An empty path (`GET  HTTP/1.0`) reads `path[-1]`.
 - **`echod`'s header comment** says it logs every connection and datagram; the code logs nothing after start-up. **`eutils.c`'s header comment** omits `crc32` and `profile`.
@@ -729,4 +789,7 @@ Commands:
 6. **Keep `execvp` and kernel limits consistent** — Return `ENAMETOOLONG` early for paths over the kernel's 128 bytes, keep searching `PATH` after `EACCES` (remembering the error), and treat empty `PATH` components as `.`. Impact: low. Effort: small.
 7. **Make signal handlers safer to write** — Save and restore `errno` around handler invocation in a libc trampoline, and document which libc functions are safe in handlers. Optionally add `SA_RESTART` to `signal()` to match BSD/glibc behaviour. Impact: low. Effort: small.
 8. **POSIX leftmost-longest matching** — Track the longest match (and POSIX subexpression rules) at each start position, or compile to a Pike VM / NFA with submatch tracking; that also bounds the time, removing the step limit and the deep recursion. Reject unknown character class names. Impact: medium. Effort: medium.
-9. **Unwind info for `__restore_rt` and correct header comments** — Add `.cfi_signal_frame`-style annotations (and keep a minimal `.eh_frame` for it) so GDB can unwind through signal handlers. Fix the stale comments in `uapi/signal.h` (`SA_RESTART`), `echod.c` and `eutils.c`. Impact: low. Effort: small.
+9. **Editor: drive prompts from the key queue** — Let macros, `.` and `:normal` feed the `:` and `/` prompts through the same queue as other keys, honour ranges in `:w` and support `:w !cmd`. Impact: medium. Effort: small.
+10. **Editor: the missing big pieces** — Split windows (`C-x 2`/`:split`) sharing buffers; visual block mode; numbered and append registers; `fill-paragraph`/`gq`; emacs keyboard macros (`C-x (`); `SIGWINCH` handling (once the TTY sends it); marks that follow edits; persistent undo across saves (clearing the modified flag at the saved state). Impact: medium. Effort: large.
+11. **Editor: safer saving** — `fsync` the temporary file before the `rename` (a no-op in the kernel today, but correct once `fsync` is real), keep the owner, honour the umask for new files, and warn when the file changed on disk since it was read (compare `st_mtime`). Impact: medium. Effort: small.
+12. **Unwind info for `__restore_rt` and correct header comments** — Add `.cfi_signal_frame`-style annotations (and keep a minimal `.eh_frame` for it) so GDB can unwind through signal handlers. Fix the stale comments in `uapi/signal.h` (`SA_RESTART`), `echod.c` and `eutils.c`. Impact: low. Effort: small.

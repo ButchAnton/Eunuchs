@@ -107,6 +107,7 @@ The stale statements in `docs/` were fixed during the review; the comments in th
 - **Flaky `tcp_loopback_echo`.** A blocking TCP `send` returned a short count when the send buffer filled, so the test's echo server (and `echod`) gave up on a "short" `write` and reset the connection, about one boot in seven. Blocking sends now wait until all the data is queued, as on Linux. The test's client uses a non-blocking socket for its `poll` loop, and its server loops on `write`.
 - **mkfs file modes.** mkfs now takes file modes from the host: 0755 for executables, 0644 for everything else (`/etc/passwd` included).
 - **The kernel could have used floating point.** It was compiled for `rv64gc` while saving no FP state. It is now built for `rv64imac_zicsr_zifencei`/`lp64`, so the compiler cannot emit an FP instruction in kernel code; `fp.S` is the only kernel code that touches the FP registers ([11](subsystems/11-build-and-testing.md#compiler-flags-and-why)).
+- **Editor and libc bugs found while documenting them**: `vi -R` argument order, `:g` without a command, `:noh`, out-of-range addresses, `:wq` with other modified buffers, `:%m0`, `:r !cmd` with no output, pasting macro registers, prompt histories, emacs `C-x C-c`'s prompt, `M-` digit arguments and `M-%` with an empty replacement; `fscanf` losing read-ahead (now `ungetc` backs up in the buffer); prefix-matched regex class names; `round`, NaN and huge arguments in `math.c`; misplaced declarations in `unistd.h`.
 - **C10 and the old shell's wrong behavior.** The shell was replaced by [esh](subsystems/12-shell.md). It expands each command when it runs, applies redirections to builtins, has its own state per `source`, and frees per-command memory. It has no fixed word limits, and doesn't use process groups when not interactive.
 
 ## 2. Top recommendations
@@ -291,6 +292,11 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Payne–Hanek argument reduction for `sin`/`cos`/`tan` of huge arguments (L/S).
 - POSIX leftmost-longest regular expressions without a step limit (M/M).
 - Harden `httpd` (M/S).
+- The editor:
+  - macros, `.` and `:normal` through the `:` and `/` prompts; ranges in `:w` and `:w !cmd` (M/S);
+  - split windows, visual block mode, numbered and append registers, `fill-paragraph`, emacs keyboard macros (M/L);
+  - safer saving: `fsync`, owner and umask, warn when the file changed on disk (M/S);
+  - smaller: `SIGWINCH`, marks that follow edits, wide-character widths, more syntax modes (e.g. Markdown, assembly) (L/M).
 - Smaller items: eutils arguments; consistent `execvp` limits; safer signal handlers; unwind information for `__restore_rt`.
 
 ### [The shell](subsystems/12-shell.md#potential-improvements)
@@ -321,6 +327,7 @@ Bigger projects that would each change what the system can do. They are listed r
 - **Floating point for user programs.** User code is built for `rv64gc`/`lp64d`. The kernel enables FP per thread on its first FP instruction, saves and restores the registers at context switches of threads that use them, copies them at `fork`, resets them at `exec`, and carries them in signal frames ([03](subsystems/03-traps-interrupts-syscalls.md#lazy-floating-point-for-user-programs)).
 - **A real C library.** Buffered `FILE` stdio, `printf` with floating point, `scanf`, `strto*`, `qsort`, `getopt`, `math.h`, `strftime`, `setjmp`/`sigsetjmp`, and POSIX regular expressions (BRE and ERE) ([10](subsystems/10-user-space.md#stdio-streams)).
 - **Several disks and a persistent `/home`.** Up to four virtio disks, a buffer cache keyed by disk, a log per filesystem, volume labels, and `home.img`, which survives rebuilds ([06](subsystems/06-filesystems.md#boot-and-mounting)).
+- **A text editor.** `edit`, with a vi personality (operators, text objects, visual mode, registers, macros, ex commands) and an emacs one (kill ring, incremental search, query-replace, `M-x`) ([10](subsystems/10-user-space.md#the-editor-vi-and-emacs)).
 
 | Direction | What it involves | Why |
 |---|---|---|
