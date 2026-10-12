@@ -35,7 +35,7 @@ What it does not do:
 | `user/lib/math.c` | `math.h`: argument reduction and series in 128-bit `long double` (software), rounded to `double`. |
 | `user/lib/time.c` | `gmtime`, `localtime` (= UTC), `timegm`/`mktime`, `difftime`, `clock`, `asctime`/`ctime`, `strftime`, `tzset`. |
 | `user/lib/setjmp.S`, `user/lib/sigsetjmp.c` | `setjmp`/`longjmp` (callee-saved integer and FP registers), `sigsetjmp`/`siglongjmp` (optionally the signal mask). |
-| `user/lib/unistd2.c` | `execl`, `execlp`, `execle` (the argument list becomes a vector), `utimensat`, `futimens`, `fsync`, `ftruncate` (`ENOSYS`), `usleep`, `sysconf`, `gethostname`, `ttyname`, `symlink`/`readlink` stubs. |
+| `user/lib/unistd2.c` | `ptrace` (glibc-style: `PTRACE_PEEK*` return the word read), `execl`, `execlp`, `execle` (the argument list becomes a vector), `utimensat`, `futimens`, `fsync`, `ftruncate` (`ENOSYS`), `usleep`, `sysconf`, `gethostname`, `ttyname`, `symlink`/`readlink` stubs. |
 | `user/lib/regex.c` | POSIX `regcomp`/`regexec`/`regerror`/`regfree`: BRE and ERE, by backtracking. |
 | `user/lib/net.c` | Socket wrappers, `poll`, `select` (on top of `ppoll`), `inet_aton`/`inet_addr`/`inet_ntoa`, `resolve_host`. |
 | `lib/printf.c` | `kvcbprintf` (callback-based formatter), `kvsnprintf`, `ksnprintf`. Shared with the kernel and host tests (`tests/host/test_printf.c`). The floating-point conversions and `%n` are inside `#ifdef FMT_FLOAT`, defined only for user code. |
@@ -53,6 +53,7 @@ What it does not do:
 | `user/bin/esh/*.c` | The shell (one program from several files; see [12-shell.md](12-shell.md)). |
 | `user/bin/eutils.c` | Multi-call binary: 32 small tools chosen by `argv[0]`. |
 | `user/bin/{ls,cat,grep,more,ps,top}.c` | Standalone file, text and process tools. |
+| `user/bin/db/*.c` | `db`, the debugger ([14](14-debugger.md)). |
 | `user/bin/edit/*.c` | The text editor, one program with a `vi` and an `emacs` personality (see [The editor](#the-editor-vi-and-emacs)). |
 | `user/bin/{ping,nc,ifconfig,netstat}.c` | Network clients and configuration. |
 | `user/bin/{httpd,rshd,echod}.c` | Network servers. |
@@ -459,7 +460,7 @@ Lists are comma-separated. A process that matches any of the lists given is sele
 - **Ids:** `pid ppid pgid sid tpgid lwp nlwp uid ruid user ruser gid rgid group rgroup`. User and group names come from `/etc/passwd` and `/etc/group`.
 - **Terminal and state:**
   - `tty`;
-  - `s`: the Unix state, `R`, `S`, `D` (an uninterruptible sleep), `T` (stopped) or `Z` (zombie);
+  - `s`: the Unix state, `R`, `S`, `D` (an uninterruptible sleep), `T` (stopped), `t` (stopped by its debugger) or `Z` (zombie);
   - `stat`: the state plus BSD flags, `s` (session leader) and `+` (in the terminal's foreground group).
 - **Commands and times:**
   - `comm` and `args`: zombies show `[name] <defunct>`, and processes without arguments `[name]`;
@@ -598,6 +599,7 @@ Fork and exec interactions:
 | `math.h` | See [Mathematics](#mathematics-mathh). |
 | `setjmp.h` | `jmp_buf sigjmp_buf setjmp longjmp _setjmp _longjmp sigsetjmp siglongjmp`. |
 | `regex.h` | `regex_t regmatch_t regoff_t`, `regcomp regexec regerror regfree`, `REG_*` flags and errors. |
+| `sys/ptrace.h` | `ptrace(request, pid, addr, data)` and, from `uapi/ptrace.h`, the `PTRACE_*` requests, `struct user_regs`, `struct user_fpregs`, `struct ptrace_siginfo`, `struct ptrace_io`, `SI_USER`/`TRAP_*`/`SEGV_*` codes. As in glibc, `PTRACE_PEEKTEXT`/`PEEKDATA` return the word (set `errno` to 0 first to tell a word of -1 from an error); the kernel itself stores it at `*data`. See [14](14-debugger.md). |
 | `sys/mman.h` | `mmap munmap mprotect`, `PROT_*`, `MAP_PRIVATE`, `MAP_ANONYMOUS`, `MAP_FAILED`. |
 | `poll.h` | `poll(fds, n, timeout_ms)`. |
 | `sys/select.h` | `select`, `fd_set` (`FD_SETSIZE` 64), `FD_*` macros. |
@@ -623,6 +625,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `vi`, `view` | `vi [-R] [+N \| + \| +/PAT] [FILE...]` | The editor's vi personality; `view` is read-only. See [The editor](#the-editor-vi-and-emacs). |
 | `emacs`, `em`, `edit` | `emacs [+N] [FILE...]` | The same program's emacs personality. |
 | `tcc` | `tcc [-c] [-o OUT] [-I DIR] [-D X] [-L DIR] [-l LIB] FILE...`, `tcc -run FILE.c [ARGS]` | TinyCC: compiles, assembles and links C for Eunuchs; see [13](13-toolchain.md). |
+| `db` | `db PROG [ARGS]`, `db --args PROG ARGS...`, `db -p PID [PROG]`, with `-ex CMD` and `-batch` | gdb-like source-level debugger on `ptrace`; see [14](14-debugger.md). |
 | `make` | `make [-f FILE] [-C DIR] [-nsikBpqd] [VAR=value] [TARGET...]` | POSIX-style make with GNU functions and built-in rules for tcc; see [13](13-toolchain.md#binmake-userbinmakec). |
 | `top` | `top` | Raw mode with `VMIN=0`; shows `/proc/uptime`, 10 lines of `/proc/cpus` and 20 of `/proc/threads` every second; `q` or `^C` quits. |
 | `ping` | `ping [-c N] [-i MS] [-s SIZE] [-W MS] HOST` | Raw ICMP, root only. |
@@ -632,7 +635,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `httpd` | `httpd [-p PORT] [-r ROOT]` | Default 80 and `/www`; serves `/proc/...` live. `make run` forwards Mac port 8080. |
 | `rshd` | `rshd [-p PORT]` | Default 23; unauthenticated `esh -i` per connection. `make run` forwards Mac port 2323. |
 | `echod` | `echod [-p PORT]` | TCP and UDP echo, default 7. `make run` forwards Mac UDP port 5555. |
-| `utests` | `utests [MODE]` | 45 user-space tests ending in `UTEST RESULT: PASS\|FAIL`. Modes `persist-check`, `crash-commit-write\|check`, `crash-log-write\|check` and `stress[:secs]` are used by `tools/run_tests.py`. |
+| `utests` | `utests [MODE]` | 46 user-space tests ending in `UTEST RESULT: PASS\|FAIL`. Modes `persist-check`, `crash-commit-write\|check`, `crash-log-write\|check` and `stress[:secs]` are used by `tools/run_tests.py`. |
 | `stress` | `stress [-j WORKERS] [-t SECS] [-n ITERS] [-v]` | Defaults: 8 workers, 10 s. Each iteration: an `echo \| cat` pipeline, file I/O in `/tmp`, a COW fork with `mmap`, and 16 KiB over loopback TCP. Prints `STRESS RESULT: PASS\|FAIL`. |
 | `segv` | `segv [null\|text\|stack\|illegal\|kernel]` | Crashes on purpose to show the kernel's fault report. |
 | `spin` | `spin [MS]` | Busy loop in user mode (default 2000 ms). |
@@ -682,7 +685,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 
 | Path | Source |
 |---|---|
-| `/bin/<prog>` for every `user/bin/*.c` and every directory `user/bin/<prog>/` | `build/user/stripped/<prog>` (DWARF stripped, symbols kept) |
+| `/bin/<prog>` for every `user/bin/*.c` and every directory `user/bin/<prog>/` (so also `/bin/db`, `/bin/edit`, `/bin/esh`, `/bin/make`), and `/bin/tcc` | `build/user/stripped/<prog>` (DWARF stripped, symbols kept) |
 | `/bin/sh` | hard link to `/bin/esh` |
 | `/bin/less` | hard link to `/bin/more` |
 | `/bin/vi`, `/bin/view`, `/bin/emacs`, `/bin/em` | hard links to `/bin/edit` |
@@ -739,7 +742,8 @@ guest:x:1000:1000:guest:/home/guest:/bin/esh
   - `dbg_fscrash(point)`: crash-consistency testing;
   - `dbg_profile(op, arg)`: the profiler (`profile run CMD` is the easy way to use it).
 - **procfs.** `/proc/<pid>/status` (credentials, pgid/sid, stopped, signal masks and dispositions), `maps`, `fds`, `stack` (kernel stack), `ustack` (symbolized user backtrace of a live process), `cmdline`; `/proc/self`.
-- **Monitor** (`Ctrl-]`): `procs`, `ubt <pid>` (user backtrace from the saved trap frame), `vm <pid> [va]`, `files <pid>`, `strace <pid>`, `kill <pid>`, `tty` (foreground group, termios, queued input). An `ebreak` in user code also stops in the monitor; `c` continues.
+- **Monitor** (`Ctrl-]`): `procs`, `ubt <pid>` (user backtrace from the saved trap frame), `vm <pid> [va]`, `files <pid>`, `strace <pid>`, `kill <pid>`, `tty` (foreground group, termios, queued input). `dbg_break()` stops in the monitor; `c` continues. An `ebreak` is a SIGTRAP (fatal unless traced or handled).
+- **`db`**: a source-level debugger for user programs, built on `ptrace` ([14](14-debugger.md)).
 - **GDB.** `make debug` then `make gdb`; `eu-procs` lists processes. For source-level debugging of a program, `add-symbol-file build/user/bin/<prog>` (no offset is needed because every program is linked at `0x10000`). Since all programs share that address range, a breakpoint on a user address fires in whichever process is running there, so combine it with a condition or use `dbg_break()` in the program instead. `__restore_rt` has no CFI (`.eh_frame` is discarded anyway), so GDB may stop unwinding at a signal handler's caller.
 - **Profiling.** `profile run CMD` gives a quick report with user functions symbolized; `profile dump` plus `make flamegraph` on the host symbolizes user frames from `build/user/bin`.
 - **Heap.** `malloc_stats()` prints bytes in use and heap size; `/proc/<pid>/maps` shows the `heap` VMA. A `0x6b6b6b6b...` value in a register or a crash address almost always means use after free.

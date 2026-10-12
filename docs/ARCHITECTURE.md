@@ -15,8 +15,9 @@ About 30,000 lines in all:
 | `kernel/net/` | 3,100 | Ethernet/ARP, IPv4/ICMP, UDP, TCP, sockets |
 | `kernel/debug/` | 2,300 | monitor, symbols, backtraces, trace, profiler, lockdep, tests |
 | `kernel/tests/` | 1,400 | in-kernel unit tests (`KTEST`) |
-| `lib/` | 500 | printf and string code shared by kernel and user, ABI headers (`uapi/`) |
-| `user/` | 17,000 | libc, the shell `esh` (13,000 of them) and about 60 commands |
+| `lib/` | 1,300 | printf and string code shared by kernel and user, ABI headers (`uapi/`) |
+| `user/` | 39,000 | libc (5,000), the shell `esh` (13,000), the editor (6,000), the debugger `db` (6,000), `make` (2,200) and about 60 commands |
+| `third_party/tinycc/`, `ports/tcc/` | (vendored) | TinyCC, the C compiler that runs on Eunuchs, and its configuration |
 | `tools/`, `tests/host/` | 3,000 | mkfs/fsck, GDB helpers, trace and profile tools, test drivers, host tests |
 
 ## Machine and boot
@@ -132,6 +133,8 @@ Watch: `ps`, `sched`, `cpus`, `cpu <n>`, `locks` and `lockdep` in the monitor; `
 **User space** (`user/`): `crt0.S`, system call stubs and a small libc (buffered `FILE` stdio, `printf`/`scanf` with floating point, a malloc with debugging checks, `math.h`, `time.h` with `strftime`, `setjmp`, POSIX regular expressions, sockets, `poll`/`select`, termios). User programs are built for RV64GC and may use floating point; the kernel, built without it, saves a thread's FP registers only once the thread has used them. `init` runs the shell, `esh` (also `/bin/sh`): a zsh-like language (functions, arrays, `[[ ]]`, here-documents, zsh's expansion rules), job control, and a line editor with syntax highlighting, autosuggestions, history search and Tab completion ([12-shell.md](subsystems/12-shell.md)). `eutils` is one binary behind 32 command names (`echo`, `cp`, `kill`, `profile`, `crc32`, ...). `edit` is a text editor that runs as `vi`/`view` or `emacs`/`em` depending on its name.
 
 **The native toolchain** ([13-toolchain.md](subsystems/13-toolchain.md)): `/bin/tcc` is TinyCC, built by GCC against the libc; a host build of the same compiler (`build/tcc/xtcc`) makes its runtime library. The image carries a sysroot (`/usr/include`, `/usr/lib/{crt1.o,libc.a}`, `/usr/lib/tcc/libtcc1.a`), a small POSIX `make`, and the sources of every program in `/usr/src`, so Eunuchs can rebuild its own user space. `tcc -run` compiles into memory and relies on `mprotect` to turn the generated code executable without breaking W^X.
+
+**The debugger** ([14-debugger.md](subsystems/14-debugger.md)): the kernel implements `ptrace` (`proc/ptrace.c`): a traced process stops whenever a signal is about to be delivered to it, including the SIGTRAP from an `ebreak` or after `exec`, and its tracer reads and writes its registers and memory and resumes it. `db` (`user/bin/db/`) is a gdb-like debugger on top: software breakpoints and single-stepping (RISC-V has no trace trap, so it decodes the next instruction), frame-pointer backtraces, a DWARF 4/5 reader for line tables, types, scopes and variable locations, an expression evaluator and an RV64GC disassembler. A user `ebreak` is now a SIGTRAP rather than an entry into the kernel monitor (`dbg_break()` still enters it).
 
 Watch: `procs`, `ubt <pid>`, `vm <pid>`, `files <pid>` and `strace <pid>` in the monitor; `/proc/<pid>/{status,maps,fds,stack,ustack}`; a fault report for every crashed program.
 

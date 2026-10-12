@@ -318,7 +318,7 @@ KTEST RESULT: PASS|FAIL
 
 ### The user test run (`utest`)
 
-With `utest` (no value) `kinit` spawns `/bin/init -1 /bin/utests`, which runs `utests` once and exits with its status. `utests` runs all 45 entries of its `tests[]` table in order. Each prints `[ RUN      ]`, calls `dbg_mark(name)` (a trace marker), and prints `[       OK ]` or `[  FAILED  ]`. `CHECK(cond)` prints the file and line and marks the test failed. At the end it writes `/home/persist.txt` ("survives reboots") for the next stage and prints `UTEST RESULT:`.
+With `utest` (no value) `kinit` spawns `/bin/init -1 /bin/utests`, which runs `utests` once and exits with its status. `utests` runs all 46 entries of its `tests[]` table in order. Each prints `[ RUN      ]`, calls `dbg_mark(name)` (a trace marker), and prints `[       OK ]` or `[  FAILED  ]`. `CHECK(cond)` prints the file and line and marks the test failed. At the end it writes `/home/persist.txt` ("survives reboots") for the next stage and prints `UTEST RESULT:`.
 
 With `utest=<mode>`, `kinit` passes the mode as `argv[1]` and `utests` runs `scenario(mode)` instead of the suite. After `ktest` and/or `utest`, if `tracedump=<path>` is set, `kinit` writes the trace buffer to that host path through semihosting, then calls `platform_exit(failed ? 1 : 0)`.
 
@@ -359,7 +359,7 @@ The crash stages use `dbg_fscrash()` from `utests` (`scenario`): write `part1`, 
 
 **Interactive shell steps** (stage 14): `echo hello | cat`; `ls / | grep bin > /tmp/x; cat /tmp/x`; `echo abc > /tmp/f; wc -c /tmp/f`; `cat` then `^C` and `echo status=$?` → `status=130`; `sleep 30` then `^Z` → `esh: suspended  sleep 30`; `jobs` → `[1]  + suspended  sleep 30`; `kill %1` → `[1]  + terminated  sleep 30` (reported as soon as it happens); `sleep 1 &` and `wait`; `V=hi sh -c 'echo inner=$V'`; `false || echo or-ok && echo and-ok`; `nosuch` → `esh: command not found: nosuch`; `segv null` → `esh: segmentation fault (core dumped)  segv null`; arrays (`x=(a b c); echo ${#x} $x[2] ${(U)x[3]}` → `3 b C`); a function with `return 3`; `for` over `{1..3}`; arithmetic, `${HOME:-none}` and `~`; `[[ abc == a* ]]`; a here-document typed over three lines (`PS2` prompts); `su guest` → prompt `guest@eunuchs:~% `, `id` → `uid=1000(guest)`, `touch /etc/nope` → `Permission denied`, `exit`; `cat /proc/self/status | grep pgid`. A step waits for its expected text, then for the next `@eunuchs:` prompt.
 
-**Toolchain and editors steps** (stage 15): writes a small C program to `/tmp/h.c` with `echo`; `tcc -o /tmp/h /tmp/h.c && /tmp/h` and `tcc -run /tmp/h.c | cat` must both print `tcc says 42`; `cd /usr/src && make bin/cat && bin/cat /etc/passwd` must show `guest:x:1000`; then `vi /tmp/v.txt` with keys `ihello from vi`, Esc, `yyp:s/vi/ex/`, `:wq`, and `cat` must show both lines; then `emacs /tmp/e.txt`, typing `hello from emacs`, `C-x C-s`, `C-x C-c`, and `cat` must show it.
+**Toolchain and editors steps** (stage 15): writes a small C program to `/tmp/h.c` with `echo`; `tcc -o /tmp/h /tmp/h.c && /tmp/h` and `tcc -run /tmp/h.c | cat` must both print `tcc says 42`; `cd /usr/src && make bin/cat && bin/cat /etc/passwd` must show `guest:x:1000`; then `vi /tmp/v.txt` with keys `ihello from vi`, Esc, `yyp:s/vi/ex/`, `:wq`, and `cat` must show both lines; then `emacs /tmp/e.txt`, typing `hello from emacs`, `C-x C-s`, `C-x C-c`, and `cat` must show it; finally `tcc -g` compiles a two-function program and `db -batch -ex 'break add' -ex run -ex bt -ex finish -ex continue` must print `Breakpoint 1, add (a=2, b=3) at /tmp/d.c:3`, a `#1` backtrace frame, `Value returned is $1 = 5` and `exited normally`.
 
 **`net_basics`** (stage 16): `ping -c 2 gateway` and `ping -c 2 localhost` with `0% packet loss`; starts `httpd &` and `echod &`; fetches `/` from the host-forwarded HTTP port and requires `Hello from Eunuchs`; fetches `/proc/net/tcp` and requires `ESTABLISHED`; UDP echo of `udp echo test`; 1 MiB from the Mac to `nc -l 5000 | crc32` with a CRC check (`bulk_to_guest`); the guest sends `/bin/sh` to a listener on the Mac (`nc host PORT < /bin/sh`) and the CRC printed by the guest must match; `netstat -s` must mention `retransmits`.
 
@@ -586,7 +586,7 @@ Boot options most used with these targets (the full list is printed by the `help
 | `lockdep_catches_inversions_before_they_deadlock` | AB/BA inversion, a 3-lock cycle and a mutex under a spinlock each produce one report (skipped if `lockdep=off`) |
 | `hung_thread_detector_reports_long_mutex_waits` | With a 50 ms threshold a waiter blocked on a mutex is reported |
 
-### User test catalog (`user/bin/utests.c`, 45 tests, in run order)
+### User test catalog (`user/bin/utests.c`, 46 tests, in run order)
 
 | Test | Checks |
 |---|---|
@@ -634,6 +634,7 @@ Boot options most used with these targets (the full list is printed by the `help
 | `sleep_and_ids` | `sleep_ms(50)` ≥ 50 ms; pid and ppid sane |
 | `brk` | `sbrk` grow, touch, shrink |
 | `mprotect` | A 3-page mapping: the middle page made read-only splits it (a write there is SIGSEGV, the neighbours stay writable) and back; `PROT_WRITE\|PROT_EXEC` → `EACCES`; misaligned → `EINVAL`; code written to a page runs after `mprotect(PROT_READ\|PROT_EXEC)` and the page is no longer writable; a read-only page shared with a forked child that the child makes writable is copied, not shared; an unmapped range → `ENOMEM` |
+| `ptrace` | A child that calls `PTRACE_TRACEME` stops on a SIGUSR1 it sends itself: the parent sees the stop without `WUNTRACED`, uses `PEEKDATA`/`POKEDATA`, `GETREGS`, `GETSIGINFO` (`SI_USER`), `PTRACE_READ`, gets `EIO` from `PTRACE_SINGLESTEP`, and resumes it without the signal. The tracer reads an FP register (`fs3` = 2.5) with `GETFPREGS` and replaces it with `SETFPREGS`. An `ebreak` stops the tracee with SIGTRAP/`TRAP_BRKPT` and `si_addr` = pc; the tracer checks the instruction with `PTRACE_READ` and steps over it by editing the pc. Untraced, an `ebreak` kills with SIGTRAP. A traced `exec` stops with SIGTRAP/`TRAP_EXEC` at the entry point. A NULL store stops the tracee with SIGSEGV, `si_addr` 8 and `SEGV_MAPERR`, and `PTRACE_KILL` ends it. `PTRACE_ATTACH` to a running child stops it with SIGSTOP; a second attach is `EPERM`; after `PTRACE_DETACH` it runs again (not stopped) and requests give `ESRCH`. Attaching to oneself or to init is `EPERM`. A grandchild's parent waits for it while the test traces it: the tracer's `wait4` reports the exit first, then the parent reaps it. |
 | `utimensat` | Explicit time, `UTIME_OMIT`, NULL times (now), `futimens` on an fd, `tv_nsec` out of range → `EINVAL`, missing file → `ENOENT` |
 
 **Scenarios** (`scenario()`, selected with `utest=<mode>`):

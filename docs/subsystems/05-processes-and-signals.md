@@ -62,6 +62,7 @@ The process is allocated with `kzalloc` in `proc_alloc`, so every field not name
 | Restart | `syscall_restart`, `restart_a0`, `nanosleep_restarting`, `nanosleep_deadline` | See "System-call restart". |
 | Credentials | `uid`, `euid`, `suid`, `gid`, `egid`, `sgid`, `umask` | All `u16`. There are no supplementary groups. |
 | Job control | `pgid`, `sid`, `ctty` | `ctty` points to the controlling `struct tty` (only the console exists). |
+| Tracing | `tracer`, `ptrace_stopped`, `ptrace_resume_sig`, `ptrace_exit_report`, `si_signo`, `si_code`, `si_addr` | The debugger tracing this process, a tracing stop in progress, the signal the tracer passes on, whether a non-parent tracer must still be told of the exit, and why the last fault or trap signal was sent (`PTRACE_GETSIGINFO`). Changed under `proc_lock`. See [14](14-debugger.md). |
 
 ### `struct exec_image`
 
@@ -270,9 +271,9 @@ On failure (no `mm` or no thread) the child is unlinked under `proc_lock` and fr
 The `pid` argument follows POSIX: -1 means any child, > 0 one child, 0 the caller's process group, < -1 group `-pid` (`child_matches`). The options are `WNOHANG` (1) and `WUNTRACED` (2). `rusage` is ignored.
 
 Loop:
-1. Under `proc_lock`, scans the children. A child is *reportable* if it is a zombie, or if `WUNTRACED` was given and the child is stopped and not yet reported (`reportable`).
-2. Stopped child: sets `stop_reported = true` and returns the pid with `WSTOPPED_ENC(stop_sig)`. The child stays in the list.
-3. Zombie: `proc_unlink` under the lock, then (unlocked) reads `exit_status`, `kfree`s the proc, copies the status out and returns the pid. If the status copy faults, the child has already been reaped and the call returns `-EFAULT`.
+1. Under `proc_lock`, `find_reportable` scans the children. A child is *reportable* if it is a zombie, or if it is stopped and not yet reported and either `WUNTRACED` was given (a job-control stop) or it is in a tracing stop and the caller is its tracer (no `WUNTRACED` needed). A tracing stop is never reported to a parent that is not the tracer. It then scans `all_procs` for processes the caller traces without being their parent (`tracee_reportable`): their tracing stops, and their exit, which is reported to the tracer once (`ptrace_exit_report`) while the real parent still reaps the zombie.
+2. Stopped child (or tracee): sets `stop_reported = true` and returns the pid with `WSTOPPED_ENC(stop_sig)`. The child stays in the list.
+3. Zombie of a traced non-child: clears `ptrace_exit_report` and `tracer` and returns its pid and status without reaping it. Zombie child: `proc_unlink` under the lock, then (unlocked) reads `exit_status`, `kfree`s the proc, copies the status out and returns the pid. If the status copy faults, the child has already been reaped and the call returns `-EFAULT`.
 4. No matching child: `-ECHILD`. With `WNOHANG`: 0.
 5. Otherwise it sleeps with `wait_event_interruptible(&p->child_wq, has_zombie(...))`. `has_zombie` re-scans under `proc_lock`, so a wakeup between the scan and the sleep is not lost. If a signal interrupts the wait, it returns `-ERESTARTSYS`.
 
@@ -318,6 +319,7 @@ intr_off();
 `signal_deliver` loops while a signal is deliverable:
 
 1. Under `proc_lock`: picks the **lowest-numbered** deliverable signal, clears its pending bit, and snapshots `cont_seq`.
+   - **Traced:** if the process has a tracer and the signal is not SIGKILL, it first enters a *tracing stop* (`ptrace_stop`, [14](14-debugger.md)), before the action is even looked at (so ignored signals stop it too). The tracer's `PTRACE_CONT` or `PTRACE_DETACH` chooses what happens next: signal 0 drops the signal and the loop continues; any other number is delivered instead, through the normal steps below (if it is blocked, it goes back to pending).
 2. If the action is `SIG_IGN`, it continues with the next signal. SIGKILL and SIGSTOP always use the default action.
 3. Default actions:
    - `I` and `K`: nothing.
@@ -371,9 +373,20 @@ Otherwise `do_stop`:
 - emits `proc_stop`;
 - sleeps uninterruptibly on `stop_wq` until `!p->stopped` or SIGKILL is pending.
 
-SIGCONT and SIGKILL clear `stopped` in `signal_send_locked`. Other signals sent to a stopped process stay pending until it continues; `wake` wakes `stop_wq`, but the wait condition is not met.
+SIGCONT and SIGKILL clear `stopped` in `signal_send_locked`, except that SIGCONT cannot end a *tracing* stop (`ptrace_stopped`): only the tracer can, or SIGKILL, which wakes the tracee so it dies. Other signals sent to a stopped process stay pending until it continues; `wake` wakes `stop_wq`, but the wait condition is not met.
 
 There is no `WCONTINUED` and no SIGCHLD on continue.
+
+### Tracing (`ptrace`)
+
+A process can be traced by a debugger (`PTRACE_TRACEME` by the child of the debugger before it execs, or `PTRACE_ATTACH`). The details are in [14-debugger.md](14-debugger.md); the effects on this subsystem are:
+
+- **Signals**: every signal except SIGKILL turns into a tracing stop first (above). The stop sets `stopped`, `stop_sig` and `ptrace_stopped`, sends SIGCHLD to the tracer, and sleeps on `stop_wq` with `wait_what = "traced"`.
+- **`exec`**: after a successful exec, a traced process is sent SIGTRAP with `si_code = TRAP_EXEC` and `si_addr` = the entry point, so the debugger gets control before the first instruction.
+- **Faults**: `user_fault` never kills a traced process directly; the signal goes through a tracing stop.
+- **`wait4`**: the tracer sees tracing stops and the tracee's exit (above).
+- **`exit`**: a tracer that exits releases its tracees (`ptrace_tracer_exit`): they lose their tracer, and one in a tracing stop is resumed with no signal. A tracee whose tracer is not its parent also notifies the tracer of its exit.
+- **State**: `/proc/<pid>/status` and `ps` show `t` for a tracing stop (`T` for a job-control stop).
 
 ### Faults (`user_fault`)
 
@@ -384,11 +397,13 @@ There is no `WCONTINUED` and no SIGCHLD on continue.
 | Page fault that `uvm_fault` could not resolve | SIGSEGV; SIGBUS for out-of-memory |
 | Illegal instruction | SIGILL |
 | Misaligned access | SIGBUS |
+| Breakpoint (`ebreak`) | SIGTRAP (`sepc` left on the `ebreak`) |
 | Anything else | SIGSEGV |
 
 Then:
 
-- If the process has a handler for the signal and the signal is not blocked (`signal_handled`), `user_fault` posts the signal and returns. The handler runs on the way out, and if it returns, the faulting instruction is executed again.
+- It records `si_signo`, `si_addr` (the pc for a breakpoint or illegal instruction, else `stval`) and `si_code` (`SEGV_ACCERR` if a VMA covers the address, otherwise 1: `SEGV_MAPERR`, `TRAP_BRKPT`, `ILL_ILLOPC` or `BUS_ADRALN`), for `PTRACE_GETSIGINFO`.
+- If the process is traced, or has a handler for the signal and the signal is not blocked (`signal_handled`), `user_fault` posts the signal and returns. A traced process then stops for its debugger in `signal_deliver` instead of dying. The handler runs on the way out, and if it returns, the faulting instruction is executed again.
 - Otherwise it prints a report and calls `proc_exit(WSIGNAL_ENC(sig) | WCOREFLAG)`. The report contains:
   - the signal, the cause and address, and a diagnosis: `NULL pointer dereference` (addr < 4096), `kernel address: ...`, `stack overflow (just below the N KiB stack)` (within 1 MiB below the stack VMA), `VMA '<name>' is r-x`, or `address not in any mapping`;
   - pc/ra/sp with the symbol;
@@ -513,6 +528,7 @@ Numbers are from `lib/include/uapi/syscall.h`.
 |---:|---|---|
 | 93 | exit | `syscall.c: do_exit` |
 | 101 | nanosleep | `cred.c: do_nanosleep` (restartable) |
+| 117 | ptrace | `ptrace.c: do_ptrace` ([14](14-debugger.md)) |
 | 129 | kill | `signal.c: do_kill` |
 | 133 | rt_sigsuspend | `do_rt_sigsuspend` (always `-EINTR`) |
 | 134 | rt_sigaction | `do_rt_sigaction` (`-EINVAL` for KILL/STOP) |

@@ -556,7 +556,7 @@ Reads (`proc_read`) and seeks then work on this snapshot, so a reader always see
 - **Global files**: the same print functions the monitor uses (`pmm_print`, `bcache_print`, `vfs_mounts_print`, ...). `uptime` and `trace` (the last 200 events) are local.
 - **`/proc/net/*`**: generated with the network mutex `net_lock` held (`NET_GEN`).
 - **`/proc/<pid>/*`** (`gen_pid`): generated with `proc_lock` held, so the process cannot be freed meanwhile.
-  - `status`: pid, ppid, name, state, tid, waiting, switches, syscalls, RSS, ids, umask, process group, session, and signal masks plus caught and ignored signals; then the fields `ps` needs: `ustate` (the Unix state letter: R, S, D for an uninterruptible sleep, T, Z), `start_ms` (start time, ms since boot), `cpu_ms` (CPU time including the current slice, `thread_cpu_ticks`), `vsz_kib` (sum of the VMAs), `tty` (`console` or `-`), `tpgid` (the terminal's foreground group), `psr` (the CPU it last ran on).
+  - `status`: pid, ppid, name, state, tid, waiting, switches, syscalls, RSS, ids, umask, process group, session, and signal masks plus caught and ignored signals; then the fields `ps` needs: `ustate` (the Unix state letter: R, S, D for an uninterruptible sleep, T, t for a tracing stop, Z), `start_ms` (start time, ms since boot), `cpu_ms` (CPU time including the current slice, `thread_cpu_ticks`), `vsz_kib` (sum of the VMAs), `tty` (`console` or `-`), `tpgid` (the terminal's foreground group), `psr` (the CPU it last ran on).
   - `maps`: `mm_print`.
   - `fds`: first a `cwd <path>` line, then `files_print_fds`. The cwd path needs sleeping I/O, so it is resolved *before* taking `proc_lock`, using a reference taken with `idup`.
   - `stack`: the kernel backtrace (`thread_backtrace`).

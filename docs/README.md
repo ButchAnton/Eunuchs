@@ -40,6 +40,7 @@ Each document has the same structure:
 | 11 | [Build and testing](subsystems/11-build-and-testing.md) | Toolchain, Makefile, disk image, QEMU setups, test suites, CI | `Makefile`, `tools/`, `tests/` |
 | 12 | [The shell](subsystems/12-shell.md) | esh: the zsh-like language, job control, the line editor (manual and internals) | `user/bin/esh/` |
 | 13 | [The native toolchain](subsystems/13-toolchain.md) | TinyCC on Eunuchs, the sysroot, `tcc -run`, `make`, `/usr/src` | `third_party/tinycc/`, `ports/tcc/`, `user/bin/make.c` |
+| 14 | [The debugger](subsystems/14-debugger.md) | `ptrace` in the kernel and `db`, the gdb-like debugger | `kernel/proc/ptrace.c`, `user/bin/db/` |
 
 ## Reading paths
 

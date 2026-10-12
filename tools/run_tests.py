@@ -366,6 +366,13 @@ def main():
         ("emacs /tmp/e.txt", None, False), (b"hello from emacs", None, False),
         (b"\x18\x13", None, False), (b"\x18\x03", None),
         ("cat /tmp/e.txt", "hello from emacs"),
+        # the debugger, on a program compiled with tcc -g
+        ("echo 'int add(int a, int b)' > /tmp/d.c; echo '{' >> /tmp/d.c", None),
+        ("echo '    return a + b;' >> /tmp/d.c; echo '}' >> /tmp/d.c", None),
+        ("echo 'int main(void) { return add(2, 3) - 5; }' >> /tmp/d.c", None),
+        ("tcc -g -o /tmp/d /tmp/d.c && db -batch -ex 'break add' -ex run -ex bt -ex finish -ex continue /tmp/d",
+         "Breakpoint 1, add (a=2, b=3) at /tmp/d.c:3", False),
+        (None, "#1  0x", False), (None, "Value returned is $1 = 5", False), (None, "exited normally"),
     ])
 
     # Networking through QEMU's user-mode network: ping, HTTP from the Mac,

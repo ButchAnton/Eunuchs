@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -261,6 +262,178 @@ static void t_mprotect(void)
 
     CHECK(munmap(p, 3 * 4096) == 0);
     CHECK(mprotect(p, 4096, PROT_READ) == -1 && errno == ENOMEM);          /* nothing mapped */
+}
+
+/* ---- ptrace ---- */
+
+static int read_file(const char *path, char *buf, size_t size);
+
+static volatile long ptrace_word = 0x1234;
+
+static int wait_stopped(pid_t pid, int sig)
+{
+    int st = 0;
+    return waitpid(pid, &st, 0) == pid && WIFSTOPPED(st) && WSTOPSIG(st) == sig;
+}
+
+static int wait_exit(pid_t pid, int code)
+{
+    int st = 0;
+    return waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == code;
+}
+
+static void t_ptrace(void)
+{
+    /* a stop on signal delivery; memory and registers; the signal suppressed */
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        ptrace_word = 0x5678;
+        kill(getpid(), SIGUSR1);            /* would kill us, if the tracer passed it on */
+        _exit(ptrace_word == 0x9abc ? 7 : 1);
+    }
+    CHECK(wait_stopped(pid, SIGUSR1));
+    errno = 0;
+    CHECK(ptrace(PTRACE_PEEKDATA, pid, (void *)&ptrace_word, 0) == 0x5678 && errno == 0);
+    CHECK(ptrace(PTRACE_POKEDATA, pid, (void *)&ptrace_word, (void *)0x9abc) == 0);
+    struct user_regs r;
+    CHECK(ptrace(PTRACE_GETREGS, pid, 0, &r) == 0 && r.r[0] >= 0x10000 && r.r[2] > 0x3f00000000UL);
+    struct ptrace_siginfo si;
+    CHECK(ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && si.si_signo == SIGUSR1 && si.si_code == SI_USER);
+    char buf[16];
+    struct ptrace_io io = { (uint64_t)(uintptr_t)&ptrace_word, (uint64_t)(uintptr_t)buf, 8 };
+    CHECK(ptrace(PTRACE_READ, pid, 0, &io) == 0 && *(long *)buf == 0x9abc);
+    CHECK(ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1 && errno == EIO);
+    CHECK(ptrace(PTRACE_CONT, pid, 0, 0) == 0);
+    CHECK(wait_exit(pid, 7));
+
+    /* FP registers: the tracee holds 2.5 in fs3 across a stop; we read it and put 7.25 */
+    pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        double in = 2.5, out = 0;
+        register long a0 asm("a0") = getpid();
+        register long a1 asm("a1") = SIGUSR1;
+        register long a7 asm("a7") = SYS_kill;
+        asm volatile("fld fs3, 0(%1)\n\t"
+                     "ecall\n\t"          /* stops here: the tracer looks at fs3 */
+                     "fsd fs3, 0(%2)"
+                     : "+r"(a0)
+                     : "r"(&in), "r"(&out), "r"(a1), "r"(a7)
+                     : "fs3", "memory");
+        _exit(out == 7.25 ? 7 : 1);
+    }
+    CHECK(wait_stopped(pid, SIGUSR1));
+    struct user_fpregs fpr;
+    double dv;
+    CHECK(ptrace(PTRACE_GETFPREGS, pid, 0, &fpr) == 0);
+    memcpy(&dv, &fpr.f[19], 8);
+    CHECK(dv == 2.5);
+    dv = 7.25;
+    memcpy(&fpr.f[19], &dv, 8);
+    CHECK(ptrace(PTRACE_SETFPREGS, pid, 0, &fpr) == 0);
+    CHECK(ptrace(PTRACE_CONT, pid, 0, 0) == 0);
+    CHECK(wait_exit(pid, 7));
+
+    /* a breakpoint: SIGTRAP with the pc on the ebreak; step over it by hand */
+    pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        asm volatile(".long 0x00100073");   /* ebreak */
+        _exit(7);
+    }
+    CHECK(wait_stopped(pid, SIGTRAP));
+    CHECK(ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && si.si_code == TRAP_BRKPT);
+    CHECK(ptrace(PTRACE_GETREGS, pid, 0, &r) == 0 && r.r[0] == si.si_addr);
+    unsigned insn = 0;
+    io = (struct ptrace_io){ r.r[0], (uint64_t)(uintptr_t)&insn, 4 };
+    CHECK(ptrace(PTRACE_READ, pid, 0, &io) == 0 && insn == 0x00100073);
+    r.r[0] += 4;
+    CHECK(ptrace(PTRACE_SETREGS, pid, 0, &r) == 0);
+    CHECK(ptrace(PTRACE_CONT, pid, 0, 0) == 0);
+    CHECK(wait_exit(pid, 7));
+
+    /* untraced, an ebreak is a SIGTRAP like on other Unixes */
+    pid = fork();
+    if (pid == 0) {
+        asm volatile(".long 0x00100073");
+        _exit(0);
+    }
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGTRAP);
+
+    /* exec stops with SIGTRAP before the first instruction */
+    pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        char *argv[] = { "true", 0 };
+        execv("/bin/true", argv);
+        _exit(99);
+    }
+    CHECK(wait_stopped(pid, SIGTRAP));
+    CHECK(ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && si.si_code == TRAP_EXEC);
+    CHECK(ptrace(PTRACE_GETREGS, pid, 0, &r) == 0 && r.r[0] == si.si_addr);
+    CHECK(ptrace(PTRACE_CONT, pid, 0, 0) == 0);
+    CHECK(wait_exit(pid, 0));
+
+    /* a fault: the tracer sees the address, then kills it */
+    pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        *(volatile int *)8 = 1;
+        _exit(0);
+    }
+    CHECK(wait_stopped(pid, SIGSEGV));
+    CHECK(ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && si.si_addr == 8 && si.si_code == SEGV_MAPERR);
+    CHECK(ptrace(PTRACE_KILL, pid, 0, 0) == 0);
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+
+    /* attach to a running process: it stops with SIGSTOP; detach lets it go */
+    pid = fork();
+    if (pid == 0) {
+        for (;;)
+            usleep(10000);
+    }
+    CHECK(ptrace(PTRACE_ATTACH, pid, 0, 0) == 0);
+    CHECK(wait_stopped(pid, SIGSTOP));
+    CHECK(ptrace(PTRACE_ATTACH, pid, 0, 0) == -1 && errno == EPERM);   /* already traced */
+    CHECK(ptrace(PTRACE_DETACH, pid, 0, 0) == 0);
+    CHECK(ptrace(PTRACE_PEEKDATA, pid, (void *)&ptrace_word, 0) == -1 && errno == ESRCH);
+    usleep(30000);
+    char path[32], stat[256];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    CHECK(read_file(path, stat, sizeof(stat)) > 0 && strstr(stat, "stopped 0"));
+    kill(pid, SIGKILL);
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st));
+
+    /* a tracee that isn't our child: we hear of its exit before its parent reaps it */
+    int fds[2];
+    CHECK(pipe(fds) == 0);
+    pid_t a = fork();
+    if (a == 0) {
+        pid_t b = fork();
+        if (b == 0) {
+            usleep(100000);
+            _exit(3);
+        }
+        write(fds[1], &b, sizeof(b));
+        int bst = 0;
+        _exit(waitpid(b, &bst, 0) == b && WIFEXITED(bst) && WEXITSTATUS(bst) == 3 ? 0 : 1);
+    }
+    pid_t b = 0;
+    CHECK(read(fds[0], &b, sizeof(b)) == sizeof(b));
+    close(fds[0]);
+    close(fds[1]);
+    CHECK(ptrace(PTRACE_ATTACH, b, 0, 0) == 0);
+    CHECK(wait_stopped(b, SIGSTOP));
+    CHECK(ptrace(PTRACE_CONT, b, 0, 0) == 0);
+    CHECK(wait_exit(b, 3));                 /* the tracer's report */
+    CHECK(wait_exit(a, 0));                 /* and then the parent's reap */
+
+    /* not allowed */
+    CHECK(ptrace(PTRACE_ATTACH, getpid(), 0, 0) == -1 && errno == EPERM);
+    CHECK(ptrace(PTRACE_ATTACH, 1, 0, 0) == -1 && errno == EPERM);
+    CHECK(ptrace(PTRACE_CONT, 1, 0, 0) == -1 && errno == ESRCH);
 }
 
 /* ---- files ---- */
@@ -1408,6 +1581,7 @@ static const struct {
     { "brk", t_brk },
     { "mprotect", t_mprotect },
     { "utimensat", t_utimensat },
+    { "ptrace", t_ptrace },
 };
 
 /*

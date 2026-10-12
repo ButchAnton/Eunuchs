@@ -418,6 +418,7 @@ Only kernel mappings need shootdowns. A user page table is live on at most one C
   3. Present PTEs are rewritten: `R` and `X` follow `prot`. Write permission is **never** put directly into a PTE that lacked it: such a page becomes `PTE_COW`, and the first write fault takes it (refcount 1) or copies it (shared). This is needed because `mm_fork` shares read-only pages without marking them COW, so making one writable in place would let the process write into its parent's or child's page. A page that was writable and stays writable keeps `W`; a page that loses write permission keeps a `COW` mark that the VMA check in `uvm_fault` makes harmless.
   4. `sfence.vma` if the mm is active. If the new protection includes execute, a local `fence.i` plus `sbi_remote_fence_i` to every hart, so code written through the data cache is what the instruction fetch sees on whichever hart the process runs next.
   The `mprotect` system call (226, `do_mprotect`) checks alignment and the range, refuses `PROT_WRITE|PROT_EXEC` with `EACCES` (W^X, as for `mmap`), and rounds the length up to whole pages. `tcc -run` uses it to make freshly generated code executable ([13](13-toolchain.md)).
+- `uvm_peek(mm, addr, dst, n)` and `uvm_poke(mm, addr, src, n)` are a debugger's access to a stopped process (`ptrace`). Both go through `debug_page`, which faults the page in if a VMA covers it (`uvm_populate`, whatever the VMA's protection), so a debugger can read pages the program has not touched yet. `uvm_poke` ignores the VMA's protection (breakpoints go into r-x text), but first gives the process a private copy of a page whose frame is shared (refcount > 1: text pages are shared after `fork` without COW marks), so a breakpoint never appears in another process; a writable COW page that gets copied this way becomes writable. If any page written is executable, it runs `fence.i` locally and on every hart through SBI. Both return `-EFAULT` for an address with no VMA.
 - `brk` and `mprotect`: if the top of the heap was given another protection (tcc's `-run` memory comes from `malloc`, so from the heap), `do_brk` starts a new `heap` VMA at the old top instead of growing the changed one.
 
 **Page-table walks:**
@@ -556,7 +557,7 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 
 ### User memory (`proc.h`)
 
-`mm_create`, `mm_destroy`, `mm_fork`, `vma_find`, `vma_add`, `vma_unmap`, `uvm_fault`, `uvm_populate`, `uvm_write`, `uvm_read`, `vm_activate`, `mm_print`, `vma_kind_name`, `copy_from_user`, `copy_to_user`, `strncpy_from_user`, `user_range_ok`.
+`mm_create`, `mm_destroy`, `mm_fork`, `vma_find`, `vma_add`, `vma_unmap`, `vma_protect`, `uvm_peek`, `uvm_poke`, `uvm_fault`, `uvm_populate`, `uvm_write`, `uvm_read`, `vm_activate`, `mm_print`, `vma_kind_name`, `copy_from_user`, `copy_to_user`, `strncpy_from_user`, `user_range_ok`.
 
 ### Fault-tolerant access (`safe.h`)
 

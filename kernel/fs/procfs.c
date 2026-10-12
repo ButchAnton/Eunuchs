@@ -136,7 +136,7 @@ static void gen_pid_locked(struct proc *p, int which, print_fn print)
         print("pgid %d\nsid %d\nstopped %d\nsig_pending %08x\nsig_blocked %08x\n", p->pgid,
               p->sid, p->stopped, p->sig_pending, p->sig_blocked);
         /* For ps: Unix state letter, times in ms, sizes in KiB, terminal. */
-        char st = p->state == P_ZOMBIE ? 'Z' : p->stopped ? 'T' : !t ? '?'
+        char st = p->state == P_ZOMBIE ? 'Z' : p->ptrace_stopped ? 't' : p->stopped ? 'T' : !t ? '?'
                 : t->state == T_RUNNING || t->state == T_RUNNABLE ? 'R'
                 : t->state == T_SLEEPING ? (t->interruptible ? 'S' : 'D') : 'X';
         u64 vsz = 0;

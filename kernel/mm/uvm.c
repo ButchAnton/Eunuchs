@@ -410,6 +410,85 @@ int uvm_read(struct mm *mm, uintptr_t src, void *dst, size_t n)
     return 0;
 }
 
+/*
+ * A debugger's view of a stopped process's memory (ptrace). The page under
+ * va, faulted in if the VMA allows it to exist. For a write the page is made
+ * private first: text pages are shared after fork without COW marks, and a
+ * breakpoint must not show up in the other process.
+ */
+static void *debug_page(struct mm *mm, uintptr_t va, bool for_write, bool *exec)
+{
+    struct vma *v = vma_find(mm, va);
+    if (!v)
+        return NULL;
+    va = ALIGN_DOWN(va, PAGE_SIZE);
+    if (!uvm_populate(mm, va))
+        return NULL;
+    pte_t *pte = vm_walk(mm->pt, va, false);
+    if (!pte || !(*pte & PTE_V))
+        return NULL;
+    *exec = v->prot & VM_EXEC;
+    if (for_write) {
+        struct page *pg = pa_to_page(PTE_PA(*pte));
+        if (pg && pg->refcount > 1) {
+            void *copy = page_alloc();
+            if (!copy)
+                return NULL;
+            memcpy(copy, __va(PTE_PA(*pte)), PAGE_SIZE);
+            pte_t flags = *pte & 0x3ff;
+            if ((flags & PTE_COW) && (v->prot & VM_WRITE))
+                flags = (flags | PTE_W) & ~PTE_COW;     /* ours now */
+            *pte = PA_TO_PTE(__pa(copy)) | flags;
+            page_put(pg);
+            mm->cow_copies++;
+            if (mm->pt == vm_current())
+                sfence_vma(va);
+        }
+    }
+    return __va(PTE_PA(*pte));
+}
+
+int uvm_peek(struct mm *mm, uintptr_t addr, void *dst, size_t n)
+{
+    u8 *d = dst;
+    while (n) {
+        bool exec;
+        u8 *page = user_range_ok(addr, 1) ? debug_page(mm, addr, false, &exec) : NULL;
+        if (!page)
+            return -EFAULT;
+        size_t off = addr & (PAGE_SIZE - 1), chunk = MIN(n, PAGE_SIZE - off);
+        memcpy(d, page + off, chunk);
+        addr += chunk;
+        d += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
+
+int uvm_poke(struct mm *mm, uintptr_t addr, const void *src, size_t n)
+{
+    const u8 *s = src;
+    bool any_exec = false;
+    while (n) {
+        bool exec;
+        u8 *page = user_range_ok(addr, 1) ? debug_page(mm, addr, true, &exec) : NULL;
+        if (!page)
+            return -EFAULT;
+        size_t off = addr & (PAGE_SIZE - 1), chunk = MIN(n, PAGE_SIZE - off);
+        memcpy(page + off, s, chunk);
+        any_exec |= exec;
+        addr += chunk;
+        s += chunk;
+        n -= chunk;
+    }
+    if (any_exec) {
+        /* new instructions: every hart's instruction cache must see them */
+        asm volatile("fence.i" ::: "memory");
+        sbi_remote_fence_i(0, -1UL);
+    }
+    return 0;
+}
+
 void vm_activate(struct mm *mm)
 {
     pagetable_t pt = mm ? mm->pt : kernel_pagetable;

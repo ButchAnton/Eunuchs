@@ -42,6 +42,7 @@
     X(93,  exit,        1, "d")              \
     X(101, nanosleep,   2, "pp")             \
     X(113, clock_gettime, 2, "dp")           \
+    X(117, ptrace,      4, "ddxx")           \
     X(124, sched_yield, 0, "")               \
     X(129, kill,        2, "dk")             \
     X(144, setgid,      1, "d")              \

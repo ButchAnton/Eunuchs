@@ -243,7 +243,6 @@ For reporting, each dependency edge stores its first occurrence: `struct ld_edge
 |---|---|---|---|
 | Ctrl-] on the console | `console.c: console_rx_char` (in the UART interrupt handler, which runs on cpu0) | `this_cpu()->irq_tf` | yes |
 | Kernel `ebreak` / `debug_break()` | `trap.c: trap_handler`, `EXC_BREAKPOINT`, when `trap_breakpoint_hook` is unset or declines | trap frame; `sepc` is advanced by the instruction length afterwards | yes |
-| User `ebreak` | `trap.c: user_exception` | user trap frame | yes |
 | `dbg break` (`SYS_debug`/`DBG_BREAK`) | `syscall.c: do_debug` | `thread_user_tf(current)` | yes |
 | Boot option `break` | `main.c: kmain`, before `pmm_init` | `NULL` | yes |
 | Any panic | `panic.c: panic_finish` (unless `panic=shutdown`) | `NULL` for `panic()`, the trap frame for `panic_trap()` | **no** |

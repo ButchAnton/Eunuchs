@@ -204,7 +204,6 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Recover after a stack-overflow report (H/S).
 - Keep `rt_sigreturn` out of restart logic (M/S).
 - Privilege checks in `SYS_debug` (M/S).
-- SIGTRAP for user `ebreak` instead of stopping the machine (M/S).
 - Sstc timer and tickless idle (M/M).
 - Spread device interrupts across CPUs, with PLIC contexts from the device tree (M/M).
 - Save FP registers only when `sstatus.FS` says they are dirty (L/S).
@@ -313,6 +312,14 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - `make -j` (M/M); more GNU make (`define`, `$(call)`, `$(eval)`, `vpath`) (M/M).
 - `tcc -run` without `mprotect` (a fallback through `/tmp` and `exec`) (L/S); a smaller `libtcc1.a` (L/S).
 
+### [The debugger](subsystems/14-debugger.md#potential-improvements)
+- Watchpoints through page protection (write-protect the page, single-step the faulting store, compare) (M/M).
+- Fork and exec events (`PTRACE_O_TRACEFORK`/`TRACEEXEC`-style options), so `db` can follow children and keep breakpoints out of them (M/M).
+- Separate debug files for `/bin` (`build/user/bin` DWARF installed under `/usr/lib/debug`) so the system programs debug at source level (M/S).
+- CFI (`.debug_frame`/`.eh_frame`) unwinding instead of frame-pointer heuristics (M/M).
+- Casts to struct and union types, and function calls, in `db` expressions (L/M).
+- Do `ptrace` memory copies without holding `proc_lock` with interrupts off (M/S).
+
 ### [Build and testing](subsystems/11-build-and-testing.md#potential-improvements)
 - Stage selection (H/M).
 - Hangs become failures (H/S).
@@ -334,6 +341,7 @@ Bigger projects that would each change what the system can do. They are listed r
 - **A real C library.** Buffered `FILE` stdio, `printf` with floating point, `scanf`, `strto*`, `qsort`, `getopt`, `math.h`, `strftime`, `setjmp`/`sigsetjmp`, and POSIX regular expressions (BRE and ERE) ([10](subsystems/10-user-space.md#stdio-streams)).
 - **Several disks and a persistent `/home`.** Up to four virtio disks, a buffer cache keyed by disk, a log per filesystem, volume labels, and `home.img`, which survives rebuilds ([06](subsystems/06-filesystems.md#boot-and-mounting)).
 - **A native C toolchain.** TinyCC runs on Eunuchs (`/bin/tcc`, with `tcc -run` through the new `mprotect`), with a sysroot in `/usr`, a POSIX `make`, and the sources of every program in `/usr/src`, rebuilt in about 6 seconds in the guest ([13](subsystems/13-toolchain.md)).
+- **A native debugger.** `ptrace` in the kernel (tracing stops on signal delivery, register, FP and memory access, `exec` and breakpoint SIGTRAPs) and `db`, a gdb-like source-level debugger with its own DWARF 4/5 reader, software single-stepping and an RV64GC disassembler ([14](subsystems/14-debugger.md)). A user `ebreak` is now a SIGTRAP instead of freezing the machine in the monitor.
 - **A text editor.** `edit`, with a vi personality (operators, text objects, visual mode, registers, macros, ex commands) and an emacs one (kill ring, incremental search, query-replace, `M-x`) ([10](subsystems/10-user-space.md#the-editor-vi-and-emacs)).
 
 | Direction | What it involves | Why |

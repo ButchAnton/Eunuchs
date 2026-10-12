@@ -34,7 +34,7 @@
     X(log_commit,      FS,    "seq", "blocks", "us")                       \
     X(signal_send,     PROC,  "pid", "sig", "from_pid")                    \
     X(signal_deliver,  PROC,  "sig", "handler", "")                        \
-    X(proc_stop,       PROC,  "pid", "sig", "")                            \
+    X(proc_stop,       PROC,  "pid", "sig", "traced")                            \
     X(tty_signal,      PROC,  "sig", "pgrp", "")                           \
     X(ipi_send,        IRQ,   "cpu", "ipi", "")                            \
     X(ipi_recv,        IRQ,   "ipi", "", "")                               \

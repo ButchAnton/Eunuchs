@@ -6,6 +6,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/ptrace.h>
 #include <uapi/syscall.h>
 
 int fsync(int fd)
@@ -149,3 +150,16 @@ int futimens(int fd, const struct timespec times[2])
     return utimensat(fd, 0, times, 0);
 }
 
+/* ---- ptrace ---- */
+
+long ptrace(int request, pid_t pid, void *addr, void *data)
+{
+    long word = 0;
+    int peek = request == PTRACE_PEEKTEXT || request == PTRACE_PEEKDATA;
+    long r = __syscall(SYS_ptrace, request, pid, (long)addr, peek ? (long)&word : (long)data, 0, 0);
+    if (r < 0) {
+        errno = (int)-r;
+        return -1;
+    }
+    return peek ? word : r;
+}

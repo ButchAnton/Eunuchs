@@ -202,15 +202,14 @@ static void user_exception(struct trap_frame *tf, u64 code)
                        r == -ENOMEM ? SIGBUS : SIGSEGV);
         break;
     }
-    case EXC_BREAKPOINT: {
-        u16 lo = 3;
-        copy_from_user(&lo, tf->sepc, sizeof(lo));
-        char reason[64];
-        ksnprintf(reason, sizeof(reason), "user breakpoint in pid %d (%s)", p->pid, p->name);
-        monitor_enter(reason, tf, true);
-        tf->sepc += (lo & 3) == 3 ? 4 : 2;
+    case EXC_BREAKPOINT:
+        /*
+         * SIGTRAP, with the pc still on the ebreak: a debugger tracing us
+         * stops us there; otherwise it kills the program, as on other
+         * Unixes (dbg_break() is the way into the monitor from user code).
+         */
+        user_fault(tf, "ebreak", SIGTRAP);
         break;
-    }
     case EXC_ILLEGAL_INSN:
         if (!(tf->sstatus & SSTATUS_FS) && !current->fp_used) {
             /*

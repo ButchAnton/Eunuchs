@@ -18,6 +18,7 @@
 #include <trace.h>
 #include <trap.h>
 #include <uapi/errno.h>
+#include <uapi/ptrace.h>
 #include <uapi/syscall.h>
 
 #define MAX_ARGS     32
@@ -300,6 +301,13 @@ static long do_exec(struct proc *p, const char *path, char *const argv[], char *
     memcpy(n, p->name, sizeof(n));
     trace(proc_exec, p->pid, n[0], n[1]);
     pr_debug("pid %d exec %s: entry %#lx, %d args\n", p->pid, path, (unsigned long)entry, argc);
+    if (p->tracer) {
+        /* the debugger gets control before the first instruction */
+        p->si_signo = SIGTRAP;
+        p->si_code = TRAP_EXEC;
+        p->si_addr = entry;
+        signal_send(p, SIGTRAP, p->pid);
+    }
     return argc;
 
 nomem:
@@ -521,6 +529,7 @@ void proc_exit(int status)
      */
     bool wake_init = false;
     flags = spin_lock_irqsave(&proc_lock);
+    ptrace_tracer_exit(p);
     struct proc *c, *tmp;
     list_for_each_entry_safe(c, tmp, &p->children, sibling) {
         list_del(&c->sibling);
@@ -538,6 +547,11 @@ void proc_exit(int status)
         signal_send_locked(parent, SIGCHLD, p->pid);
         wake_up(&parent->child_wq);
     }
+    if (p->tracer && p->tracer != parent) {
+        p->ptrace_exit_report = true;
+        signal_send_locked(p->tracer, SIGCHLD, p->pid);
+        wake_up(&p->tracer->child_wq);
+    }
     if (wake_init && initproc)
         wake_up(&initproc->child_wq);
     wake_up(&p->exit_wq);
@@ -552,19 +566,58 @@ static bool child_matches(struct proc *c, long pid)
            (pid < -1 && c->pgid == -pid);
 }
 
+/*
+ * What wait4 reports about a child c of current: its exit, a job-control
+ * stop (with WUNTRACED), or a tracing stop if we are its tracer. A tracing
+ * stop is the tracer's business: the parent doesn't see it.
+ */
 static bool reportable(struct proc *c, long options)
 {
-    return c->state == P_ZOMBIE || ((options & WUNTRACED) && c->stopped && !c->stop_reported);
+    if (c->state == P_ZOMBIE)
+        return true;
+    if (!c->stopped || c->stop_reported)
+        return false;
+    if (c->ptrace_stopped)
+        return c->tracer == current_proc();
+    return options & WUNTRACED;
+}
+
+/* A process we trace without being its parent: its tracing stops and its exit. */
+static bool tracee_reportable(struct proc *c)
+{
+    return (c->state == P_ZOMBIE && c->ptrace_exit_report) ||
+           (c->state == P_ALIVE && c->ptrace_stopped && !c->stop_reported);
+}
+
+/* proc_lock held: a child or foreign tracee to report; *any: there is something to wait for */
+static struct proc *find_reportable(struct proc *p, long pid, long options, bool *any)
+{
+    struct proc *c;
+    *any = false;
+    list_for_each_entry(c, &p->children, sibling) {
+        if (!child_matches(c, pid))
+            continue;
+        *any = true;
+        if (c->state == P_ZOMBIE && c->ptrace_exit_report && c->tracer && c->tracer != p)
+            continue;               /* its tracer hears of the exit first, as in Linux */
+        if (reportable(c, options))
+            return c;
+    }
+    list_for_each_entry(c, &all_procs, all_node) {
+        if (c->tracer != p || c->parent == p || !child_matches(c, pid))
+            continue;
+        *any = true;
+        if (tracee_reportable(c))
+            return c;
+    }
+    return NULL;
 }
 
 static bool has_zombie(struct proc *p, long pid, long options)
 {
-    bool found = false;
-    struct proc *c;
+    bool any;
     unsigned long flags = spin_lock_irqsave(&proc_lock);
-    list_for_each_entry(c, &p->children, sibling)
-        if (child_matches(c, pid) && reportable(c, options))
-            found = true;
+    bool found = find_reportable(p, pid, options, &any) != NULL;
     spin_unlock_irqrestore(&proc_lock, flags);
     return found;
 }
@@ -574,17 +627,20 @@ long sys_wait4(long pid, uintptr_t ustatus, long options, uintptr_t rusage)
     (void)rusage;
     struct proc *p = current_proc();
     for (;;) {
-        bool any = false;
-        struct proc *z = NULL, *c;
+        bool any;
         unsigned long flags = spin_lock_irqsave(&proc_lock);
-        list_for_each_entry(c, &p->children, sibling) {
-            if (!child_matches(c, pid))
-                continue;
-            any = true;
-            if (reportable(c, options)) {
-                z = c;
-                break;
-            }
+        struct proc *z = find_reportable(p, pid, options, &any);
+        if (z && z->parent != p && z->state == P_ZOMBIE) {
+            /* a tracee that isn't our child exited: tell us, then its parent may reap it */
+            z->ptrace_exit_report = false;
+            z->tracer = NULL;
+            if (z->parent)
+                wake_up(&z->parent->child_wq);
+            int status = z->exit_status, cpid = z->pid;
+            spin_unlock_irqrestore(&proc_lock, flags);
+            if (ustatus && copy_to_user(ustatus, &status, sizeof(status)))
+                return -EFAULT;
+            return cpid;
         }
         if (z && z->state != P_ZOMBIE) {        /* stopped: report, keep it */
             z->stop_reported = true;
@@ -680,7 +736,11 @@ static int err_print(const char *fmt, ...)
 void user_fault(struct trap_frame *tf, const char *what, int sig)
 {
     struct proc *p = current_proc();
-    if (signal_handled(p, sig)) {
+    u32 code = SCAUSE_CODE(tf->scause);
+    p->si_signo = sig;
+    p->si_addr = code == EXC_BREAKPOINT || code == EXC_ILLEGAL_INSN ? tf->sepc : tf->stval;
+    p->si_code = sig == SIGSEGV && p->mm && vma_find(p->mm, tf->stval) ? SEGV_ACCERR : 1;
+    if (signal_handled(p, sig) || p->tracer) {
         pr_debug("pid %d (%s): %s at %#lx -> %s handler\n", p->pid, p->name, what,
                  (unsigned long)tf->stval, signal_name(sig));
         signal_send(p, sig, p->pid);
@@ -740,7 +800,7 @@ void proc_list_print(print_fn print)
     list_for_each_entry(p, &all_procs, all_node) {
         print("  %3d  %4d %4d %4d %-16s %-6s %4d %9lu %8lu  %-6s  %08x %08x %lu\n", p->pid,
               p->parent ? p->parent->pid : 0, p->pgid, p->sid, p->name,
-              p->state == P_ZOMBIE ? "zombie" : p->stopped ? "T" :
+              p->state == P_ZOMBIE ? "zombie" : p->ptrace_stopped ? "t" : p->stopped ? "T" :
               p->thread ? thread_state_name(p->thread->state) : "?",
               p->thread ? p->thread->tid : -1, (unsigned long)p->syscalls,
               (unsigned long)(p->mm ? p->mm->rss * 4 : 0),

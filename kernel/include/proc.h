@@ -80,6 +80,8 @@ int uvm_fault(struct mm *mm, uintptr_t addr, int access);
 void *uvm_populate(struct mm *mm, uintptr_t va);   /* map a zeroed page; kernel VA of it */
 int uvm_write(struct mm *mm, uintptr_t dst, const void *src, size_t n);
 int uvm_read(struct mm *mm, uintptr_t src, void *dst, size_t n);  /* no faulting in */
+int uvm_peek(struct mm *mm, uintptr_t addr, void *dst, size_t n);        /* ptrace: faults in */
+int uvm_poke(struct mm *mm, uintptr_t addr, const void *src, size_t n);  /* ptrace: ignores prot */
 void vm_activate(struct mm *mm);                    /* NULL: kernel page table */
 void mm_print(int (*print)(const char *fmt, ...), struct mm *mm);
 const char *vma_kind_name(enum vma_kind k);
@@ -158,6 +160,15 @@ struct proc {
     bool nanosleep_restarting;      /* restarted nanosleep: sleep until the old deadline */
     u64 nanosleep_deadline;         /* rdtime */
 
+    /* ptrace (ptrace.c); changed under proc_lock */
+    struct proc *tracer;            /* the debugger, or NULL */
+    bool ptrace_stopped;            /* in a tracing stop (only PTRACE_CONT etc. resume it) */
+    int ptrace_resume_sig;          /* the signal the tracer passes on (0: none) */
+    bool ptrace_exit_report;        /* exited: tell a tracer that isn't the parent */
+    int si_signo;                   /* the last fault signal, ... */
+    int si_code;                    /* ... why it was sent ... */
+    u64 si_addr;                    /* ... and the faulting address (PTRACE_GETSIGINFO) */
+
     /* Credentials */
     u16 uid, euid, suid;
     u16 gid, egid, sgid;
@@ -212,6 +223,10 @@ void signal_fork(struct proc *child, struct proc *parent);
 void signal_exec(struct proc *p);
 void signal_notify_parent(struct proc *p, int code);
 void syscall_restart_check(struct trap_frame *tf);
+
+/* ptrace.c */
+int ptrace_stop(struct proc *p, int sig);       /* tracing stop; the signal to deliver (0: none) */
+void ptrace_tracer_exit(struct proc *tracer);   /* proc_lock held: let the tracees go */
 
 long sys_fork(void);
 long sys_execve(uintptr_t upath, uintptr_t uargv, uintptr_t uenvp);

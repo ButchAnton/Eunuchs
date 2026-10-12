@@ -126,8 +126,10 @@ int signal_send_locked(struct proc *p, int sig, int from_pid)
     if (sig == SIGCONT || sig == SIGKILL) {
         p->cont_seq++;
         p->sig_pending &= ~STOP_SIGS;
-        if (p->stopped) {
+        if (p->stopped && !p->ptrace_stopped) {    /* only the tracer ends a tracing stop */
             p->stopped = false;
+            wake_up(&p->stop_wq);
+        } else if (p->ptrace_stopped && sig == SIGKILL) {
             wake_up(&p->stop_wq);
         }
     }
@@ -256,7 +258,22 @@ void signal_deliver(struct trap_frame *tf)
         int sig = lowest_bit(deliverable);
         p->sig_pending &= ~SIGBIT(sig);
         u32 cont_seq = p->cont_seq;
+        bool traced = p->tracer != NULL;
         spin_unlock_irqrestore(&proc_lock, flags);
+        if (traced && sig != SIGKILL) {
+            /* the debugger decides what (if anything) gets delivered */
+            sig = ptrace_stop(p, sig);
+            if (!sig)
+                continue;
+            flags = spin_lock_irqsave(&proc_lock);
+            cont_seq = p->cont_seq;
+            if ((p->sig_blocked & SIGBIT(sig)) && !(UNBLOCKABLE & SIGBIT(sig))) {
+                p->sig_pending |= SIGBIT(sig);      /* passed on but blocked: stays pending */
+                spin_unlock_irqrestore(&proc_lock, flags);
+                continue;
+            }
+            spin_unlock_irqrestore(&proc_lock, flags);
+        }
         struct ksigaction *act = &p->sigactions[sig];
 
         if (act->handler == (uintptr_t)SIG_IGN && !(UNBLOCKABLE & SIGBIT(sig)))

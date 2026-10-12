@@ -147,7 +147,7 @@ For GDB, `kernel_trap_entry` carries DWARF CFI: `.cfi_signal_frame` (so GDB show
 | `EXC_INSN_MISALIGNED` | 0 | SIGBUS / panic |
 | `EXC_INSN_ACCESS` | 1 | SIGSEGV / panic |
 | `EXC_ILLEGAL_INSN` | 2 | first FP instruction: enable FP for the thread; otherwise SIGILL / panic |
-| `EXC_BREAKPOINT` | 3 | debug monitor / semihosting fallback, `trap_breakpoint_hook`, or monitor |
+| `EXC_BREAKPOINT` | 3 | SIGTRAP (a tracer stops the process) / semihosting fallback, `trap_breakpoint_hook`, or monitor |
 | `EXC_LOAD_MISALIGNED`, `EXC_STORE_MISALIGNED` | 4, 6 | SIGBUS / exception-table fixup or panic |
 | `EXC_LOAD_ACCESS`, `EXC_STORE_ACCESS` | 5, 7 | SIGSEGV / exception-table fixup or panic |
 | `EXC_ECALL_U` | 8 | system call |
@@ -315,8 +315,8 @@ Handlers that need the full user register state use `thread_user_tf(current)`: `
 |---|---|
 | `ecall` | `syscall_dispatch` |
 | instruction/load/store page fault | `intr_on`, `uvm_fault(p->mm, stval, FAULT_EXEC/READ/WRITE)`, `intr_off`, trace `user_fault`. On failure `user_fault(tf, reason, sig)`: `-ENOMEM` → "out of memory", SIGBUS; `-EACCES` → "permission denied", SIGSEGV; else "no mapping", SIGSEGV. |
-| breakpoint | Enter the debug monitor (stops the world) with reason `user breakpoint in pid N (name)`, then skip the 2- or 4-byte `ebreak`. |
-| illegal instruction | SIGILL. If `sstatus.FS` is off and the opcode is `0x07` (LOAD-FP), the message is `floating point is not supported in user mode yet`. |
+| breakpoint | `user_fault(tf, "ebreak", SIGTRAP)` with `sepc` still on the `ebreak`. A traced process stops for its debugger ([14](14-debugger.md)); an untraced one with a SIGTRAP handler gets it; otherwise the program is killed with the usual fault report, as on other Unixes. (Until the debugger stage this entered the kernel monitor; `dbg_break()`, i.e. `SYS_debug`/`DBG_BREAK`, is now the way into the monitor from user code.) |
+| illegal instruction | If `sstatus.FS` is off in the trap frame and the thread has not used floating point yet (`!current->fp_used`), this is the program's first FP instruction: zero `current->fp`, set `fp_used`, load the zeroed registers (`fp_load_regs`), set `FS` = Initial in the frame, and return so the instruction is retried. Otherwise SIGILL "illegal instruction". See [lazy floating point](#lazy-floating-point-for-user-programs). |
 | misaligned | SIGBUS "misaligned access". |
 | anything else | SIGSEGV "bad access". |
 
@@ -448,6 +448,7 @@ ABI: `ecall` with `a7` = number, `a0`–`a5` = arguments; result in `a0`, `-errn
 | 93 | `exit` | `kernel/proc/syscall.c: do_exit` | `proc_exit(WEXITSTATUS_ENC(code))`; never returns. |
 | 101 | `nanosleep` | `kernel/proc/cred.c: do_nanosleep` | Fills the remainder; `-ERESTARTSYS` on a signal, restarted to the original deadline. |
 | 113 | `clock_gettime` | `kernel/proc/cred.c: do_clock_gettime` | `CLOCK_REALTIME` (RTC) and `CLOCK_MONOTONIC` (`rdtime`) only. |
+| 117 | `ptrace` | `kernel/proc/ptrace.c: do_ptrace` | Linux request numbers plus Eunuchs `PTRACE_READ`/`PTRACE_WRITE`; `PEEK*` store the word at `*data`; `PTRACE_SINGLESTEP` → `EIO`. See [14](14-debugger.md). |
 | 124 | `sched_yield` | `kernel/proc/syscall.c: do_sched_yield` | |
 | 129 | `kill` | `kernel/proc/signal.c: do_kill` | pid > 0, 0 (own group), < -1 (group); `kill(-1)` → `EINVAL`. |
 | 133 | `rt_sigsuspend` | `kernel/proc/signal.c: do_rt_sigsuspend` | 32-bit mask; always returns `EINTR`. |
@@ -553,7 +554,6 @@ Strings are cut at 40 bytes, buffers at 32, argv at 6 elements of 24 bytes; `brk
 ## Limitations and known issues
 
 - **FP state is saved eagerly once used.** `FS` is never checked for Dirty: every switch away from an `fp_used` thread saves all 32 registers and `fcsr`, and every switch back loads them, even if the thread has not touched FP since. A thread that used FP once pays this until it execs.
-- **User `ebreak` stops the whole machine** in the monitor instead of delivering SIGTRAP. There is no ptrace-style user debugging.
 - **A genuinely illegal instruction costs two traps** in a program that has not used FP: the first is taken as "first FP use" (the opcode is not inspected) and enables FP; the retry then faults with `FS` on and gets SIGILL.
 - **`SYS_debug` has no permission checks.** Any process can stop the machine (`DBG_BREAK`), arm a simulated filesystem crash (`DBG_FSCRASH`), and start the profiler and write its output to a host path of its choice through semihosting (`DBG_PROFILE` op 3).
 - **After a kernel stack overflow, the CPU cannot take another trap.** `overflow_sp` is never cleared and `stack_overflow` halts on the second call, so a faulting `safe_read` during the overflow report or later in the monitor (e.g. `mem` at a bad address) exits QEMU with the misleading "overflow while handling an overflow" message.
@@ -581,14 +581,13 @@ Strings are cut at 40 bytes, buffers at 32, argv at 6 elements of 24 bytes; `brk
 2. **Let traps work after a stack overflow** — In `trap_handler`, treat a trap as a new overflow only if the emergency-stack switch happened for *this* trap (e.g. compare `regs[2]`/`sp` with the emergency stack, or clear `overflow_sp` in `stack_overflow` once it is copied into the frame), so `safe_read` fixups, `bt` and `mem` work in the overflow report and the monitor. Impact: high. Effort: small.
 3. **Keep `rt_sigreturn` out of the restart logic** — Skip the `-ERESTARTSYS` check in `syscall_dispatch` for `SYS_rt_sigreturn` (or have handlers signal a restart through a flag instead of the return value). Removes a rare context corruption. Impact: medium. Effort: small.
 4. **Permission checks for `SYS_debug`** — Require euid 0 (or a boot option) for `DBG_BREAK`, `DBG_FSCRASH` and `DBG_PROFILE`, and restrict profile dump paths to `build/`. Today any user process can halt the machine or write host files. Impact: medium. Effort: small.
-5. **SIGTRAP for user `ebreak`** — Deliver SIGTRAP (default: kill with a report) and keep the monitor behind `DBG_BREAK` or a boot option, so one program cannot freeze every CPU. A step toward user-level debuggers. Impact: medium. Effort: small.
-6. **Asm offsets generated from C** — Generate `FRAME_SIZE`, `TF_SEPC`... and `CPU_*` from `offsetof` at build time (an `asm-offsets.c`), or at least add `_Static_assert`s for each `TF_*` offset. Prevents silent frame-layout drift. Impact: low. Effort: small.
-7. **Sstc timer and tickless idle** — Use `stimecmp` when the hart has Sstc (no SBI `ecall` per tick), and stop the periodic tick on idle CPUs, programming the next sleeper's deadline instead. Less overhead and fewer wakeups, especially at profiling rates up to 5000 Hz. Impact: medium. Effort: medium.
-8. **Spread device interrupts and read PLIC contexts from the device tree** — Parse `interrupts-extended` to find each hart's S-mode context, add per-IRQ CPU affinity and `irq_unregister`/mask, and enable `SEIE` on more than cpu0. Removes the cpu0 bottleneck and the `2 * hart + 1` assumption. Impact: medium. Effort: medium.
-9. **Faster signal delivery to running processes** — When `signal_send` targets a process that is running on another CPU, send `IPI_RESCHED` so the signal is seen at once rather than at the next tick; and loop `return_to_user_checks` until neither `need_resched` nor a deliverable signal remains. Impact: low. Effort: small.
-10. **Linux-compatible `nanosleep` interruption** — Return a distinct internal code (like `ERESTART_RESTARTBLOCK`) so a handler always yields `EINTR` with the remaining time, and only handler-less interruptions restart. Impact: low. Effort: small.
-11. **`__restore_rt` safety net** — Follow its `ecall` with an `unimp` (or a call to `_exit`), so a failed `rt_sigreturn` cannot fall through into unrelated code. Impact: low. Effort: small.
-12. **Show `missed_ticks` and per-CPU exceptions** — Add missed ticks to `/proc/interrupts`/`cpus`, count ticks lost in `cpu_wait_ticks`, and add per-syscall counts (and optionally latency) to a `/proc/syscalls` file. Cheap observability for timer and syscall behavior. Impact: low. Effort: small.
-13. **Save FP state only when dirty** — Check `sstatus.FS` (or `tf->sstatus`) for Dirty before `fp_save_regs` and set it back to Clean afterwards, and turn `FS` off again for a thread that has not used FP for a while, so FP-using threads that are mostly integer stop paying 33 loads and stores per switch. Impact: low. Effort: small.
-14. **Resolve kernel uaccess faults with interrupts on when allowed** — In `trap_handler`, enable interrupts around `uvm_fault` if the frame's `SPIE` was set, matching the user-fault path and cutting interrupt latency during COW copies. Impact: low. Effort: small.
-15. **Sorted exception table** — Sort `__ex_table` at build or boot and binary-search it in `extable_lookup` (called twice per kernel memory fault). Small today, but grows with every new uaccess/safe accessor. Impact: low. Effort: small.
+5. **Asm offsets generated from C** — Generate `FRAME_SIZE`, `TF_SEPC`... and `CPU_*` from `offsetof` at build time (an `asm-offsets.c`), or at least add `_Static_assert`s for each `TF_*` offset. Prevents silent frame-layout drift. Impact: low. Effort: small.
+6. **Sstc timer and tickless idle** — Use `stimecmp` when the hart has Sstc (no SBI `ecall` per tick), and stop the periodic tick on idle CPUs, programming the next sleeper's deadline instead. Less overhead and fewer wakeups, especially at profiling rates up to 5000 Hz. Impact: medium. Effort: medium.
+7. **Spread device interrupts and read PLIC contexts from the device tree** — Parse `interrupts-extended` to find each hart's S-mode context, add per-IRQ CPU affinity and `irq_unregister`/mask, and enable `SEIE` on more than cpu0. Removes the cpu0 bottleneck and the `2 * hart + 1` assumption. Impact: medium. Effort: medium.
+8. **Faster signal delivery to running processes** — When `signal_send` targets a process that is running on another CPU, send `IPI_RESCHED` so the signal is seen at once rather than at the next tick; and loop `return_to_user_checks` until neither `need_resched` nor a deliverable signal remains. Impact: low. Effort: small.
+9. **Linux-compatible `nanosleep` interruption** — Return a distinct internal code (like `ERESTART_RESTARTBLOCK`) so a handler always yields `EINTR` with the remaining time, and only handler-less interruptions restart. Impact: low. Effort: small.
+10. **`__restore_rt` safety net** — Follow its `ecall` with an `unimp` (or a call to `_exit`), so a failed `rt_sigreturn` cannot fall through into unrelated code. Impact: low. Effort: small.
+11. **Show `missed_ticks` and per-CPU exceptions** — Add missed ticks to `/proc/interrupts`/`cpus`, count ticks lost in `cpu_wait_ticks`, and add per-syscall counts (and optionally latency) to a `/proc/syscalls` file. Cheap observability for timer and syscall behavior. Impact: low. Effort: small.
+12. **Save FP state only when dirty** — Check `sstatus.FS` (or `tf->sstatus`) for Dirty before `fp_save_regs` and set it back to Clean afterwards, and turn `FS` off again for a thread that has not used FP for a while, so FP-using threads that are mostly integer stop paying 33 loads and stores per switch. Impact: low. Effort: small.
+13. **Resolve kernel uaccess faults with interrupts on when allowed** — In `trap_handler`, enable interrupts around `uvm_fault` if the frame's `SPIE` was set, matching the user-fault path and cutting interrupt latency during COW copies. Impact: low. Effort: small.
+14. **Sorted exception table** — Sort `__ex_table` at build or boot and binary-search it in `extable_lookup` (called twice per kernel memory fault). Small today, but grows with every new uaccess/safe accessor. Impact: low. Effort: small.

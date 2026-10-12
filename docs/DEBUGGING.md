@@ -144,7 +144,9 @@ Faults become catchable signals (`SIGSEGV`, `SIGILL`, `SIGBUS`). The detailed cr
 
 `Ctrl-]` always goes to the kernel monitor first.
 
-**Monitor**: `tty` (termios flags, foreground group and session, the line being edited, queued input, signals sent), `pipes`, `procs` (now with process group, session, and pending/blocked signal masks), `vm <pid> [va]` (VMAs, or a page-table walk in that address space), `ubt <pid>` (where a process is in user code), `strace <pid>`, `kill <pid>`. `ebreak` in user code, or `dbg_break()`, stops in the monitor with the user registers; `c` continues.
+**Monitor**: `tty` (termios flags, foreground group and session, the line being edited, queued input, signals sent), `pipes`, `procs` (now with process group, session, and pending/blocked signal masks), `vm <pid> [va]` (VMAs, or a page-table walk in that address space), `ubt <pid>` (where a process is in user code), `strace <pid>`, `kill <pid>`. `dbg_break()` stops in the monitor with the user registers; `c` continues. An `ebreak` in user code is a SIGTRAP: it stops the program under a debugger (`db`), and otherwise kills it with a fault report.
+
+**Debugging user programs**: `db PROG [ARGS]` (or `db -p PID`) is a gdb-like debugger that runs on Eunuchs, built on `ptrace`: breakpoints, stepping, backtraces, locals and expressions at source level for programs compiled with `tcc -g` (or `make CFLAGS=-g` in `/usr/src`), and symbols plus disassembly for the stripped programs in `/bin`. A traced process shows state `t` in `ps`. See [14-debugger.md](subsystems/14-debugger.md).
 
 **GDB**: `eu-procs`. To debug user code, `add-symbol-file build/user/bin/<prog>` (full DWARF; the copies on the disk image are stripped).
 
@@ -152,6 +154,7 @@ Faults become catchable signals (`SIGSEGV`, `SIGILL`, `SIGBUS`). The detailed cr
 
 User programs are built for `rv64gc` and may use floating point. The kernel is built without FP; a thread gets zeroed FP registers on its first FP instruction (an illegal-instruction trap the kernel absorbs) and from then on they are saved and restored at context switches, copied by `fork`, and carried in signal frames. In GDB, `info registers float` shows the live user values only while that thread is the one running on the CPU; otherwise look at `((struct thread *)T)->fp`.
 
+Programs compiled on Eunuchs with `tcc` keep a symbol table; compile with `tcc -g` to debug them at source level with `db`. To chase a compile problem, `tcc -vv` shows the search paths and files used, `strace tcc ...` the system calls, and the same compiler runs on the Mac as `build/tcc/xtcc -Bbuild/sysroot/usr/lib/tcc`; disassemble its output with `riscv64-elf-objdump -d`. See [13-toolchain.md](subsystems/13-toolchain.md#debugging-and-observability).
 
 ## Threads, scheduling and locks
 
