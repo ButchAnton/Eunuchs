@@ -17,6 +17,7 @@
 #include <printk.h>
 #include <proc.h>
 #include <riscv.h>
+#include <sbi.h>
 #include <uapi/errno.h>
 
 static u64 prot_to_pte(u32 prot)
@@ -173,6 +174,81 @@ int vma_unmap(struct mm *mm, uintptr_t start, uintptr_t end)
             if (r)
                 return r;
         }
+    }
+    return 0;
+}
+
+/*
+ * mprotect: give [start, end) new permissions, splitting VMAs at the edges.
+ * The whole range must be mapped. Write permission is never put straight
+ * into a PTE: fork shares read-only pages without marking them COW, so a page
+ * that becomes writable is marked COW and the first write fault takes it (or
+ * copies it if it is shared). Pages that become executable get the
+ * instruction caches of every hart synchronized.
+ */
+int vma_protect(struct mm *mm, uintptr_t start, uintptr_t end, u32 prot)
+{
+    if ((start | end) & (PAGE_SIZE - 1) || start >= end || end > USER_TOP)
+        return -EINVAL;
+    /* the range must be covered without holes */
+    for (uintptr_t a = start; a < end;) {
+        struct vma *v = vma_find(mm, a);
+        if (!v)
+            return -ENOMEM;
+        a = v->end;
+    }
+    struct vma *v, *tmp;
+    list_for_each_entry_safe(v, tmp, &mm->vmas, node) {
+        if (end <= v->start || start >= v->end || v->prot == prot)
+            continue;
+        uintptr_t s = MAX(start, v->start), e = MIN(end, v->end);
+        /* split off the parts outside the range; they keep the old protection */
+        if (s > v->start) {
+            uintptr_t old_start = v->start;
+            unsigned long flags = spin_lock_irqsave(&mm->vma_lock);
+            v->start = s;
+            spin_unlock_irqrestore(&mm->vma_lock, flags);
+            int r = vma_add(mm, old_start, s, v->prot, v->kind, v->name);
+            if (r) {
+                flags = spin_lock_irqsave(&mm->vma_lock);
+                v->start = old_start;
+                spin_unlock_irqrestore(&mm->vma_lock, flags);
+                return r;
+            }
+        }
+        if (e < v->end) {
+            uintptr_t old_end = v->end;
+            unsigned long flags = spin_lock_irqsave(&mm->vma_lock);
+            v->end = e;
+            spin_unlock_irqrestore(&mm->vma_lock, flags);
+            int r = vma_add(mm, e, old_end, v->prot, v->kind, v->name);
+            if (r) {
+                flags = spin_lock_irqsave(&mm->vma_lock);
+                v->end = old_end;
+                spin_unlock_irqrestore(&mm->vma_lock, flags);
+                return r;
+            }
+        }
+        v->prot = prot;
+        pte_t *pte;
+        for_each_present(mm->pt, va, s, e, pte) {
+            pte_t old = *pte, n = old & ~(PTE_R | PTE_W | PTE_X);
+            if (prot & VM_READ)
+                n |= PTE_R;
+            if (prot & VM_EXEC)
+                n |= PTE_X;
+            if (old & PTE_W)
+                n |= prot & VM_WRITE ? PTE_W : PTE_COW;
+            else if (prot & VM_WRITE)
+                n |= PTE_COW;
+            *pte = n;
+        }
+    }
+    if (mm->pt == vm_current())
+        sfence_vma_all();
+    if (prot & VM_EXEC) {
+        asm volatile("fence.i" ::: "memory");
+        sbi_remote_fence_i(0, -1UL);
     }
     return 0;
 }

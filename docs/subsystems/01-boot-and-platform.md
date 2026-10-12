@@ -11,7 +11,7 @@ This document covers everything from the first instruction the kernel executes t
 - The order of initialization in `kmain`, and the `kinit` thread's choice between tests and `/bin/init`.
 - Device tree (DTB) parsing into the global `platform`, and the `dtb`/`plat` printers.
 - Kernel command line parsing, the table of known options and their validation.
-- The SBI call layer (base, legacy console, TIME, IPI, HSM, SRST) and the `sifive,test0` exit device.
+- The SBI call layer (base, legacy console, TIME, IPI, RFENCE `remote_fence_i` for `mprotect`, HSM, SRST) and the `sifive,test0` exit device.
 - The console: the SBI fallback, the polled 16550 transmit path, the UART receive interrupt and `Ctrl-]`.
 - Kernel logging: `klog`/`pr_*`, the 64 KiB log ring, thresholds, `quiet`, `log=`.
 - `panic` and `panic_trap` reports, and how the machine ends (monitor or exit code).

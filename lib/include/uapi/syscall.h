@@ -35,6 +35,7 @@
     X(64,  write,       3, "dbu")            \
     X(73,  ppoll,       4, "pdpp")           \
     X(79,  fstatat,     4, "dspx")           \
+    X(88,  utimensat,   4, "dspx")           \
     X(80,  fstat,       2, "dp")             \
     X(81,  sync,        0, "")               \
     X(82,  fsync,       1, "d")              \
@@ -78,6 +79,7 @@
     X(220, fork,        0, "")               \
     X(221, execve,      3, "sap")            \
     X(222, mmap,        6, "puxxdx")         \
+    X(226, mprotect,    3, "pux")            \
     X(242, accept4,     4, "dppx")           \
     X(260, wait4,       4, "dpxp")           \
     X(500, sleep_ms,    1, "u")              \

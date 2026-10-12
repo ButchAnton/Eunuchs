@@ -1332,10 +1332,12 @@ int test_binary(const char *l, const char *op, const char *r, int pattern)
     if (!strcmp(op, "-nt") || !strcmp(op, "-ot") || !strcmp(op, "-ef")) {
         struct stat a, b;
         int ha = stat(l, &a) == 0, hb = stat(r, &b) == 0;
+        long long ta = ha ? a.st_mtim.tv_sec * 1000000000LL + a.st_mtim.tv_nsec : 0;
+        long long tb = hb ? b.st_mtim.tv_sec * 1000000000LL + b.st_mtim.tv_nsec : 0;
         if (op[1] == 'n')
-            return ha && (!hb || a.st_mtime > b.st_mtime);
+            return ha && (!hb || ta > tb);
         if (op[1] == 'o')
-            return hb && (!ha || a.st_mtime < b.st_mtime);
+            return hb && (!ha || ta < tb);
         return ha && hb && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
     }
     long long x, y;

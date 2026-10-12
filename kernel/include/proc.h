@@ -75,6 +75,7 @@ struct vma *vma_find(struct mm *mm, uintptr_t addr);
 int vma_add(struct mm *mm, uintptr_t start, uintptr_t end, u32 prot, enum vma_kind kind,
             const char *name);
 int vma_unmap(struct mm *mm, uintptr_t start, uintptr_t end);
+int vma_protect(struct mm *mm, uintptr_t start, uintptr_t end, u32 prot);
 int uvm_fault(struct mm *mm, uintptr_t addr, int access);
 void *uvm_populate(struct mm *mm, uintptr_t va);   /* map a zeroed page; kernel VA of it */
 int uvm_write(struct mm *mm, uintptr_t dst, const void *src, size_t n);

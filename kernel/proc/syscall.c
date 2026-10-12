@@ -66,11 +66,13 @@ long do_brk(const u64 *a)
         struct vma *next = vma_find(mm, new_top - 1);
         if (next && next != heap)
             return old;                     /* would run into another mapping */
+        if (heap && heap->prot != (VM_READ | VM_WRITE))
+            heap = NULL;                    /* mprotect changed the top page: start a new VMA */
         if (heap) {
             unsigned long flags = spin_lock_irqsave(&mm->vma_lock);
             heap->end = new_top;
             spin_unlock_irqrestore(&mm->vma_lock, flags);
-        } else if (vma_add(mm, mm->brk_start, new_top, VM_READ | VM_WRITE, VMA_HEAP, "heap"))
+        } else if (vma_add(mm, MAX(old_top, mm->brk_start), new_top, VM_READ | VM_WRITE, VMA_HEAP, "heap"))
             return old;
     } else if (new_top < old_top) {
         vma_unmap(mm, new_top, old_top);
@@ -105,6 +107,20 @@ long do_munmap(const u64 *a)
     if (!user_range_ok(a[0], a[1]))
         return -EINVAL;
     return vma_unmap(current_proc()->mm, a[0], a[0] + PAGE_ALIGN(a[1]));
+}
+
+long do_mprotect(const u64 *a)
+{
+    u64 prot = a[2];
+    if (a[0] & (PAGE_SIZE - 1) || !user_range_ok(a[0], a[1]) || (prot & ~7UL))
+        return -EINVAL;
+    if (!a[1])
+        return 0;                           /* as in Linux */
+    if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
+        return -EACCES;                     /* W^X */
+    u32 vprot = (prot & PROT_READ ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) |
+                (prot & PROT_EXEC ? VM_EXEC : 0);
+    return vma_protect(current_proc()->mm, a[0], a[0] + PAGE_ALIGN(a[1]), vprot);
 }
 
 long do_sleep_ms(const u64 *a)

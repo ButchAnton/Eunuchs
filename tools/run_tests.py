@@ -350,8 +350,16 @@ def main():
         ("cat /proc/self/status | grep pgid", "pgid"),
     ])
 
-    # The editors: both personalities edit and save a file.
-    interactive("editors", [
+    # The native toolchain and the editors: tcc compiles and runs a program (to
+    # a file and with -run), make rebuilds a program from /usr/src, and both
+    # editor personalities edit and save a file.
+    interactive("toolchain and editors", [
+        ("echo '#include <stdio.h>' > /tmp/h.c", None),
+        ("echo 'int main(void) { printf(\"tcc says %d\", 6 * 7); puts(\"\"); return 0; }' >> /tmp/h.c",
+         None),
+        ("tcc -o /tmp/h /tmp/h.c && /tmp/h", "tcc says 42"),
+        ("tcc -run /tmp/h.c | cat", "tcc says 42"),
+        ("cd /usr/src && make bin/cat && bin/cat /etc/passwd; cd /", "guest:x:1000"),
         ("vi /tmp/v.txt", None, False), (b"ihello from vi", None, False), (b"\x1b", None, False),
         (b"yyp:s/vi/ex/\r", None, False), (b":wq\r", None),
         ("cat /tmp/v.txt", "hello from vi\r\nhello from ex"),

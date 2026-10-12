@@ -115,6 +115,8 @@ User link: `$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ prog.o $(UL
 | `build/test-fs.img`, `build/test-logs/` | `make test` scratch image, one `.log` per stage, `.pcap` per network stage |
 | `build/ktest-trace.bin`, `ktest-trace.json` | Event trace from the first test boot, and its Perfetto conversion |
 | `build/stress.img` | `make stress` scratch image |
+| `build/tcc/xtcc`, `build/tcc/tcc.o`, `build/tcc/rt/`, `build/tcc/libgcc/` | The host cross TinyCC, `/bin/tcc`'s object, tcc's runtime objects (built by `xtcc`), and the members extracted from `libgcc.a` ([13](13-toolchain.md)) |
+| `build/sysroot/usr/{include,lib}` | What the image gets in `/usr/include` and `/usr/lib` (`make sysroot`) |
 | `build/rr/` | Record/replay: `kernel.elf`, `base.img`, `fs.qcow2`, `snap.qcow2`, `replay.bin`, `append`, `record.log`, `replay.log` |
 | `build/ci/<step>.log` | `make ci` per-step logs |
 | `build/profile.bin`, `profile.svg`, `profile.folded`, `trace.bin`, `trace.json` | Written by `profile dump`/`trace dump` via semihosting and converted by `make flamegraph`/`make trace-json` |
@@ -166,7 +168,8 @@ What goes in:
 - hard links to `/bin/eutils` for `echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile true false yes kill date dmesg free sleep strace su dbg uname clear` (`EUTILS_LINKS`);
 - hard links `/bin/sh` → `esh`, `/bin/less` → `more`, and `/bin/vi`, `/bin/view`, `/bin/emacs`, `/bin/em` → `edit`;
 - `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` from `user/etc/`, `/www/index.html` from `user/www/`;
-- empty `/dev/`, `/proc/`, `/tmp/` (mode 0777), `/www/`, `/home/`, and `/home/guest/` (0755, uid 1000, gid 1000).
+- empty `/dev/`, `/proc/`, `/tmp/` (mode 0777), `/www/`, `/home/`, and `/home/guest/` (0755, uid 1000, gid 1000);
+- the toolchain's sysroot (`SYS_FILES`: everything under `build/sysroot`, at the same path without that prefix: `/usr/include`, `/usr/lib`, `/usr/lib/tcc`) and the program sources (`USR_SRC`: `user/bin/*.c` and `user/bin/*/*.{c,h}` under `/usr/src`, plus `user/usr-src/Makefile` as `/usr/src/Makefile`).
 
 **The home disk.** `home.img` (`HOME_IMG ?= home.img`, in the top directory, not `build/`) is a separate image made by `$(MKFS) --label home home.img $(HOME_MB) /guest/:0755:1000:1000` with `HOME_MB ?= 64`. Its rule has only an order-only dependency on mkfs, so it is created once and never rebuilt: files saved under `/home` survive `make`, `make clean` and kernel changes. `make clean-home` deletes it. `*.img` is in `.gitignore`.
 
@@ -217,7 +220,7 @@ All boots share one scratch image, `build/test-fs.img`, copied from `build/fs.im
 2. Each `user/bin/X.c` becomes `build/user/bin/X.o`, then links to `build/user/bin/X` (`user: $(UPROGS)`). Each directory `user/bin/X/` (`UMULTI`; today `esh` and `edit`) is compiled into `build/user/multi/X/*.o` and linked into one program `build/user/bin/X` by a rule generated from `MULTI_RULE`.
 3. `objcopy --strip-debug` produces `build/user/stripped/X`.
 4. `build/tools/mkfs` is built from `tools/mkfs/mkfs.c` (it depends on `kernel/include/efs_format.h`).
-5. `build/fs.img` is rebuilt from scratch whenever mkfs, any stripped program, or anything in `user/etc/` or `user/www/` changes. **This discards files created at run time** (Makefile comment on the `$(FSIMG)` rule).
+5. `build/fs.img` is rebuilt from scratch whenever mkfs, any stripped program, anything in `user/etc/` or `user/www/`, any sysroot file or any program source changes. **This discards files created at run time** (Makefile comment on the `$(FSIMG)` rule).
 
 `make all` builds `build/kernel.elf` and `build/fs.img`, so it also builds every user program.
 
@@ -315,7 +318,7 @@ KTEST RESULT: PASS|FAIL
 
 ### The user test run (`utest`)
 
-With `utest` (no value) `kinit` spawns `/bin/init -1 /bin/utests`, which runs `utests` once and exits with its status. `utests` runs all 43 entries of its `tests[]` table in order. Each prints `[ RUN      ]`, calls `dbg_mark(name)` (a trace marker), and prints `[       OK ]` or `[  FAILED  ]`. `CHECK(cond)` prints the file and line and marks the test failed. At the end it writes `/home/persist.txt` ("survives reboots") for the next stage and prints `UTEST RESULT:`.
+With `utest` (no value) `kinit` spawns `/bin/init -1 /bin/utests`, which runs `utests` once and exits with its status. `utests` runs all 45 entries of its `tests[]` table in order. Each prints `[ RUN      ]`, calls `dbg_mark(name)` (a trace marker), and prints `[       OK ]` or `[  FAILED  ]`. `CHECK(cond)` prints the file and line and marks the test failed. At the end it writes `/home/persist.txt` ("survives reboots") for the next stage and prints `UTEST RESULT:`.
 
 With `utest=<mode>`, `kinit` passes the mode as `argv[1]` and `utests` runs `scenario(mode)` instead of the suite. After `ktest` and/or `utest`, if `tracedump=<path>` is set, `kinit` writes the trace buffer to that host path through semihosting, then calls `platform_exit(failed ? 1 : 0)`.
 
@@ -346,7 +349,7 @@ The 17 stages, in order:
 | 12 | `smp stress` | boot | `utest=stress` (8 workers, 8 s) | `STRESS RESULT: PASS`, `UTEST RESULT: PASS`; no `LOCKDEP`, `HUNG THREAD`, `filesystem error` |
 | 13 | `fsck after stress` | fsck | | `clean`; no `note: log holds` |
 | 14 | `interactive shell` | interactive | see below | every expected string within its timeout |
-| 15 | `editors` | interactive | see below | every expected string within its timeout |
+| 15 | `toolchain and editors` | interactive | see below | every expected string within its timeout |
 | 16 | `network` | network | `net_basics` | script completes without exception |
 | 17 | `network, 5% loss` | network | `net.drop=5`, `net_lossy` | script completes |
 
@@ -356,7 +359,7 @@ The crash stages use `dbg_fscrash()` from `utests` (`scenario`): write `part1`, 
 
 **Interactive shell steps** (stage 14): `echo hello | cat`; `ls / | grep bin > /tmp/x; cat /tmp/x`; `echo abc > /tmp/f; wc -c /tmp/f`; `cat` then `^C` and `echo status=$?` → `status=130`; `sleep 30` then `^Z` → `esh: suspended  sleep 30`; `jobs` → `[1]  + suspended  sleep 30`; `kill %1` → `[1]  + terminated  sleep 30` (reported as soon as it happens); `sleep 1 &` and `wait`; `V=hi sh -c 'echo inner=$V'`; `false || echo or-ok && echo and-ok`; `nosuch` → `esh: command not found: nosuch`; `segv null` → `esh: segmentation fault (core dumped)  segv null`; arrays (`x=(a b c); echo ${#x} $x[2] ${(U)x[3]}` → `3 b C`); a function with `return 3`; `for` over `{1..3}`; arithmetic, `${HOME:-none}` and `~`; `[[ abc == a* ]]`; a here-document typed over three lines (`PS2` prompts); `su guest` → prompt `guest@eunuchs:~% `, `id` → `uid=1000(guest)`, `touch /etc/nope` → `Permission denied`, `exit`; `cat /proc/self/status | grep pgid`. A step waits for its expected text, then for the next `@eunuchs:` prompt.
 
-**Editors steps** (stage 15): `vi /tmp/v.txt` with keys `ihello from vi`, Esc, `yyp:s/vi/ex/`, `:wq`, and `cat` must show both lines; then `emacs /tmp/e.txt`, typing `hello from emacs`, `C-x C-s`, `C-x C-c`, and `cat` must show it.
+**Toolchain and editors steps** (stage 15): writes a small C program to `/tmp/h.c` with `echo`; `tcc -o /tmp/h /tmp/h.c && /tmp/h` and `tcc -run /tmp/h.c | cat` must both print `tcc says 42`; `cd /usr/src && make bin/cat && bin/cat /etc/passwd` must show `guest:x:1000`; then `vi /tmp/v.txt` with keys `ihello from vi`, Esc, `yyp:s/vi/ex/`, `:wq`, and `cat` must show both lines; then `emacs /tmp/e.txt`, typing `hello from emacs`, `C-x C-s`, `C-x C-c`, and `cat` must show it.
 
 **`net_basics`** (stage 16): `ping -c 2 gateway` and `ping -c 2 localhost` with `0% packet loss`; starts `httpd &` and `echod &`; fetches `/` from the host-forwarded HTTP port and requires `Hello from Eunuchs`; fetches `/proc/net/tcp` and requires `ESTABLISHED`; UDP echo of `udp echo test`; 1 MiB from the Mac to `nc -l 5000 | crc32` with a CRC check (`bulk_to_guest`); the guest sends `/bin/sh` to a listener on the Mac (`nc host PORT < /bin/sh`) and the CRC printed by the guest must match; `netstat -s` must mention `retransmits`.
 
@@ -433,9 +436,11 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 | `replay-check` | kernel, image | Record and replay `panic=shutdown ktest`; require identical output |
 | `flamegraph` | (`build/profile.bin`) | `euprof.py report`, `svg` and `folded`, all with `--no-idle` |
 | `trace-json` | (`build/trace.bin`) | `eutrace.py perfetto` → `build/trace.json` |
-| `clean` | | `rm -rf build` |
+| `clean` | | `rm -rf build` (keeps `home.img`) |
+| `sysroot` | `/bin/tcc`'s runtime, `libc.a` | Stage `build/sysroot` (headers, start-up files, `libc.a`, `libtcc1.a`, `runmain.o`), which the image copies to `/usr` ([13](13-toolchain.md)) |
+| `clean-home` | | `rm -f home.img` |
 
-Internal file targets you may name directly: `build/kernel.elf`, `build/kernel.pass1.elf`, `build/fs.img`, `build/tools/mkfs`, `build/user/bin/<prog>`, `build/host/test_<name>`.
+Internal file targets you may name directly: `build/tcc/xtcc` (the host cross TinyCC), `build/kernel.elf`, `build/kernel.pass1.elf`, `build/fs.img`, `build/tools/mkfs`, `build/user/bin/<prog>`, `build/host/test_<name>`.
 
 ### Make variables
 
@@ -581,7 +586,7 @@ Boot options most used with these targets (the full list is printed by the `help
 | `lockdep_catches_inversions_before_they_deadlock` | AB/BA inversion, a 3-lock cycle and a mutex under a spinlock each produce one report (skipped if `lockdep=off`) |
 | `hung_thread_detector_reports_long_mutex_waits` | With a 50 ms threshold a waiter blocked on a mutex is reported |
 
-### User test catalog (`user/bin/utests.c`, 43 tests, in run order)
+### User test catalog (`user/bin/utests.c`, 45 tests, in run order)
 
 | Test | Checks |
 |---|---|
@@ -628,6 +633,8 @@ Boot options most used with these targets (the full list is printed by the `help
 | `kill` | `SIGKILL` of a sleeping child is prompt; `ESRCH` |
 | `sleep_and_ids` | `sleep_ms(50)` ≥ 50 ms; pid and ppid sane |
 | `brk` | `sbrk` grow, touch, shrink |
+| `mprotect` | A 3-page mapping: the middle page made read-only splits it (a write there is SIGSEGV, the neighbours stay writable) and back; `PROT_WRITE\|PROT_EXEC` → `EACCES`; misaligned → `EINVAL`; code written to a page runs after `mprotect(PROT_READ\|PROT_EXEC)` and the page is no longer writable; a read-only page shared with a forked child that the child makes writable is copied, not shared; an unmapped range → `ENOMEM` |
+| `utimensat` | Explicit time, `UTIME_OMIT`, NULL times (now), `futimens` on an fd, `tv_nsec` out of range → `EINVAL`, missing file → `ENOENT` |
 
 **Scenarios** (`scenario()`, selected with `utest=<mode>`):
 

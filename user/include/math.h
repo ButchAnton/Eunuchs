@@ -1,10 +1,18 @@
 #ifndef _MATH_H
 #define _MATH_H
 
+#ifdef __TINYC__
+/* tcc has no float builtins for a Linux-like target; these fold to inf and NaN */
+#define HUGE_VAL (1e500)
+#define HUGE_VALF (1e50f)
+#define INFINITY (1e50f)
+#define NAN (0.0f / 0.0f)
+#else
 #define HUGE_VAL (__builtin_huge_val())
 #define HUGE_VALF (__builtin_huge_valf())
 #define INFINITY (__builtin_inff())
 #define NAN (__builtin_nanf(""))
+#endif
 #define M_E 2.71828182845904523536
 #define M_LOG2E 1.44269504088896340736
 #define M_LOG10E 0.434294481903251827651

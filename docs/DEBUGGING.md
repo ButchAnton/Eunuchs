@@ -148,7 +148,7 @@ Faults become catchable signals (`SIGSEGV`, `SIGILL`, `SIGBUS`). The detailed cr
 
 **GDB**: `eu-procs`. To debug user code, `add-symbol-file build/user/bin/<prog>` (full DWARF; the copies on the disk image are stripped).
 
-**Safety checks that will bite you (on purpose):** the kernel can only touch user memory through `copy_from_user` / `copy_to_user` / `strncpy_from_user`. `sstatus.SUM` is enabled only inside them, so any other kernel dereference of a user pointer panics with "user-space address accessed from the kernel". Kernel addresses passed in by user programs are rejected with `EFAULT`. User memory is W^X, too: `mmap(PROT_WRITE|PROT_EXEC)` fails with `EACCES`.
+**Safety checks that will bite you (on purpose):** the kernel can only touch user memory through `copy_from_user` / `copy_to_user` / `strncpy_from_user`. `sstatus.SUM` is enabled only inside them, so any other kernel dereference of a user pointer panics with "user-space address accessed from the kernel". Kernel addresses passed in by user programs are rejected with `EFAULT`. User memory is W^X, too: `mmap` or `mprotect` with `PROT_WRITE|PROT_EXEC` fails with `EACCES`; code generated at run time (`tcc -run`) is written first and then made r-x with `mprotect`.
 
 User programs are built for `rv64gc` and may use floating point. The kernel is built without FP; a thread gets zeroed FP registers on its first FP instruction (an illegal-instruction trap the kernel absorbs) and from then on they are saved and restored at context switches, copied by `fork`, and carried in signal frames. In GDB, `info registers float` shows the live user values only while that thread is the one running on the CPU; otherwise look at `((struct thread *)T)->fp`.
 
@@ -353,7 +353,8 @@ QEMU shows each hart as a GDB thread (`info threads`; GDB thread = hart id + 1).
   5. a power failure before the commit point, fsck, then recovery (the change must be absent), fsck
   6. an SMP stress run (`/bin/stress`: 8 processes doing fork/exec pipelines, file I/O, copy-on-write forks and loopback TCP connections on all CPUs for 8 s, every result checked), then fsck
   7. an interactive session typed into the shell on the console: pipelines and redirection, `^C`, `^Z` and job control, quoting and variables, `su guest` and a permission denial, command-not-found, and a segfault message
-  8. networking through QEMU's user network: ping, HTTP requests from the Mac (including a live `/proc/net/tcp`), UDP echo, 1 MiB each way between the Mac and the guest with CRC checks; then 5% induced packet loss: a transfer over loopback (our TCP at both ends) and one from the Mac, checksummed. Each stage leaves a `.pcap` in `build/test-logs/`.
+  8. the native toolchain and the editors: `tcc` compiles and runs a program (to a file and with `-run`), `make` rebuilds `cat` from `/usr/src`, and `vi` and `emacs` each edit and save a file
+  9. networking through QEMU's user network: ping, HTTP requests from the Mac (including a live `/proc/net/tcp`), UDP echo, 1 MiB each way between the Mac and the guest with CRC checks; then 5% induced packet loss: a transfer over loopback (our TCP at both ends) and one from the Mac, checksummed. Each stage leaves a `.pcap` in `build/test-logs/`.
 
   The user tests include socket tests over loopback: a 200 KB TCP echo driven by `poll`, error cases (refused, address in use, reset, EPIPE, ENOTSOCK), non-blocking connect and accept, UDP, and `poll`/`select` with pipes. The stress run also makes a TCP connection over loopback in every iteration.
 

@@ -63,6 +63,7 @@ NULL, OpenSBI's memory and any MMIO not explicitly mapped are unmapped, so stray
 **User memory** (`uvm.c`): an `mm` is a page table plus a sorted list of VMAs (ELF segments, heap, `mmap` areas, stack).
 - Pages are allocated on first touch (`uvm_fault`).
 - `fork` shares pages copy-on-write (`PTE_COW`, reference counts).
+- `mprotect` changes a range's permissions (splitting VMAs, never rwx); adding execute runs `fence.i` on every hart.
 - Walks over page tables skip empty tables whole.
 - Kernel code touches user memory only through `copy_from_user`/`copy_to_user` (`uaccess.S`). Those set `SUM` only for the copy and register their instructions in the exception table, so a bad pointer returns `EFAULT` instead of a panic.
 
@@ -129,6 +130,8 @@ Watch: `ps`, `sched`, `cpus`, `cpu <n>`, `locks` and `lockdep` in the monitor; `
 **Credentials** (`cred.c`): real, effective and saved uid/gid, permission checks in the VFS, setuid executables, umask.
 
 **User space** (`user/`): `crt0.S`, system call stubs and a small libc (buffered `FILE` stdio, `printf`/`scanf` with floating point, a malloc with debugging checks, `math.h`, `time.h` with `strftime`, `setjmp`, POSIX regular expressions, sockets, `poll`/`select`, termios). User programs are built for RV64GC and may use floating point; the kernel, built without it, saves a thread's FP registers only once the thread has used them. `init` runs the shell, `esh` (also `/bin/sh`): a zsh-like language (functions, arrays, `[[ ]]`, here-documents, zsh's expansion rules), job control, and a line editor with syntax highlighting, autosuggestions, history search and Tab completion ([12-shell.md](subsystems/12-shell.md)). `eutils` is one binary behind 32 command names (`echo`, `cp`, `kill`, `profile`, `crc32`, ...). `edit` is a text editor that runs as `vi`/`view` or `emacs`/`em` depending on its name.
+
+**The native toolchain** ([13-toolchain.md](subsystems/13-toolchain.md)): `/bin/tcc` is TinyCC, built by GCC against the libc; a host build of the same compiler (`build/tcc/xtcc`) makes its runtime library. The image carries a sysroot (`/usr/include`, `/usr/lib/{crt1.o,libc.a}`, `/usr/lib/tcc/libtcc1.a`), a small POSIX `make`, and the sources of every program in `/usr/src`, so Eunuchs can rebuild its own user space. `tcc -run` compiles into memory and relies on `mprotect` to turn the generated code executable without breaking W^X.
 
 Watch: `procs`, `ubt <pid>`, `vm <pid>`, `files <pid>` and `strace <pid>` in the monitor; `/proc/<pid>/{status,maps,fds,stack,ustack}`; a fault report for every crashed program.
 

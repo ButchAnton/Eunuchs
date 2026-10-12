@@ -83,7 +83,10 @@ FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(no
            /etc/motd=user/etc/motd /etc/passwd=user/etc/passwd /etc/group=user/etc/group /etc/hostname=user/etc/hostname \
            /etc/eshrc=user/etc/eshrc /dev/ /proc/ /tmp/:0777 \
            /www/ /www/index.html=user/www/index.html \
-           /home/ /home/guest/:0755:1000:1000
+           /home/ /home/guest/:0755:1000:1000 \
+           $(foreach f,$(SYS_FILES),$(patsubst $(SYSROOT)%,%,$(f))=$(f)) \
+           $(foreach f,$(filter user/bin/%,$(USR_SRC)),/usr/src/$(patsubst user/bin/%,%,$(f))=$(f)) \
+           /usr/src/Makefile=user/usr-src/Makefile
 DISKOPTS = -global virtio-mmio.force-legacy=false \
            -drive file=$(1),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
@@ -106,7 +109,7 @@ comma := ,
 HOMEOPTS = -drive file=$(HOME_IMG),if=none,format=raw,id=hd1 -device virtio-blk-device,drive=hd1
 QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(NETOPTS)
 
-.PHONY: all user fsck clean-home run debug gdb test stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean
+.PHONY: all user fsck clean-home run debug gdb test stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean sysroot
 
 all: $(KERNEL) $(FSIMG)
 
@@ -175,6 +178,87 @@ $(BUILD)/user/bin/$(1): $(patsubst user/bin/$(1)/%.c,$(BUILD)/user/multi/$(1)/%.
 endef
 $(foreach p,$(UMULTI),$(eval $(call MULTI_RULE,$(p))))
 
+# --- TinyCC: a C compiler that runs on Eunuchs ---
+# /bin/tcc is built by gcc against our libc. The host cross compiler
+# build/tcc/xtcc (same configuration) builds tcc's runtime library. The
+# "sysroot" is what goes into the image: /usr/include (our headers),
+# /usr/lib/{crt1.o,crti.o,crtn.o,libc.a} and /usr/lib/tcc/{include,libtcc1.a}.
+TCC_SRC   := third_party/tinycc
+TCC_DEPS  := $(wildcard $(TCC_SRC)/*.c $(TCC_SRC)/*.h) ports/tcc/config.h
+XTCC      := $(BUILD)/tcc/xtcc
+SYSROOT   := $(BUILD)/sysroot
+LIBGCC    := $(shell $(CC) -march=rv64gc -mabi=lp64d -print-libgcc-file-name)
+TCC_RT    := $(addprefix $(BUILD)/tcc/rt/,stdatomic.o atomic.o builtin.o alloca.o armflush.o)
+SYS_HDRS  := $(patsubst user/include/%,$(SYSROOT)/usr/include/%,$(shell find user/include -name '*.h')) \
+             $(patsubst lib/include/%,$(SYSROOT)/usr/include/%,$(shell find lib/include -name '*.h')) \
+             $(patsubst $(TCC_SRC)/include/%,$(SYSROOT)/usr/lib/tcc/include/%,$(wildcard $(TCC_SRC)/include/*.h))
+SYS_LIBS  := $(addprefix $(SYSROOT)/usr/lib/,crt1.o crti.o crtn.o libc.a tcc/libtcc1.a tcc/runmain.o)
+# /usr/src: the programs' sources and a Makefile to rebuild them with tcc
+USR_SRC   := $(wildcard user/bin/*.c user/bin/*/*.c user/bin/*/*.h) user/usr-src/Makefile
+SYS_FILES := $(SYS_HDRS) $(SYS_LIBS)
+UPROGS    += $(BUILD)/user/bin/tcc
+
+$(XTCC): $(TCC_DEPS)
+	@mkdir -p $(dir $@)
+	$(call msg,HOSTCC,$@)
+	$(Q)$(HOSTCC) -O1 -w -DONE_SOURCE=1 -Iports/tcc -o $@ $(TCC_SRC)/tcc.c
+
+$(BUILD)/tcc/tcc.o: $(TCC_DEPS)
+	@mkdir -p $(dir $@)
+	$(call msg,UCC,$(TCC_SRC)/tcc.c)
+	$(Q)$(CC) $(UCFLAGS) -w -DONE_SOURCE=1 -Iports/tcc -c $(TCC_SRC)/tcc.c -o $@
+
+$(BUILD)/user/bin/tcc: $(BUILD)/tcc/tcc.o $(ULIB) user/user.ld
+	$(call msg,ULD,$@)
+	$(Q)$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ $< $(ULIB) -lgcc
+
+$(BUILD)/tcc/rt/%.o: $(TCC_SRC)/lib/%.c $(XTCC)
+	@mkdir -p $(dir $@)
+	$(call msg,XTCC,$<)
+	$(Q)$(XTCC) -B$(TCC_SRC) -Iuser/include -Ilib/include -c $< -o $@
+
+$(BUILD)/tcc/rt/%.o: $(TCC_SRC)/lib/%.S $(XTCC)
+	@mkdir -p $(dir $@)
+	$(call msg,XTCC,$<)
+	$(Q)$(XTCC) -B$(TCC_SRC) -Iuser/include -Ilib/include -c $< -o $@
+
+# libtcc1.a: tcc's helpers plus libgcc (soft long double, used by libc too).
+$(SYSROOT)/usr/lib/tcc/libtcc1.a: $(TCC_RT) $(LIBGCC)
+	@mkdir -p $(dir $@) $(BUILD)/tcc/libgcc
+	$(call msg,AR,$@)
+	$(Q)cd $(BUILD)/tcc/libgcc && rm -f *.o && $(CROSS)ar x $(LIBGCC)
+	$(Q)rm -f $@ && $(CROSS)ar rcs $@ $(TCC_RT) $(BUILD)/tcc/libgcc/*.o && $(CROSS)strip -g $@
+
+$(SYSROOT)/usr/lib/tcc/runmain.o: $(BUILD)/tcc/rt/runmain.o
+	@mkdir -p $(dir $@)
+	$(Q)cp $< $@
+
+$(SYSROOT)/usr/lib/libc.a: $(ULIB)
+	@mkdir -p $(dir $@)
+	$(call msg,AR,$@)
+	$(Q)rm -f $@ && $(CROSS)ar rcs $@ $(filter-out %/crt0.o,$(ULIB)) && $(CROSS)strip -g $@
+
+$(SYSROOT)/usr/lib/crt1.o: user/lib/crt0.S
+	@mkdir -p $(dir $@)
+	$(call msg,UAS,$@)
+	$(Q)$(CC) $(UCFLAGS) -D__ASSEMBLY__ -DNO_GP -c $< -o $@
+
+$(SYSROOT)/usr/lib/crti.o $(SYSROOT)/usr/lib/crtn.o:
+	@mkdir -p $(dir $@)
+	$(Q)echo "" | $(CC) $(UCFLAGS) -x assembler -c - -o $@
+
+$(SYSROOT)/usr/include/%: user/include/%
+	@mkdir -p $(dir $@)
+	$(Q)cp $< $@
+$(SYSROOT)/usr/include/%: lib/include/%
+	@mkdir -p $(dir $@)
+	$(Q)cp $< $@
+$(SYSROOT)/usr/lib/tcc/include/%: $(TCC_SRC)/include/%
+	@mkdir -p $(dir $@)
+	$(Q)cp $< $@
+
+sysroot: $(SYS_FILES)
+
 # The disk image gets copies without DWARF (symbol tables stay, for the
 # kernel's user backtraces); the full binaries in build/user/bin are for GDB.
 $(BUILD)/user/stripped/%: $(BUILD)/user/bin/%
@@ -187,7 +271,7 @@ $(MKFS): tools/mkfs/mkfs.c kernel/include/efs_format.h
 	$(Q)$(HOSTCC) -O1 -g -Wall -Wextra -Werror -Ikernel/include -o $@ $<
 
 # Rebuilt whenever a program changes, which discards files created at run time.
-$(FSIMG): $(MKFS) $(patsubst $(BUILD)/user/bin/%,$(BUILD)/user/stripped/%,$(UPROGS)) user/etc/* user/www/*
+$(FSIMG): $(MKFS) $(patsubst $(BUILD)/user/bin/%,$(BUILD)/user/stripped/%,$(UPROGS)) user/etc/* user/www/* $(SYS_FILES) $(USR_SRC)
 	$(call msg,MKFS,$@)
 	$(Q)$(MKFS) --label root $@ $(FS_MB) $(FS_FILES) > /dev/null
 

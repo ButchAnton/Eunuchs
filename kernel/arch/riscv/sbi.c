@@ -54,6 +54,11 @@ long sbi_send_ipi(unsigned long hart_mask, unsigned long hart_mask_base)
     return sbi_call(SBI_EXT_IPI, 0, hart_mask, hart_mask_base, 0).error;
 }
 
+long sbi_remote_fence_i(unsigned long hart_mask, unsigned long hart_mask_base)
+{
+    return sbi_call(SBI_EXT_RFENCE, 0, hart_mask, hart_mask_base, 0).error;
+}
+
 long sbi_hart_start(unsigned long hartid, unsigned long start_addr, unsigned long opaque)
 {
     return sbi_call(SBI_EXT_HSM, 0, hartid, start_addr, opaque).error;

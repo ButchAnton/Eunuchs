@@ -505,7 +505,17 @@ int main(int argc, char **argv)
             if (rmdir(argv[i]) < 0)
                 rc = fail(argv[i]);
     } else if (!strcmp(prog, "touch")) {
-        for (int i = 1; i < argc; i++) {
+        int i = 1, no_create = 0;
+        if (i < argc && !strcmp(argv[i], "-c"))
+            no_create = 1, i++;
+        for (; i < argc; i++) {
+            if (utimensat(AT_FDCWD, argv[i], 0, 0) == 0)
+                continue;               /* it exists: now it's new */
+            if (errno != ENOENT || no_create) {
+                if (errno != ENOENT)
+                    rc = fail(argv[i]);
+                continue;
+            }
             int fd = open(argv[i], O_WRONLY | O_CREAT, 0644);
             if (fd < 0)
                 rc = fail(argv[i]);

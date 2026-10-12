@@ -44,6 +44,13 @@
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
 #define S_ISCHR(m) (((m) & S_IFMT) == S_IFCHR)
 
+struct timespec {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+};
+
+/* As in POSIX: st_mtim and st_ctim are timespecs, st_mtime and st_ctime their
+   seconds. efs keeps no access time; st_atim is the modification time. */
 struct stat {
     uint32_t st_dev;
     uint32_t st_ino;
@@ -53,11 +60,15 @@ struct stat {
     uint32_t st_gid;
     uint64_t st_size;
     uint64_t st_blocks;     /* 512-byte units */
-    uint64_t st_mtime;      /* ns since the epoch */
-    uint64_t st_ctime;
+    struct timespec st_mtim;
+    struct timespec st_ctim;
     uint32_t st_rdev;
     uint32_t st_pad;
 };
+#define st_mtime st_mtim.tv_sec
+#define st_ctime st_ctim.tv_sec
+#define st_atim  st_mtim
+#define st_atime st_mtim.tv_sec
 
 #define DT_UNKNOWN 0
 #define DT_CHR     2
@@ -76,10 +87,9 @@ struct dirent {
 #define X_OK 1
 #define F_OK 0
 
-struct timespec {
-    int64_t tv_sec;
-    int64_t tv_nsec;
-};
+/* utimensat: tv_nsec values */
+#define UTIME_NOW  ((1L << 30) - 1)
+#define UTIME_OMIT ((1L << 30) - 2)
 
 struct timeval {
     int64_t tv_sec;

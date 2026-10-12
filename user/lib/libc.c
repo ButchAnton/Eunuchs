@@ -263,6 +263,7 @@ unsigned long uptime_ms(void) { return SC0(SYS_uptime_ms); }
 pid_t waitpid(pid_t pid, int *st, int opt) { return ret(__syscall(SYS_wait4, pid, (long)st, opt, 0, 0, 0)); }
 pid_t wait(int *st) { return waitpid(-1, st, 0); }
 int munmap(void *a, size_t n) { return ret(SC2(SYS_munmap, a, n)); }
+int mprotect(void *a, size_t n, int prot) { return ret(SC3(SYS_mprotect, a, n, prot)); }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
 {
@@ -601,15 +602,6 @@ void malloc_stats(void)
 /* ---- startup ---- */
 
 int main(int argc, char **argv);
-
-/* stdio.c and stdlib.c: run atexit handlers, flush every stream */
-void __libc_exit_hooks(void);
-
-void exit(int status)
-{
-    __libc_exit_hooks();
-    _exit(status);
-}
 
 void __libc_start(int argc, char **argv, char **envp)
 {

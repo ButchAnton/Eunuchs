@@ -39,6 +39,7 @@ static FILE f_stdout = { 1, F_WRITE, _IOLBF, stdout_buf, BUFSIZ, 0, 0, 0, EOF, 0
 static FILE f_stderr = { 2, F_WRITE, _IONBF, 0, 0, 0, 0, 0, EOF, 0, 0 };
 FILE *stdin = &f_stdin, *stdout = &f_stdout, *stderr = &f_stderr;
 static FILE *open_files;
+void __stdio_flush_all(void);
 
 /* ---- low level ---- */
 
@@ -115,6 +116,13 @@ static int put_bytes(FILE *f, const char *p, size_t n)
     }
     f->writing = 1;
     ensure_buf(f);
+    static int registered;
+    if (!registered) {
+        /* Our exit() flushes anyway; this is for an exit() that doesn't know
+           about stdio, like the one tcc -run links in. */
+        registered = 1;
+        atexit(__stdio_flush_all);
+    }
     if (f->mode == _IONBF || !f->buf) {
         while (n) {
             long w = write(f->fd, p, n);
@@ -677,20 +685,8 @@ int asprintf(char **out, const char *fmt, ...)
 
 /* ---- exit ---- */
 
-static void (*exit_fns[32])(void);
-static int nexit_fns;
-
-int atexit(void (*fn)(void))
+/* exit.c calls this (a weak reference: programs without stdio don't pull it in). */
+void __stdio_flush_all(void)
 {
-    if (nexit_fns == 32)
-        return -1;
-    exit_fns[nexit_fns++] = fn;
-    return 0;
-}
-
-void __libc_exit_hooks(void)
-{
-    while (nexit_fns > 0)
-        exit_fns[--nexit_fns]();
     fflush(0);
 }

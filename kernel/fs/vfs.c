@@ -398,10 +398,13 @@ void vfs_stat(struct inode *ip, struct stat *st)
     st->st_gid = ip->gid;
     st->st_size = ip->size;
     st->st_blocks = ip->type == I_CHR ? 0 : (ip->size + 511) / 512;
-    st->st_mtime = ip->mtime;
-    st->st_ctime = ip->ctime;
-    if (!ip->mtime && !ip->ctime)               /* devfs, procfs */
-        st->st_mtime = st->st_ctime = boot_time_ns();
+    u64 mtime = ip->mtime, ctime = ip->ctime;
+    if (!mtime && !ctime)                       /* devfs, procfs */
+        mtime = ctime = boot_time_ns();
+    st->st_mtim.tv_sec = mtime / 1000000000ULL;
+    st->st_mtim.tv_nsec = mtime % 1000000000ULL;
+    st->st_ctim.tv_sec = ctime / 1000000000ULL;
+    st->st_ctim.tv_nsec = ctime % 1000000000ULL;
     st->st_rdev = ip->rdev;
 }
 
@@ -535,9 +538,15 @@ struct file *vfs_open(const char *path, int flags, int mode, int *err)
             *err = -EPERM;
             goto fail;
         }
+        /* one lock order everywhere: the transaction first, then the inode */
+        iunlock(ip);
         fs_begin_op(ip->sb);
-        ip->sb->ops->truncate(ip, 0);
+        ilock(ip);
+        if (ip->size)
+            ip->sb->ops->truncate(ip, 0);
+        iunlock(ip);
         fs_end_op(ip->sb);
+        ilock(ip);
     }
 
     struct file *f = kzalloc(sizeof(*f));

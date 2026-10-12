@@ -436,7 +436,8 @@ static int vercmp(const char *a, const char *b)
 
 static unsigned long long etime(struct ent *e)
 {
-    return use_ctime ? e->st.st_ctime : e->st.st_mtime;
+    const struct timespec *t = use_ctime ? &e->st.st_ctim : &e->st.st_mtim;
+    return (unsigned long long)t->tv_sec * 1000000000ull + (unsigned long long)t->tv_nsec;
 }
 
 static int cmp(struct ent *a, struct ent *b)

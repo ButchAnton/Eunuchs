@@ -1,9 +1,11 @@
 /* unistd odds and ends. */
 #include <errno.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <uapi/syscall.h>
 
 int fsync(int fd)
@@ -78,5 +80,72 @@ long readlink(const char *path, char *buf, size_t size)
     (void)size;
     errno = EINVAL;                     /* nothing is a symbolic link */
     return -1;
+}
+
+/* ---- execl and friends: the argument list becomes a vector ---- */
+
+#define EXECL_MAX 256
+
+static int collect_args(const char *arg, va_list ap, char **argv)
+{
+    int n = 0;
+    argv[n++] = (char *)arg;
+    while (arg && n < EXECL_MAX) {
+        arg = va_arg(ap, const char *);
+        argv[n++] = (char *)arg;
+    }
+    if (arg) {
+        errno = E2BIG;
+        return -1;
+    }
+    return n;
+}
+
+int execl(const char *path, const char *arg, ...)
+{
+    char *argv[EXECL_MAX + 1];
+    va_list ap;
+    va_start(ap, arg);
+    int n = collect_args(arg, ap, argv);
+    va_end(ap);
+    return n < 0 ? -1 : execv(path, argv);
+}
+
+int execlp(const char *file, const char *arg, ...)
+{
+    char *argv[EXECL_MAX + 1];
+    va_list ap;
+    va_start(ap, arg);
+    int n = collect_args(arg, ap, argv);
+    va_end(ap);
+    return n < 0 ? -1 : execvp(file, argv);
+}
+
+int execle(const char *path, const char *arg, ...)
+{
+    char *argv[EXECL_MAX + 1];
+    va_list ap;
+    va_start(ap, arg);
+    int n = collect_args(arg, ap, argv);
+    char *const *envp = n < 0 ? 0 : va_arg(ap, char *const *);
+    va_end(ap);
+    return n < 0 ? -1 : execve(path, argv, envp);
+}
+
+/* ---- file times ---- */
+
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags)
+{
+    long r = __syscall(SYS_utimensat, dirfd, (long)path, (long)times, flags, 0, 0);
+    if (r < 0) {
+        errno = (int)-r;
+        return -1;
+    }
+    return 0;
+}
+
+int futimens(int fd, const struct timespec times[2])
+{
+    return utimensat(fd, 0, times, 0);
 }
 

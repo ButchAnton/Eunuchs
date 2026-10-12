@@ -11,13 +11,13 @@ Eunuchs manages memory in five layers. A buddy allocator hands out physical page
 - Kernel heap: `kmalloc`, `kzalloc`, `kfree`, `ksize`, and named caches (`kmem_cache_create`, `kmem_cache_alloc`, `kmem_cache_free`).
 - The kernel page table: building it in `vm_init`, `vm_map`/`vm_unmap`, `ioremap`, lookups (`vm_translate`, `vm_walk`), and lazily propagating new kernel top-level entries into process page tables.
 - Guarded kernel thread stacks in a dedicated virtual area (`kstack_alloc`, `kstack_free`), including the TLB shootdown needed to unmap them.
-- User address spaces: creation, VMA list, demand-zero paging, COW fork, teardown, cross-address-space reads and writes, activation on context switch.
+- User address spaces: creation, VMA list, changing protections (`vma_protect`, behind `mprotect`), demand-zero paging, COW fork, teardown, cross-address-space reads and writes, activation on context switch.
 - Safe kernel access to user memory (`copy_from_user`, `copy_to_user`, `strncpy_from_user`) and fault-tolerant debug accessors (`safe_read_*`, `safe_write_*`), both through the exception table.
 - Corruption detection and reporting (`mm_corruption`, `heapcheck`, `slab leaks`, fault hints).
 
 **It does not handle:**
 
-- System-call argument parsing for `brk`, `mmap` and `munmap`. Those live in `kernel/proc/syscall.c` (`do_mmap`, `do_munmap` and the brk handler), which call `vma_add`/`vma_unmap`.
+- System-call argument parsing for `brk`, `mmap`, `munmap` and `mprotect`. Those live in `kernel/proc/syscall.c` (`do_mmap`, `do_munmap`, `do_mprotect` and the brk handler), which call `vma_add`/`vma_unmap`/`vma_protect`.
 - ELF loading (`kernel/proc/elf.c: elf_load`, which uses `vma_add` and `uvm_populate`) and building the initial user stack (`kernel/proc/proc.c`, which uses `uvm_write`).
 - Signal delivery and the crash report for a failed user fault (`user_fault` in `kernel/proc`).
 - The IPI transport. TLB shootdown (`kernel/arch/riscv/smp.c: tlb_shootdown`) is documented here, but IPIs, `ipi_poll` and stop-the-world belong to the SMP subsystem.
@@ -412,6 +412,13 @@ Only kernel mappings need shootdowns. A user page table is live on at most one C
 - `vma_add` validates its arguments (`-EINVAL`) and rejects overlaps (`-EEXIST`). It allocates the VMA with `kzalloc` and inserts it in sorted position under `vma_lock`.
 - `vma_find` is a linear search.
 - `vma_unmap(start, end)` handles each overlapping VMA in turn. It first unmaps the pages, then, under `vma_lock`, removes the VMA, trims it at either end, or splits it (the tail is re-added with `vma_add`).
+- `vma_protect(mm, start, end, prot)` (behind `mprotect`) changes the protection of a page-aligned range:
+  1. The whole range must be covered by VMAs without holes (`-ENOMEM` otherwise), as on Linux.
+  2. Each overlapping VMA whose protection differs is split at `start` and `end` (the outside parts are re-added with `vma_add` and keep the old protection), and the inside part gets the new `prot`.
+  3. Present PTEs are rewritten: `R` and `X` follow `prot`. Write permission is **never** put directly into a PTE that lacked it: such a page becomes `PTE_COW`, and the first write fault takes it (refcount 1) or copies it (shared). This is needed because `mm_fork` shares read-only pages without marking them COW, so making one writable in place would let the process write into its parent's or child's page. A page that was writable and stays writable keeps `W`; a page that loses write permission keeps a `COW` mark that the VMA check in `uvm_fault` makes harmless.
+  4. `sfence.vma` if the mm is active. If the new protection includes execute, a local `fence.i` plus `sbi_remote_fence_i` to every hart, so code written through the data cache is what the instruction fetch sees on whichever hart the process runs next.
+  The `mprotect` system call (226, `do_mprotect`) checks alignment and the range, refuses `PROT_WRITE|PROT_EXEC` with `EACCES` (W^X, as for `mmap`), and rounds the length up to whole pages. `tcc -run` uses it to make freshly generated code executable ([13](13-toolchain.md)).
+- `brk` and `mprotect`: if the top of the heap was given another protection (tcc's `-run` memory comes from `malloc`, so from the heap), `do_brk` starts a new `heap` VMA at the old top instead of growing the changed one.
 
 **Page-table walks:**
 
@@ -557,7 +564,7 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 
 ### System calls built on this subsystem
 
-`brk`, `mmap` (anonymous private only, W^X enforced) and `munmap` are in `kernel/proc/syscall.c`. `fork` and `execve` (`kernel/proc/proc.c`) use `mm_fork`, `mm_create`, `uvm_write`, `vm_activate` and `mm_destroy`.
+`brk`, `mmap` (anonymous private only, W^X enforced), `munmap` and `mprotect` (W^X enforced) are in `kernel/proc/syscall.c`. `fork` and `execve` (`kernel/proc/proc.c`) use `mm_fork`, `mm_create`, `uvm_write`, `vm_activate` and `mm_destroy`.
 
 ### Boot options
 
@@ -666,12 +673,14 @@ Kernel faults land in `panic_trap` with a `vm_fault_hint` diagnosis, such as "po
 
 **User memory:**
 
-- **No `mprotect`, no file-backed or shared mappings** (`do_mmap` accepts only `MAP_ANONYMOUS|MAP_PRIVATE`), **no swapping, no OOM killer.** A failed demand-page allocation sends `SIGBUS` to the faulting process.
+- **No file-backed or shared mappings** (`do_mmap` accepts only `MAP_ANONYMOUS|MAP_PRIVATE`), **no swapping, no OOM killer.** A failed demand-page allocation sends `SIGBUS` to the faulting process.
 - **`mmap` uses a bump pointer.** `mmap_next` only grows, and holes left by `munmap` are never reused.
 - **User page-table pages are freed only by `mm_destroy`.** `munmap` leaves empty tables in place.
 - **No locking for the user mm.** Correctness depends on processes having exactly one thread. Adding threads would need an mm lock and user TLB shootdowns.
 - **VMA operations are linear.** VMAs are a linked list, so lookups and inserts are O(n), and `mm_fork` re-inserts each VMA with `vma_add`.
 - **`vma_unmap` can leave a hole on failure.** If `vma_add` for the tail fails while splitting a VMA, the pages are already unmapped and the original VMA has already been trimmed. The tail part of the mapping silently disappears (the error is returned).
+- **`vma_protect` is not failure-atomic.** If a split's `vma_add` fails part way through a multi-VMA range, the VMAs already processed keep their new protection.
+- **Making memory executable is expensive.** Every `mprotect` that adds `PROT_EXEC` sends a remote `fence.i` to all harts through SBI, whether or not they ever ran the process.
 - **`uvm_write` counts as faults.** It calls `uvm_fault` for every page it writes, so `mm->faults` includes exec-time stack writes.
 
 **Uaccess and extable:**
@@ -706,3 +715,4 @@ Kernel faults land in `panic_trap` with a `vm_fault_hint` diagnosis, such as "po
 14. **Boot option to slim slab debugging** — For example `noslabdebug`, which drops the metadata and redzones and uses a compact slot layout. This would allow measuring and running without the 48 bytes per object of overhead, as `nopoison` already does for pages. Impact: low. Effort: medium.
 15. **Host tests for slab and uvm logic** — Only `buddy.c` is host-tested. Factoring the pure parts of `slab.c` (slot geometry, free-list handling, redzone checks) and of `uvm.c` (VMA list operations, `next_present`) so they can run under ASan would catch bugs like items 1 and 3 earlier. Impact: medium. Effort: medium.
 16. **Atomic statistics** — Use `__atomic_add_fetch` (or the relevant lock) for `tlb_shootdowns`, `large_allocs`, `large_frees` and `large_active_bytes`, so that `/proc/slabinfo` and `cpus` show exact numbers under SMP. Impact: low. Effort: small.
+17. **Failure-atomic, targeted `mprotect`** — Allocate the split VMAs before changing anything, so `vma_protect` either fully succeeds or leaves the address space untouched; and send the remote `fence.i` only to harts that have run this `mm` since its last `fence.i` (a per-mm CPU mask), instead of every hart through SBI. Impact: low. Effort: small.

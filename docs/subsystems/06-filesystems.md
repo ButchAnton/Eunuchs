@@ -19,7 +19,7 @@ This subsystem turns one or more virtio disks into a Unix file tree. Three files
 - The block driver. `blk_rw`, `blk_count`, `blk_capacity` and `blk_print` are in `kernel/drivers/virtio_blk.c`; disks are numbered 0..`blk_count()-1` in the order the driver finds them. The filesystem calls `blk_rw` synchronously: the caller sleeps until the request completes.
 - The TTY line discipline (`tty_ops`, `kernel/drivers/tty.c`). devfs only exposes it as `/dev/console`, `/dev/tty0` and `/dev/tty`.
 - Sockets (`kernel/net/socket.c`). They are `struct file`s with their own `chr_ops`, and they plug into `ppoll` through `chr_ops.poll`.
-- Credentials and the `chmod`/`chown`/`access` system calls. These live in `kernel/proc/cred.c`, but they use `vfs_permission`, `namei` and `write_inode` from this subsystem.
+- Credentials and the `chmod`/`chown`/`access`/`utimensat` system calls. These live in `kernel/proc/cred.c`, but they use `vfs_permission`, `namei` and `write_inode` from this subsystem.
 - `exec`, which reads a whole program with `vfs_read_all` (`kernel/proc/proc.c`).
 - The generators behind most `/proc` files (`pmm_print`, `tcp_print`, ...). procfs only calls them.
 
@@ -29,7 +29,7 @@ This subsystem turns one or more virtio disks into a Unix file tree. Three files
 |---|---|
 | `kernel/include/fs.h` | All in-kernel FS types (`buf`, `inode`, `file`, `super_block`, `fs_ops`, `chr_ops`, `kdirent`) and prototypes; documents the lock order. |
 | `kernel/include/efs_format.h` | On-disk efs format, shared by the kernel and the host tool (only `<stdint.h>` types). |
-| `lib/include/uapi/fs.h` | ABI: `O_*`, `F_*`, `S_*`, `struct stat`, `struct dirent`, `R_OK..`, `PATH_MAX` (256), `NAME_MAX` (59). |
+| `lib/include/uapi/fs.h` | ABI: `O_*`, `F_*`, `S_*`, `struct stat` (with `st_mtim`/`st_ctim` timespecs), `UTIME_NOW`/`UTIME_OMIT`, `struct dirent`, `R_OK..`, `PATH_MAX` (256), `NAME_MAX` (59). |
 | `kernel/fs/bcache.c` | Buffer cache: `bread`, `bwrite`, `brelse`, `bpin`/`bunpin`, LRU, statistics. |
 | `kernel/fs/log.c` | Write-ahead log: `log_begin`/`log_end`/`log_write`, `commit`, `install`, recovery in `log_create`, crash points. |
 | `kernel/fs/efs.c` | efs `fs_ops`: `balloc`/`bfree`, inode read/write/alloc/free, `bmap`, `efs_truncate`, `efs_read`/`efs_write`, directories, `efs_mount`, `efs_label`. |
@@ -483,8 +483,13 @@ All of these take `sb->ns_lock` and run as one transaction, so each is atomic ac
   - procfs files and `/dev/kmsg` (`priv` set) are seekable; `SEEK_END` uses the snapshot length.
   - Seeking past EOF is allowed, and a later write leaves a hole.
 - **`fstat` / `fstatat`**: `vfs_stat` fills `struct stat`.
-  - `st_mode` = mode | `S_IFDIR`/`S_IFCHR`/`S_IFREG`; `st_blocks` = ⌈size/512⌉ (0 for devices); `st_dev` is always 0. Filesystems that keep no times (devfs, procfs) report the boot time as `st_mtime` and `st_ctime` (`boot_time_ns`, from the RTC minus the uptime).
+  - `st_mode` = mode | `S_IFDIR`/`S_IFCHR`/`S_IFREG`; `st_blocks` = ⌈size/512⌉ (0 for devices); `st_dev` is always 0. Times are POSIX `struct timespec`s: `st_mtim` and `st_ctim` hold seconds and nanoseconds split from the inode's nanosecond `mtime`/`ctime`, and `st_mtime`/`st_ctime` are macros for their `tv_sec` (until this change they were `u64` nanosecond fields). efs keeps no access time, so `st_atim`/`st_atime` are macros for the modification time. Filesystems that keep no times (devfs, procfs) report the boot time (`boot_time_ns`, from the RTC minus the uptime).
   - A pipe gets `S_IFIFO|0600`. For a procfs snapshot, `st_size` is the snapshot's length.
+- **`utimensat`** (88, `kernel/proc/cred.c: do_utimensat`), behind libc's `utimensat`, `futimens` and `touch`:
+  - A NULL path means the open file `dirfd` (that is `futimens`); otherwise `dirfd` must be `AT_FDCWD` (`EINVAL`) and the path is looked up.
+  - `times` NULL means now. Otherwise `times[0]` (access time) is ignored and `times[1]` gives the modification time: `UTIME_NOW`, `UTIME_OMIT` (change nothing), or an explicit time (`tv_nsec` must be in 0..999,999,999 and `tv_sec` ≥ 0, else `EINVAL`).
+  - Permissions: root, or the owner, may do anything. Others may only set the time to now, and only with write permission through the group or other bits; an explicit time gives `EPERM`, a missing write permission `EACCES`. A filesystem without `write_inode` (devfs, procfs) gives `EPERM`.
+  - It sets `mtime` and sets `ctime` to now, inside a transaction, and writes the inode. Like `chmod`, it begins the transaction before taking the inode lock (see Concurrency).
 - **`getdents64`**: fills fixed 64-byte `struct dirent` records (`d_ino`, `d_type`, `d_name[59]`) and advances `f->off` after each record it copies.
 - **`chdir`**: requires a directory and swaps `p->cwd` under `proc_lock`.
 - **`getcwd`**: returns the length including the NUL.
@@ -648,7 +653,7 @@ ns_lock  ->  fs_begin_op (log space)  ->  inode lock(s) (dir, then entry)  ->  b
 - `create_in` and `unlink_locked` hold the directory and then the child.
 - `iput`'s free path takes the inode lock inside a (possibly nested) transaction.
 
-**Exceptions to the order.** `vfs_open` with `O_TRUNC`, `cred.c: chmod_inode` and `do_fchownat` take `ilock` *before* `fs_begin_op`. Waiting for log space while holding an inode lock can deadlock with an operation that is already admitted and waits for that inode. Example: a `file_write` that has begun and is waiting for `ilock`, while enough blocks are pending that the opener cannot be admitted until that writer finishes. lockdep does not see the log space as a lock, so it cannot report this. The hung-thread detector (mutex waits over 30 s) would.
+**No exceptions to the order.** `vfs_open` with `O_TRUNC`, `cred.c: chmod_inode`, `do_fchownat` and `do_utimensat` used to take `ilock` *before* `fs_begin_op`. Waiting for log space while holding an inode lock can deadlock with an operation that is already admitted and waits for that inode (a `file_write` that has begun and waits for `ilock`, while enough blocks are pending that the other operation cannot be admitted until that writer finishes). They now begin the transaction first; `vfs_open` drops the inode lock to do so and takes it again. lockdep does not see log space as a lock, so it could not have reported the old order; the hung-thread detector (mutex waits over 30 s) would have.
 
 **Transactions and sleeping:**
 - `commit` runs in the thread that ended the last operation, with no spinlocks held. It sleeps on disk I/O.
@@ -713,6 +718,7 @@ Numbers are Linux RISC-V (`lib/include/uapi/syscall.h`).
 | 48 | faccessat | `cred.c: do_faccessat` | uses the effective ids |
 | 49 | chdir | `do_chdir` | |
 | 52 / 53 / 54 | fchmod / fchmodat / fchownat | `cred.c` | |
+| 88 | utimensat | `cred.c: do_utimensat` | see below |
 | 56 / 57 | openat / close | `do_openat`, `do_close` | |
 | 59 | pipe2 | `do_pipe2` | `O_CLOEXEC` only |
 | 61 | getdents64 | `do_getdents64` | 64-byte `struct dirent` |
@@ -818,7 +824,6 @@ Export them to Perfetto as described in `DEBUGGING.md`.
   - A large rename-over (unlink of a big target plus link, unlink and `..` updates) can also exceed its 16-block reservation.
 
 **Locking:**
-- The `ilock` → `fs_begin_op` order in `vfs_open` (`O_TRUNC`), `chmod_inode` and `do_fchownat` is the reverse of the documented order, and can deadlock under log pressure (see Concurrency).
 - `bhint`, `nfree_blocks` and `nfree_inodes` are updated without a lock; `efs_info.alloc_lock` is never used. The counters can drift under concurrent allocation. The ktest `fs_no_errors_recorded` compares the block counter with the bitmap, but only once.
 
 **Inode cache:**
@@ -827,7 +832,9 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 
 **Missing features:**
 - No symlinks, no `ftruncate`/`truncate`, no `*at` system calls relative to a directory fd, no mount or unmount system call, no atime.
-- `ctime` is set only when the inode is allocated: `chmod`, `chown` and `link` do not update it.
+- `ctime` is set only when the inode is allocated and by `utimensat`: `chmod`, `chown` and `link` do not update it.
+- No access time: `utimensat` ignores `times[0]` and `stat` reports the modification time as `st_atime`.
+- `utimensat` accepts only `AT_FDCWD` (or a NULL path with an fd) and ignores its flags (there are no symlinks for `AT_SYMLINK_NOFOLLOW` to matter).
 - `st_dev` is always 0, so inode numbers from efs, devfs and procfs collide in `stat`, and so do those of the root and `/home` filesystems (both start at inode 1). Tools that detect hard links or loops by (`st_dev`, `st_ino`) can be fooled across the mount.
 - Ids are 16 bits; there are no supplementary groups and no sticky bit.
 - `faccessat` checks the effective ids, where POSIX uses the real ids.
@@ -879,7 +886,7 @@ Export them to Perfetto as described in `DEBUGGING.md`.
    - Check `bwrite` results in `commit`, `install` and `write_head`, and do not write the commit point if any log block write failed. Mark the filesystem read-only or panic on a failed install.
 
    Today a failed read is cached as valid data, and a failed log write can still be "committed". Impact: high. Effort: medium.
-2. **Restore a single lock order for transactions**: in `vfs_open` (`O_TRUNC`), `cred.c: chmod_inode` and `do_fchownat`, call `fs_begin_op` before `ilock`, as `file_write` and the namespace operations do. This removes a deadlock that lockdep cannot see. Impact: high. Effort: small.
+2. **Restore a single lock order for transactions**: done; `vfs_open` (`O_TRUNC`), `chmod_inode`, `do_fchownat` and `do_utimensat` now call `fs_begin_op` before `ilock` (see Concurrency).
 3. **Close the inode free/reuse race**:
    - In `iput`, invalidate the inode (`valid = false`) and unlink it from `icache` *before* releasing the on-disk inode, or hold off the bitmap/inode-table update until `refcnt` reaches 0.
    - Alternatively, have `efs_alloc_inode` refuse an inode number that is still in the cache.

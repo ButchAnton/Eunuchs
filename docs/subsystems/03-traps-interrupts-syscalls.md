@@ -444,6 +444,7 @@ ABI: `ecall` with `a7` = number, `a0`–`a5` = arguments; result in `a0`, `-errn
 | 80 | `fstat` | `kernel/fs/file.c: do_fstat` | Pipes report `S_IFIFO`. |
 | 81 | `sync` | `kernel/fs/file.c: do_sync` | No-op: every transaction is already on disk. |
 | 82 | `fsync` | `kernel/fs/file.c: do_fsync` | No-op apart from the fd check. |
+| 88 | `utimensat` | `kernel/proc/cred.c: do_utimensat` | Sets the modification time; a NULL path means the fd (`futimens`); `AT_FDCWD` only otherwise; `UTIME_NOW`/`UTIME_OMIT`; flags ignored. |
 | 93 | `exit` | `kernel/proc/syscall.c: do_exit` | `proc_exit(WEXITSTATUS_ENC(code))`; never returns. |
 | 101 | `nanosleep` | `kernel/proc/cred.c: do_nanosleep` | Fills the remainder; `-ERESTARTSYS` on a signal, restarted to the original deadline. |
 | 113 | `clock_gettime` | `kernel/proc/cred.c: do_clock_gettime` | `CLOCK_REALTIME` (RTC) and `CLOCK_MONOTONIC` (`rdtime`) only. |
@@ -476,11 +477,12 @@ ABI: `ecall` with `a7` = number, `a0`–`a5` = arguments; result in `a0`, `-errn
 | 208 | `setsockopt` | `kernel/net/socket.c: do_setsockopt` | Accepts and ignores `SO_REUSEADDR/RCVBUF/SNDBUF`, `TCP_NODELAY`; else `ENOPROTOOPT`. |
 | 209 | `getsockopt` | `kernel/net/socket.c: do_getsockopt` | `SOL_SOCKET` only (e.g. `SO_ERROR`). |
 | 210 | `shutdown` | `kernel/net/socket.c: do_shutdown` | |
-| 214 | `brk` | `kernel/proc/syscall.c: do_brk` | Returns the new break, or the old one on failure (Linux style). Grows/shrinks the heap VMA. |
+| 214 | `brk` | `kernel/proc/syscall.c: do_brk` | Returns the new break, or the old one on failure (Linux style). Grows/shrinks the heap VMA, or starts a new one if `mprotect` changed the top of the heap. |
 | 215 | `munmap` | `kernel/proc/syscall.c: do_munmap` | |
 | 220 | `fork` | `kernel/proc/syscall.c: do_fork` → `proc.c: sys_fork` | No arguments (Linux 220 is `clone`). Child gets `a0 = 0`. |
 | 221 | `execve` | `kernel/proc/syscall.c: do_execve` → `proc.c: sys_execve` | On success returns `argc` into the new image's `a0`. |
-| 222 | `mmap` | `kernel/proc/syscall.c: do_mmap` | Anonymous private only; `PROT_WRITE|PROT_EXEC` → `EACCES`; address hint ignored; a guard page between mappings. |
+| 222 | `mmap` | `kernel/proc/syscall.c: do_mmap` | Anonymous private only; `PROT_WRITE\|PROT_EXEC` → `EACCES`; address hint ignored; a guard page between mappings. |
+| 226 | `mprotect` | `kernel/proc/syscall.c: do_mprotect` → `uvm.c: vma_protect` | Page-aligned start; the whole range must be mapped (`ENOMEM`); `PROT_WRITE\|PROT_EXEC` → `EACCES`; splits VMAs; `fence.i` on every hart when execute is added. |
 | 242 | `accept4` | `kernel/net/socket.c: do_accept4` | |
 | 260 | `wait4` | `kernel/proc/syscall.c: do_wait4` → `proc.c: sys_wait4` | `rusage` ignored; `-ERESTARTSYS` when interrupted. |
 | 500 | `sleep_ms` | `kernel/proc/syscall.c: do_sleep_ms` | Eunuchs-specific. `EINTR` if a signal is pending afterwards (not restarted). |

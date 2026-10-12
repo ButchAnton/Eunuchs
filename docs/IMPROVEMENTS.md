@@ -35,7 +35,6 @@ The system is a single-user teaching OS running in a VM, but it does have users 
 
 | # | Bug | Where | Consequence |
 |---|---|---|---|
-| H1 | Transactions and inode locks are taken in both orders ✔ | `fs/vfs.c: vfs_open` (`O_TRUNC`), `proc/cred.c: chmod_inode`, `do_fchownat` take `ilock` before `fs_begin_op`; writes do the reverse | Can deadlock waiting for log space; lockdep cannot see it (log space is not a lock) |
 | H2 | Retry loop on safe accesses to user memory (likely) | `arch/riscv/trap.c: trap_handler`: the copy-on-write/demand-paging retry matches every exception-table entry, including `safe_read_*` | A `safe_read` of a mapped user address (monitor `mem 0x10000` after a user breakpoint, a backtrace into user space) faults forever |
 | H3 | netd can miss its wakeup | `net/net.c: netd`: checks for pending timers, drops `net_lock`, then waits; a `net_kick` in between is lost | TCP timers stall until the next packet arrives |
 | H4 | Any trap after a stack overflow halts | `arch/riscv/trap.c: stack_overflow`: `overflow_sp` is never cleared | The overflow report's own `safe_read` faults turn into "overflow while handling overflow" and QEMU exits |
@@ -108,6 +107,7 @@ The stale statements in `docs/` were fixed during the review; the comments in th
 - **mkfs file modes.** mkfs now takes file modes from the host: 0755 for executables, 0644 for everything else (`/etc/passwd` included).
 - **The kernel could have used floating point.** It was compiled for `rv64gc` while saving no FP state. It is now built for `rv64imac_zicsr_zifencei`/`lp64`, so the compiler cannot emit an FP instruction in kernel code; `fp.S` is the only kernel code that touches the FP registers ([11](subsystems/11-build-and-testing.md#compiler-flags-and-why)).
 - **Editor and libc bugs found while documenting them**: `vi -R` argument order, `:g` without a command, `:noh`, out-of-range addresses, `:wq` with other modified buffers, `:%m0`, `:r !cmd` with no output, pasting macro registers, prompt histories, emacs `C-x C-c`'s prompt, `M-` digit arguments and `M-%` with an empty replacement; `fscanf` losing read-ahead (now `ungetc` backs up in the buffer); prefix-matched regex class names; `round`, NaN and huge arguments in `math.c`; misplaced declarations in `unistd.h`.
+- **H1, transactions and inode locks in both orders.** `vfs_open` (`O_TRUNC`), `chmod_inode`, `do_fchownat` and `do_utimensat` took the inode lock before `fs_begin_op`, which could deadlock waiting for log space. They now begin the transaction first, as writes do ([06](subsystems/06-filesystems.md)).
 - **C10 and the old shell's wrong behavior.** The shell was replaced by [esh](subsystems/12-shell.md). It expands each command when it runs, applies redirections to builtins, has its own state per `source`, and frees per-command memory. It has no fixed word limits, and doesn't use process groups when not interactive.
 
 ## 2. Top recommendations
@@ -120,7 +120,7 @@ Ranked by value for effort. The first group is mostly small fixes for the bugs a
 |---:|---|:-:|:-:|---|
 | 1 | Permission checks: `kill`, `SYS_debug`, `TIOCSCTTY`/`TIOCSPGRP` | H | S | S1, S4 |
 | 2 | Exec from the already-checked inode; harden the ELF parser and symbolizer | H | S | S2, S3 |
-| 3 | One lock order for transactions (`fs_begin_op` before `ilock` everywhere) | H | S | H1 |
+| 3 | One lock order for transactions (`fs_begin_op` before `ilock` everywhere): done, see 1.6 | H | S | H1 |
 | 4 | Make double frees of coalesced pages detectable (poison and flag every page of a free block) | H | S | C1 |
 | 5 | Limit the uaccess retry to `copy_*_user` instructions (a separate exception table or flag) | H | S | H2 |
 | 6 | Fix `strace_enter` bounds; clear `overflow_sp` after reporting | H | S | S5, H4 |
@@ -196,7 +196,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Per-CPU page and object caches (M/L).
 - Host tests for the slab and `uvm` logic (M/M).
 - Smaller items:
-  - failure-atomic `vma_unmap`, robust `ioremap`, atomic statistics (L/S);
+  - failure-atomic `vma_unmap` and `vma_protect`, remote `fence.i` only to harts that ran the process, robust `ioremap`, atomic statistics (L/S);
   - freeing empty user page tables and reusing `mmap` holes, and a boot option to slim down slab debugging (L/M).
 
 ### [Traps, interrupts and system calls](subsystems/03-traps-interrupts-syscalls.md#potential-improvements)
@@ -307,6 +307,12 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - `SIGWINCH` from the console (L/S).
 - Smaller items: cache parsed functions; shared history between running shells; wide characters; time zones; process substitution.
 
+### [The native toolchain](subsystems/13-toolchain.md#potential-improvements)
+- Line numbers from `-g` DWARF in kernel fault reports (M/M).
+- Self-hosting: tcc's own sources in `/usr/src` (M/S).
+- `make -j` (M/M); more GNU make (`define`, `$(call)`, `$(eval)`, `vpath`) (M/M).
+- `tcc -run` without `mprotect` (a fallback through `/tmp` and `exec`) (L/S); a smaller `libtcc1.a` (L/S).
+
 ### [Build and testing](subsystems/11-build-and-testing.md#potential-improvements)
 - Stage selection (H/M).
 - Hangs become failures (H/S).
@@ -327,6 +333,7 @@ Bigger projects that would each change what the system can do. They are listed r
 - **Floating point for user programs.** User code is built for `rv64gc`/`lp64d`. The kernel enables FP per thread on its first FP instruction, saves and restores the registers at context switches of threads that use them, copies them at `fork`, resets them at `exec`, and carries them in signal frames ([03](subsystems/03-traps-interrupts-syscalls.md#lazy-floating-point-for-user-programs)).
 - **A real C library.** Buffered `FILE` stdio, `printf` with floating point, `scanf`, `strto*`, `qsort`, `getopt`, `math.h`, `strftime`, `setjmp`/`sigsetjmp`, and POSIX regular expressions (BRE and ERE) ([10](subsystems/10-user-space.md#stdio-streams)).
 - **Several disks and a persistent `/home`.** Up to four virtio disks, a buffer cache keyed by disk, a log per filesystem, volume labels, and `home.img`, which survives rebuilds ([06](subsystems/06-filesystems.md#boot-and-mounting)).
+- **A native C toolchain.** TinyCC runs on Eunuchs (`/bin/tcc`, with `tcc -run` through the new `mprotect`), with a sysroot in `/usr`, a POSIX `make`, and the sources of every program in `/usr/src`, rebuilt in about 6 seconds in the guest ([13](subsystems/13-toolchain.md)).
 - **A text editor.** `edit`, with a vi personality (operators, text objects, visual mode, registers, macros, ex commands) and an emacs one (kill ring, incremental search, query-replace, `M-x`) ([10](subsystems/10-user-space.md#the-editor-vi-and-emacs)).
 
 | Direction | What it involves | Why |

@@ -8,6 +8,7 @@
 #define SBI_EXT_IPI   0x735049   /* "sPI"  */
 #define SBI_EXT_HSM   0x48534D   /* "HSM"  */
 #define SBI_EXT_SRST  0x53525354 /* "SRST" */
+#define SBI_EXT_RFENCE 0x52464E43 /* "RFNC" */
 
 struct sbiret {
     long error;
@@ -27,6 +28,7 @@ const char *sbi_impl_name(long id);
 
 void sbi_set_timer(u64 stime);
 long sbi_send_ipi(unsigned long hart_mask, unsigned long hart_mask_base);
+long sbi_remote_fence_i(unsigned long hart_mask, unsigned long hart_mask_base);
 long sbi_hart_start(unsigned long hartid, unsigned long start_addr, unsigned long opaque);
 long sbi_hart_status(unsigned long hartid);
 

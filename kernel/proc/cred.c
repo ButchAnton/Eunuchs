@@ -58,22 +58,29 @@ static long get_inode(uintptr_t upath, struct inode **ipp)
     return *ipp ? 0 : err;
 }
 
+/*
+ * Inode changes take the transaction before the inode lock, as writes do:
+ * the other order can deadlock waiting for log space.
+ */
 static long chmod_inode(struct inode *ip, u64 mode)
 {
     struct proc *p = current_proc();
+    if (!ip->sb->ops->write_inode) {
+        iput(ip);
+        return -EPERM;
+    }
+    fs_begin_op(ip->sb);
     ilock(ip);
     long r = 0;
     if (p->euid != 0 && p->euid != ip->uid) {
         r = -EPERM;
-    } else if (!ip->sb->ops->write_inode) {
-        r = -EPERM;
     } else {
-        fs_begin_op(ip->sb);
         ip->mode = mode & 07777;
         ip->sb->ops->write_inode(ip);
-        fs_end_op(ip->sb);
     }
-    iunlockput(ip);
+    iunlock(ip);
+    fs_end_op(ip->sb);
+    iput(ip);
     return r;
 }
 
@@ -94,6 +101,69 @@ long do_fchmod(const u64 *a)
     return chmod_inode(idup(p->files[a[0]]->ip), a[1]);
 }
 
+u64 rtc_time_ns(void);
+
+/*
+ * utimensat(dirfd, path, times, flags): set a file's modification time
+ * (efs keeps no access time, so times[0] is accepted and ignored). A NULL
+ * path means the open file dirfd (futimens). NULL times means now.
+ */
+long do_utimensat(const u64 *a)
+{
+    struct proc *p = current_proc();
+    struct inode *ip;
+    if (!a[1]) {
+        if (a[0] >= NOFILE || !p->files[a[0]] || !p->files[a[0]]->ip)
+            return -EBADF;
+        ip = idup(p->files[a[0]]->ip);
+    } else {
+        if ((long)a[0] != AT_FDCWD)
+            return -EINVAL;
+        long r = get_inode(a[1], &ip);
+        if (r)
+            return r;
+    }
+    u64 now = rtc_time_ns(), mtime = now;
+    int omit = 0, explicit_time = 0;
+    if (a[2]) {
+        struct timespec ts[2];
+        if (copy_from_user(ts, a[2], sizeof(ts))) {
+            iput(ip);
+            return -EFAULT;
+        }
+        if (ts[1].tv_nsec == UTIME_OMIT) {
+            omit = 1;
+        } else if (ts[1].tv_nsec != UTIME_NOW) {
+            if (ts[1].tv_nsec < 0 || ts[1].tv_nsec >= 1000000000 || ts[1].tv_sec < 0) {
+                iput(ip);
+                return -EINVAL;
+            }
+            mtime = (u64)ts[1].tv_sec * 1000000000ULL + (u64)ts[1].tv_nsec;
+            explicit_time = 1;
+        }
+    }
+    if (!ip->sb->ops->write_inode) {
+        iput(ip);
+        return -EPERM;
+    }
+    fs_begin_op(ip->sb);
+    ilock(ip);
+    long r = 0;
+    /* setting a chosen time needs ownership; "now" also needs write permission */
+    if (p->euid != 0 && p->euid != ip->uid &&
+        (explicit_time || !(ip->mode & (p->egid == ip->gid ? 0020 : 0002)))) {
+        r = explicit_time ? -EPERM : -EACCES;
+    } else if (!omit) {
+        ip->mtime = mtime;
+        ip->ctime = now;
+        ip->sb->ops->write_inode(ip);
+    }
+    iunlock(ip);
+    fs_end_op(ip->sb);
+    iput(ip);
+    return r;
+}
+
 long do_fchownat(const u64 *a)
 {
     struct inode *ip;
@@ -104,19 +174,20 @@ long do_fchownat(const u64 *a)
     long r = get_inode(a[1], &ip);
     if (r)
         return r;
-    ilock(ip);
-    if (ip->sb->ops->write_inode) {
-        fs_begin_op(ip->sb);
-        if ((long)a[2] != -1)
-            ip->uid = (u16)a[2];
-        if ((long)a[3] != -1)
-            ip->gid = (u16)a[3];
-        ip->sb->ops->write_inode(ip);
-        fs_end_op(ip->sb);
-    } else {
-        r = -EPERM;
+    if (!ip->sb->ops->write_inode) {
+        iput(ip);
+        return -EPERM;
     }
-    iunlockput(ip);
+    fs_begin_op(ip->sb);
+    ilock(ip);
+    if ((long)a[2] != -1)
+        ip->uid = (u16)a[2];
+    if ((long)a[3] != -1)
+        ip->gid = (u16)a[3];
+    ip->sb->ops->write_inode(ip);
+    iunlock(ip);
+    fs_end_op(ip->sb);
+    iput(ip);
     return r;
 }
 

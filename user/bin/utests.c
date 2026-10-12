@@ -207,6 +207,62 @@ static void t_brk(void)
     CHECK(sbrk(0) == a);
 }
 
+static int child_status(void (*fn)(void *), void *arg)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        fn(arg);
+        _exit(0);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return st;
+}
+
+static void poke(void *p) { *(volatile char *)p = 1; }
+
+static void cow_after_mprotect(void *p)
+{
+    _exit(mprotect(p, 4096, PROT_READ | PROT_WRITE) == 0 && (*(volatile char *)p = 'B') == 'B' ? 0 : 1);
+}
+
+static void t_mprotect(void)
+{
+    char *p = mmap(0, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(p != MAP_FAILED);
+    p[0] = 'a', p[4096] = 'b', p[8192] = 'c';
+    /* the middle page read-only: the mapping splits in three */
+    CHECK(mprotect(p + 4096, 4096, PROT_READ) == 0);
+    int st = child_status(poke, p + 4096);
+    CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
+    p[0] = 'A', p[8192] = 'C';                          /* the neighbours stay writable */
+    CHECK(p[4096] == 'b');
+    CHECK(mprotect(p + 4096, 4096, PROT_READ | PROT_WRITE) == 0);
+    p[4096] = 'B';
+    CHECK(p[0] == 'A' && p[4096] == 'B' && p[8192] == 'C');
+    CHECK(mprotect(p, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == -1 && errno == EACCES);   /* W^X */
+    CHECK(mprotect(p + 1, 4096, PROT_READ) == -1 && errno == EINVAL);
+
+    /* code written to a page runs once the page is executable: li a0, 42; ret */
+    unsigned *code = (unsigned *)p;
+    code[0] = 0x02a00513;
+    code[1] = 0x00008067;
+    CHECK(mprotect(p, 4096, PROT_READ | PROT_EXEC) == 0);
+    int (*fn)(void) = (int (*)(void))(void *)p;
+    CHECK(fn() == 42);
+    st = child_status(poke, p);                         /* and is no longer writable */
+    CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
+
+    /* a read-only page shared by fork that one side makes writable is copied, not shared */
+    CHECK(mprotect(p + 8192, 4096, PROT_READ) == 0);
+    st = child_status(cow_after_mprotect, p + 8192);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(p[8192] == 'C');
+
+    CHECK(munmap(p, 3 * 4096) == 0);
+    CHECK(mprotect(p, 4096, PROT_READ) == -1 && errno == ENOMEM);          /* nothing mapped */
+}
+
 /* ---- files ---- */
 
 static int write_file(const char *path, const char *data, int flags)
@@ -727,6 +783,31 @@ static void t_tty(void)
     waitpid(pid, &st, 0);
 }
 
+static void t_utimensat(void)
+{
+    const char *path = "/tmp/ut_times";
+    CHECK(write_file(path, "x", O_TRUNC) == 0);
+    struct stat st;
+    struct timespec ts[2] = { { 0, UTIME_OMIT }, { 1000000000, 0 } };   /* 2001-09-09 */
+    CHECK(utimensat(AT_FDCWD, path, ts, 0) == 0);
+    CHECK(stat(path, &st) == 0 && st.st_mtime == 1000000000);
+    ts[1].tv_nsec = UTIME_OMIT;                                         /* leaves it alone */
+    CHECK(utimensat(AT_FDCWD, path, ts, 0) == 0);
+    CHECK(stat(path, &st) == 0 && st.st_mtime == 1000000000);
+    CHECK(utimensat(AT_FDCWD, path, 0, 0) == 0);                        /* now */
+    CHECK(stat(path, &st) == 0 && st.st_mtime >= time(0) - 5);
+    int fd = open(path, O_RDONLY);
+    ts[1].tv_sec = 2000000000;
+    ts[1].tv_nsec = 0;
+    CHECK(futimens(fd, ts) == 0);
+    close(fd);
+    CHECK(stat(path, &st) == 0 && st.st_mtime == 2000000000);
+    ts[1].tv_nsec = 1000000000;
+    CHECK(utimensat(AT_FDCWD, path, ts, 0) == -1 && errno == EINVAL);
+    CHECK(utimensat(AT_FDCWD, "/tmp/ut_no_such_file", 0, 0) == -1 && errno == ENOENT);
+    unlink(path);
+}
+
 static void t_permissions(void)
 {
     CHECK(getuid() == 0 && geteuid() == 0);
@@ -1022,7 +1103,9 @@ static void fp_clobber_handler(int sig)
 {
     (void)sig;
     /* use the FP registers the interrupted code was using */
-    asm volatile("fmv.d.x ft0, zero\n\tfmv.d.x fs1, zero" ::: "ft0", "fs1");
+    /* fmv.d.x ft0, zero; fmv.d.x fs1, zero, encoded: tcc's assembler lacks them
+       (.long is 4 bytes in both assemblers; tcc's .word is 2) */
+    asm volatile(".long 0xf2000053\n\t.long 0xf20004d3" ::: "ft0", "fs1");
 }
 
 static void t_float(void)
@@ -1054,14 +1137,22 @@ static void t_float(void)
         CHECK(waitpid(kids[i], &st, 0) == kids[i] && WIFEXITED(st) && WEXITSTATUS(st) == 0);
     }
 
-    /* a forked child starts with the parent's FP registers */
-    double inherited;
-    asm volatile("fld fs2, %0" :: "m"(want) : "fs2");
-    pid_t pid = fork();
-    if (pid == 0) {
-        asm volatile("fsd fs2, %0" : "=m"(inherited));
+    /* a forked child starts with the parent's FP registers. One asm block
+       loads fs2, forks and stores it: tcc saves and restores
+       clobbered registers around each asm statement, so fs2 can't be set in one
+       statement and read in another. */
+    double inherited = 0;
+    register long fa0 asm("a0") = 0;      /* "+r": keeps the other inputs out of a0 */
+    register long fa7 asm("a7") = SYS_fork;
+    asm volatile("fld fs2, 0(%1)\n\t"
+                 "ecall\n\t"
+                 "fsd fs2, 0(%2)"          /* the parent stores it too; only the child looks */
+                 : "+r"(fa0)
+                 : "r"(&want), "r"(&inherited), "r"(fa7)
+                 : "fs2", "memory");
+    pid_t pid = (pid_t)fa0;
+    if (pid == 0)
         _exit(inherited == want ? 0 : 1);
-    }
     int st;
     CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 
@@ -1072,13 +1163,14 @@ static void t_float(void)
     register long a0 asm("a0") = getpid();
     register long a1 asm("a1") = SIGUSR1;
     register long a7 asm("a7") = SYS_kill;
-    asm volatile("fld ft0, %3\n\t"
-                 "fld fs1, %3\n\t"
+    /* (addresses in registers rather than "m" operands, so tcc can build this too) */
+    asm volatile("fld ft0, 0(%1)\n\t"
+                 "fld fs1, 0(%1)\n\t"
                  "ecall\n\t"                /* kill(getpid(), SIGUSR1): the handler runs on return */
-                 "fsd ft0, %0\n\t"
-                 "fsd fs1, %1"
-                 : "=m"(after0), "=m"(after1), "+r"(a0)
-                 : "m"(before), "r"(a1), "r"(a7)
+                 "fsd ft0, 0(%2)\n\t"
+                 "fsd fs1, 0(%3)"
+                 : "+r"(a0)
+                 : "r"(&before), "r"(&after0), "r"(&after1), "r"(a1), "r"(a7)
                  : "ft0", "fs1", "memory");
     CHECK(after0 == 42.5 && after1 == 42.5);
     signal(SIGUSR1, SIG_DFL);
@@ -1314,6 +1406,8 @@ static const struct {
     { "kill", t_kill },
     { "sleep_and_ids", t_sleep_and_ids },
     { "brk", t_brk },
+    { "mprotect", t_mprotect },
+    { "utimensat", t_utimensat },
 };
 
 /*

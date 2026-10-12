@@ -10,7 +10,7 @@ What this subsystem does:
 - **System call wrappers.** One generic `__syscall` stub (`syscall.S`) plus a C wrapper per call (`libc.c`, `net.c`) that converts `-errno` returns into `-1` and `errno`.
 - **Library services.** Buffered stdio (`stdio.c`), formatted output (the kernel's `printf` core, shared through `lib/printf.c`, plus floating-point conversions compiled only for user space), `scanf`, string functions (`lib/string.c`, also shared, and `strings.c`), number conversion, sorting and searching, `getopt`, temporary files, heap allocation, environment handling, directory reading, `math.h`, time conversion and `strftime`, non-local jumps, regular expressions, `poll`/`select`, IPv4 address helpers, termios helpers and the Eunuchs-specific debug hooks (`dbg_*`).
 - **The shell.** `esh`, a zsh-like shell with a line editor (`user/bin/esh/`), is described in [12-shell.md](12-shell.md). This document covers only how it fits in.
-- **Commands.** `init` (pid 1), file and text tools, process tools, network tools and servers, and test programs (`utests`, `stress`, `segv`, ...).
+- **Commands.** `init` (pid 1), file and text tools, the pager, the editor, `make` (with `tcc`, see [13](13-toolchain.md)), process tools, network tools and servers, and test programs (`utests`, `stress`, `segv`, ...).
 - **Disk-image contents.** Which files and links go into `build/fs.img` (`Makefile`: `UPROGS`, `EUTILS_LINKS`, `FS_FILES`).
 
 What it does not do:
@@ -27,14 +27,15 @@ What it does not do:
 | `user/lib/crt0.S` | `_start`: sets `gp` and `fp`, computes `argc`/`argv`/`envp` from `sp`, calls `__libc_start`. |
 | `user/lib/syscall.S` | `__syscall(nr, a0..a5)` (shuffles arguments into `a7`, `a0`-`a5`, `ecall`) and `__restore_rt` (signal return trampoline). |
 | `user/lib/libc.c` | System call wrappers (process, file, credential, time, environment, terminal, signal), `strerror`/`strsignal`, `gmtime_r`, the `malloc` family, `getenv`/`setenv`/`unsetenv`, `exit`, `__libc_start`. |
-| `user/lib/stdio.c` | `FILE` streams: `stdin`/`stdout`/`stderr`, `fopen` family, buffered reads and writes, `printf` family, `getline`, `tmpfile`, `perror`; `atexit` and the exit hooks (`__libc_exit_hooks`). |
+| `user/lib/stdio.c` | `FILE` streams: `stdin`/`stdout`/`stderr`, `fopen` family, buffered reads and writes, `printf` family, `getline`, `tmpfile`, `perror`; `__stdio_flush_all`. |
+| `user/lib/exit.c` | `exit` and `atexit` (32 handlers), alone in their object so that `tcc -run`'s `runmain.o` can supply its own ([13](13-toolchain.md#tcc--run)). |
 | `user/lib/scanf.c` | `scanf`, `fscanf`, `sscanf` and their `v` forms. |
 | `user/lib/stdlib.c` | `strto*` (integers and floating point), `ato*`, `abs`/`div` families, `qsort`, `bsearch`, `rand`, `abort`, `__assert_fail`, `system`, `putenv`, `realpath`, `mkstemp`/`mktemp`/`mkdtemp`, `getopt`, `reallocarray`. |
 | `user/lib/strings.c` | The string functions not shared with the kernel: `strcpy`, `stpcpy`, `strncpy`, `strcat`, `strncat`, `strdup`, `strndup`, `strspn`, `strcspn`, `strpbrk`, `strtok`/`strtok_r`, `strsep`, `memchr`, `memrchr`, `strcasecmp`, `strncasecmp`, `strcoll`, `strxfrm`. |
 | `user/lib/math.c` | `math.h`: argument reduction and series in 128-bit `long double` (software), rounded to `double`. |
 | `user/lib/time.c` | `gmtime`, `localtime` (= UTC), `timegm`/`mktime`, `difftime`, `clock`, `asctime`/`ctime`, `strftime`, `tzset`. |
 | `user/lib/setjmp.S`, `user/lib/sigsetjmp.c` | `setjmp`/`longjmp` (callee-saved integer and FP registers), `sigsetjmp`/`siglongjmp` (optionally the signal mask). |
-| `user/lib/unistd2.c` | `fsync`, `ftruncate` (`ENOSYS`), `usleep`, `sysconf`, `gethostname`, `ttyname`, `symlink`/`readlink` stubs. |
+| `user/lib/unistd2.c` | `execl`, `execlp`, `execle` (the argument list becomes a vector), `utimensat`, `futimens`, `fsync`, `ftruncate` (`ENOSYS`), `usleep`, `sysconf`, `gethostname`, `ttyname`, `symlink`/`readlink` stubs. |
 | `user/lib/regex.c` | POSIX `regcomp`/`regexec`/`regerror`/`regfree`: BRE and ERE, by backtracking. |
 | `user/lib/net.c` | Socket wrappers, `poll`, `select` (on top of `ppoll`), `inet_aton`/`inet_addr`/`inet_ntoa`, `resolve_host`. |
 | `lib/printf.c` | `kvcbprintf` (callback-based formatter), `kvsnprintf`, `ksnprintf`. Shared with the kernel and host tests (`tests/host/test_printf.c`). The floating-point conversions and `%n` are inside `#ifdef FMT_FLOAT`, defined only for user code. |
@@ -129,7 +130,7 @@ struct FILE {
 - **Writing.** Bytes are copied into the buffer, which is flushed when full and, for a line-buffered stream, when it contains a `'\n'`. `flush_out` loops until everything is written (retrying `EINTR`); a failed or zero-length `write` sets the error flag and drops the pending bytes.
 - **Reading.** `fill` reads up to a buffer's worth. Before reading stdin (or any stream on fd 0) it flushes stdout, so a prompt without a newline appears before input is awaited. `fread` of `BUFSIZ` bytes or more reads straight into the caller's memory. `ungetc` of the character just read backs up within the read buffer, so several characters can be pushed back that way (`scanf` relies on it after reading ahead); otherwise one extra character is held in `ungot`.
 - **Switching direction and seeking.** `fseek` accounts for read-ahead and the pushed-back character; `fflush` of an input stream seeks the descriptor back over unread read-ahead. As in ISO C, a `+` stream needs an `fseek` (or `fflush`) between reading and writing.
-- **Exit.** `exit` (`libc.c`) calls `__libc_exit_hooks` (`stdio.c`), which runs the `atexit` functions newest first and then `fflush(NULL)` (stdout, stderr and every stream on the open list), then `_exit`. `_exit`, `_Exit` and a fatal signal flush nothing; `abort` flushes everything before raising `SIGABRT`.
+- **Exit.** `exit` (`exit.c`) runs the `atexit` functions newest first, then calls `__stdio_flush_all` (`fflush(NULL)`: stdout, stderr and every stream on the open list) through a weak reference, so a program that uses no stdio does not pull it in, then `_exit`. stdio also registers `__stdio_flush_all` with `atexit` on its first output, for an `exit` that knows nothing about stdio (the one `tcc -run` links in). `_exit`, `_Exit` and a fatal signal flush nothing; `abort` flushes everything before raising `SIGABRT`.
 
 The formatted-output functions all go through one formatter: `vfprintf` runs `kvcbprintf` into a 256-byte staging sink that is passed to the stream in chunks. `snprintf`/`vsnprintf` remain macros for the shared `ksnprintf`/`kvsnprintf`; `sprintf` is `kvsnprintf` with a 1 GiB limit; `asprintf` allocates. Eunuchs extras kept for older programs: `fflush_stdout()` is `fflush(stdout)`, and `fprintf_fd(fd, ...)` (and the `eprintf(...)` macro, `fprintf_fd(2, ...)`) flushes stdout first, then formats straight to the descriptor with `vdprintf` (no length limit), so error text never overtakes earlier standard output.
 
@@ -191,7 +192,7 @@ The kernel's `proc_spawn` gives the first process `PATH=/bin`, `HOME=/`, `TERM=v
 1. `_start` (`crt0.S`) loads `gp` from `__global_pointer$`, sets `fp = 0` (terminates the frame-pointer chain, which is what stops `proc_user_backtrace`), computes `argc`, `argv`, `envp` from `sp`, and calls `__libc_start`. If that ever returned, `_start` would spin in `1: j 1b`.
 2. `__libc_start` (`libc.c`) sets `environ = envp` and calls `exit(main(argc, argv))`. `main` is declared with two arguments; programs use `environ` or `getenv` for the environment.
 3. There is no BSS clearing in user space. The kernel's ELF loader (`elf_load`) copies the file bytes of each segment eagerly, and the rest of the segment (the BSS) stays zero.
-4. `exit` runs the `atexit` functions (newest first), flushes every stdio stream (`__libc_exit_hooks`) and then calls `_exit`, which issues `SYS_exit` and loops forever in case it returns.
+4. `exit` runs the `atexit` functions (newest first), flushes stdio (`__stdio_flush_all`) and then calls `_exit`, which issues `SYS_exit` and loops forever in case it returns.
 
 ### A system call
 
@@ -576,19 +577,18 @@ Fork and exec interactions:
 
 | Header | Contents |
 |---|---|
-| `unistd.h` | `__syscall`; `read write _exit fork execve execv execvp pipe pipe2 fcntl getpid getppid brk sbrk sched_yield kill close lseek unlink rmdir link rename chdir getcwd dup dup2 sync fsync ftruncate setpgid getpgid getpgrp setsid getsid getuid geteuid getgid getegid setuid setgid chown access isatty usleep sysconf gethostname ttyname symlink readlink`, `getopt` with `optarg optind opterr optopt`; `STDIN_FILENO`..., `SEEK_*`, `R_OK`..., `_SC_PAGESIZE`, `_SC_CLK_TCK`; Eunuchs extras `sleep_ms(ms)` and `uptime_ms()`. `ftruncate` and `symlink` fail with `ENOSYS` and `readlink` with `EINVAL` (efs has neither). |
+| `unistd.h` | `__syscall`; `read write _exit fork execve execv execvp execl execlp execle pipe pipe2 fcntl getpid getppid brk sbrk sched_yield kill close lseek unlink rmdir link rename chdir getcwd dup dup2 sync fsync ftruncate setpgid getpgid getpgrp setsid getsid getuid geteuid getgid getegid setuid setgid chown access isatty usleep sysconf gethostname ttyname symlink readlink`, `getopt` with `optarg optind opterr optopt`; `STDIN_FILENO`..., `SEEK_*`, `R_OK`..., `_SC_PAGESIZE`, `_SC_CLK_TCK`; Eunuchs extras `sleep_ms(ms)` and `uptime_ms()`. `ftruncate` and `symlink` fail with `ENOSYS` and `readlink` with `EINVAL` (efs has neither). |
 | `stdio.h` | `FILE`, `stdin stdout stderr`; `fopen` (modes `r w a`, `+`, `b` ignored, `x` for `O_EXCL`, `e` for `O_CLOEXEC`) `fdopen freopen fclose fflush setvbuf setbuf fileno feof ferror clearerr`; `fgetc getc getchar ungetc fgets getline getdelim fread`; `fputc putc putchar fputs puts fwrite`; `fseek ftell rewind fgetpos fsetpos`; `printf fprintf dprintf sprintf asprintf` and their `v` forms, `snprintf`/`vsnprintf` (macros for `ksnprintf`/`kvsnprintf`); the `scanf` family; `perror remove rename tmpfile tmpnam`; `BUFSIZ` (4096), `EOF`, `_IOFBF _IOLBF _IONBF`; Eunuchs extras `fprintf_fd`, `eprintf(...)`, `fflush_stdout`. No `popen`. |
 | `stdlib.h` | `malloc calloc realloc reallocarray free malloc_stats`; `exit _Exit abort atexit system`; `getenv setenv unsetenv putenv environ`; `atoi atol atoll atof strtol strtoul strtoll strtoull strtod strtof strtold`; `abs labs llabs div ldiv lldiv`; `qsort bsearch`; `rand srand random srandom`, `RAND_MAX`; `realpath mkstemp mkdtemp mktemp`; `EXIT_SUCCESS`, `EXIT_FAILURE`, `MB_CUR_MAX` (1). |
 | `string.h` | everything in `kstring.h` (`memset memcpy memmove memcmp strlen strnlen strcmp strncmp strchr strrchr strstr strlcpy memchr_inv kstrtoul kisspace kisdigit kisprint`) plus `strcpy stpcpy strncpy strcat strncat strdup strndup strspn strcspn strpbrk strtok strtok_r strsep memchr memrchr strcasecmp strncasecmp strcoll strxfrm strerror`. |
 | `errno.h` | `errno`, `strerror` (returns `char *`), all `E*` constants. |
 | `fcntl.h` | `open(path, flags, [mode])`, `creat`, `O_*`, `F_*`, `FD_CLOEXEC`, `AT_*`. |
-| `sys/stat.h` | `stat fstat mkdir chmod fchmod umask`, `struct stat` (`st_mtime`/`st_ctime` in ns), `S_IS*`. |
+| `sys/stat.h` | `stat fstat mkdir chmod fchmod umask utimensat futimens`, `struct stat` (POSIX `st_mtim`/`st_ctim` timespecs; `st_mtime`, `st_ctime` and `st_atime` are macros for the seconds), `UTIME_NOW`, `UTIME_OMIT`, `S_IS*`. |
 | `dirent.h` | `opendir readdir closedir`, fixed-size `struct dirent`, `DT_*`. |
 | `sys/wait.h` | `wait waitpid`, `WNOHANG WUNTRACED`, `WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WCOREDUMP WIFSTOPPED WSTOPSIG`. |
 | `signal.h` | `sigaction signal sigprocmask sigsuspend pause raise strsignal`, inline `sigemptyset sigfillset sigaddset sigdelset sigismember`, `sigset_t` (32-bit). |
 | `termios.h` | `tcgetattr tcsetattr (TCSANOW/TCSADRAIN/TCSAFLUSH) cfmakeraw tcgetpgrp tcsetpgrp isatty ioctl`. |
 | `time.h` | `time clock clock_gettime gettimeofday nanosleep sleep`, `gmtime gmtime_r localtime localtime_r timegm mktime difftime asctime asctime_r ctime ctime_r strftime tzset tzname timezone daylight`, `struct tm` (with `tm_isdst`, `tm_gmtoff`, `tm_zone`), `CLOCKS_PER_SEC`. Local time is UTC. |
-| `sys/mman.h` | `mmap munmap`, `PROT_*`, `MAP_PRIVATE`, `MAP_ANONYMOUS`, `MAP_FAILED`. |
 | `sys/time.h` | `gettimeofday`, `struct timeval`, `struct timezone`. |
 | `sys/types.h` | `ssize_t pid_t uid_t gid_t` (16-bit ids) `mode_t off_t ino_t dev_t nlink_t blksize_t blkcnt_t time_t` (64-bit) `suseconds_t clock_t`. |
 | `stdint.h`, `inttypes.h` | Exact-, least- and fast-width integer types, `intptr_t`, `intmax_t`, their limits and `INTn_C` macros (LP64); `PRId64`-style format macros, `SCN*` for 32 and 64 bits, `strtoimax`/`strtoumax`. |
@@ -598,6 +598,7 @@ Fork and exec interactions:
 | `math.h` | See [Mathematics](#mathematics-mathh). |
 | `setjmp.h` | `jmp_buf sigjmp_buf setjmp longjmp _setjmp _longjmp sigsetjmp siglongjmp`. |
 | `regex.h` | `regex_t regmatch_t regoff_t`, `regcomp regexec regerror regfree`, `REG_*` flags and errors. |
+| `sys/mman.h` | `mmap munmap mprotect`, `PROT_*`, `MAP_PRIVATE`, `MAP_ANONYMOUS`, `MAP_FAILED`. |
 | `poll.h` | `poll(fds, n, timeout_ms)`. |
 | `sys/select.h` | `select`, `fd_set` (`FD_SETSIZE` 64), `FD_*` macros. |
 | `sys/socket.h` | `socket bind listen accept accept4 connect getsockname getpeername send recv sendto recvfrom setsockopt getsockopt shutdown`, `MSG_NOSIGNAL` (defined here, but not in `uapi/net.h`'s list). |
@@ -621,6 +622,8 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `more`, `less` | `more [-NiRsFEd] [-NUM] [+NUM \| +/PAT] [FILE...]` | Pager; see [The `more` and `less` pager](#the-more-and-less-pager). |
 | `vi`, `view` | `vi [-R] [+N \| + \| +/PAT] [FILE...]` | The editor's vi personality; `view` is read-only. See [The editor](#the-editor-vi-and-emacs). |
 | `emacs`, `em`, `edit` | `emacs [+N] [FILE...]` | The same program's emacs personality. |
+| `tcc` | `tcc [-c] [-o OUT] [-I DIR] [-D X] [-L DIR] [-l LIB] FILE...`, `tcc -run FILE.c [ARGS]` | TinyCC: compiles, assembles and links C for Eunuchs; see [13](13-toolchain.md). |
+| `make` | `make [-f FILE] [-C DIR] [-nsikBpqd] [VAR=value] [TARGET...]` | POSIX-style make with GNU functions and built-in rules for tcc; see [13](13-toolchain.md#binmake-userbinmakec). |
 | `top` | `top` | Raw mode with `VMIN=0`; shows `/proc/uptime`, 10 lines of `/proc/cpus` and 20 of `/proc/threads` every second; `q` or `^C` quits. |
 | `ping` | `ping [-c N] [-i MS] [-s SIZE] [-W MS] HOST` | Raw ICMP, root only. |
 | `nc` | `nc [-uv] HOST PORT`, `nc -l [-ukv] PORT` | TCP or UDP netcat. |
@@ -629,7 +632,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `httpd` | `httpd [-p PORT] [-r ROOT]` | Default 80 and `/www`; serves `/proc/...` live. `make run` forwards Mac port 8080. |
 | `rshd` | `rshd [-p PORT]` | Default 23; unauthenticated `esh -i` per connection. `make run` forwards Mac port 2323. |
 | `echod` | `echod [-p PORT]` | TCP and UDP echo, default 7. `make run` forwards Mac UDP port 5555. |
-| `utests` | `utests [MODE]` | 43 user-space tests ending in `UTEST RESULT: PASS\|FAIL`. Modes `persist-check`, `crash-commit-write\|check`, `crash-log-write\|check` and `stress[:secs]` are used by `tools/run_tests.py`. |
+| `utests` | `utests [MODE]` | 45 user-space tests ending in `UTEST RESULT: PASS\|FAIL`. Modes `persist-check`, `crash-commit-write\|check`, `crash-log-write\|check` and `stress[:secs]` are used by `tools/run_tests.py`. |
 | `stress` | `stress [-j WORKERS] [-t SECS] [-n ITERS] [-v]` | Defaults: 8 workers, 10 s. Each iteration: an `echo \| cat` pipeline, file I/O in `/tmp`, a COW fork with `mmap`, and 16 KiB over loopback TCP. Prints `STRESS RESULT: PASS\|FAIL`. |
 | `segv` | `segv [null\|text\|stack\|illegal\|kernel]` | Crashes on purpose to show the kernel's fault report. |
 | `spin` | `spin [MS]` | Busy loop in user mode (default 2000 ms). |
@@ -645,7 +648,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `mkdir` | `mkdir DIR...` | Mode 0755. |
 | `rm` | `rm FILE...` | `unlink` only; no `-r`/`-f`. |
 | `rmdir` | `rmdir DIR...` | |
-| `touch` | `touch FILE...` | Creates if missing (0644); does not update times. |
+| `touch` | `touch [-c] FILE...` | Sets the modification time to now (`utimensat`); creates a missing file (0644) unless `-c`. |
 | `ln` | `ln OLD NEW` | Hard links only; exactly two arguments. |
 | `mv` | `mv OLD NEW` | `rename`; exactly two arguments; a directory target is not handled. |
 | `cp` | `cp FROM TO` | Exactly two arguments; creates `TO` with 0644. |
@@ -683,6 +686,10 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `/bin/sh` | hard link to `/bin/esh` |
 | `/bin/less` | hard link to `/bin/more` |
 | `/bin/vi`, `/bin/view`, `/bin/emacs`, `/bin/em` | hard links to `/bin/edit` |
+| `/usr/include/` | `user/include/` and `lib/include/` (the headers tcc compiles against) |
+| `/usr/lib/crt1.o`, `crti.o`, `crtn.o`, `libc.a` | the start-up files and the libc as an archive, from `build/sysroot` |
+| `/usr/lib/tcc/` | `libtcc1.a`, `runmain.o` and tcc's own headers |
+| `/usr/src/` | the sources of every program (`user/bin/`) and `user/usr-src/Makefile` |
 | `/bin/<applet>` for every `EUTILS_LINKS` name | hard link to `/bin/eutils` (`=@/bin/eutils`) |
 | `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` | `user/etc/` |
 | `/dev/`, `/proc/` | empty mount points |
