@@ -1,6 +1,6 @@
 # Eunuchs — top-level build
 #
-#   make run        boot in QEMU (Ctrl-A X quits QEMU)
+#   make run        boot in QEMU (Ctrl-^ X quits QEMU)
 #   make test       boot headless, run in-kernel tests, exit with pass/fail
 #   make test-host  run host-native unit tests (ASan/UBSan)
 #   make debug      boot halted, waiting for GDB on :1234
@@ -90,7 +90,11 @@ FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(no
 DISKOPTS = -global virtio-mmio.force-legacy=false \
            -drive file=$(1),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
-QEMUBASE = -machine virt -bios default -nographic -smp $(CPUS) -m $(MEM) \
+# -nographic muxes serial + monitor. QEMU's default escape is Ctrl-A (1),
+# which is beginning-of-line in emacs and the shell. Ctrl-^ (30) is unused
+# by either; Ctrl-^ X still quits QEMU, Ctrl-^ Ctrl-^ sends a literal Ctrl-^.
+QEMU_ECHR ?= 30
+QEMUBASE = -machine virt -bios default -nographic -echr $(QEMU_ECHR) -smp $(CPUS) -m $(MEM) \
            -semihosting-config enable=on,target=native -kernel $(KERNEL)
 
 # Networking: QEMU's user-mode network (guest 10.0.2.15, host 10.0.2.2).
@@ -357,7 +361,7 @@ gdb: $(KERNEL)
 # the boot options in build/rr/, so rebuilding does not invalidate it. Under
 # -icount idle time passes in real time: disk-heavy runs are slower than usual.
 RRDIR    := $(BUILD)/rr
-RROPTS = -machine virt -bios default -nographic -smp 1 -m $(MEM) -kernel $(RRDIR)/kernel.elf \
+RROPTS = -machine virt -bios default -nographic -echr $(QEMU_ECHR) -smp 1 -m $(MEM) -kernel $(RRDIR)/kernel.elf \
          -icount shift=auto,rr=$(1),rrfile=$(RRDIR)/replay.bin,rrsnapshot=init \
          -drive file=$(RRDIR)/snap.qcow2,if=none,id=rr \
          -global virtio-mmio.force-legacy=false \

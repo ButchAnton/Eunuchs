@@ -28,7 +28,7 @@ The guest is RISC-V, so the host can be Apple Silicon or Intel. On Intel Macs Ho
 command make run
 ```
 
-`command` bypasses shell wrappers around `make` (such as grc) that buffer the console. Inside, `help` lists the shell's builtins and keys; `Ctrl-]` enters the kernel debug monitor (`help` there too, `c` to continue); `Ctrl-A X` quits QEMU (so `Ctrl-A Ctrl-A`, or Home, moves to the start of the line).
+`command` bypasses shell wrappers around `make` (such as grc) that buffer the console. Inside, `help` lists the shell's builtins and keys; `Ctrl-]` enters the kernel debug monitor (`help` there too, `c` to continue); `Ctrl-^ X` quits QEMU.
 
 | Target | What it does |
 |---|---|

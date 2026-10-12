@@ -230,11 +230,11 @@ All boots share one scratch image, `build/test-fs.img`, copied from `build/fs.im
 Common base (`QEMUBASE`):
 
 ```
-qemu-system-riscv64 -machine virt -bios default -nographic -smp $(CPUS) -m $(MEM) \
+qemu-system-riscv64 -machine virt -bios default -nographic -echr 30 -smp $(CPUS) -m $(MEM) \
     -semihosting-config enable=on,target=native -kernel build/kernel.elf
 ```
 
-`-bios default` is OpenSBI. Semihosting lets the kernel write host files (`tracedump=`, `trace dump`, `profile dump`) relative to QEMU's working directory.
+`-bios default` is OpenSBI. `-echr 30` makes QEMU's mux escape `Ctrl-^` instead of `Ctrl-A`, so beginning-of-line works in emacs and the shell (`Ctrl-^ X` still quits QEMU). Semihosting lets the kernel write host files (`tracedump=`, `trace dump`, `profile dump`) relative to QEMU's working directory.
 
 Disk (`DISKOPTS`, a function of the image path):
 
@@ -281,7 +281,7 @@ Network (`NETOPTS`, used by `run`, `debug`, `qemu-log`):
 ### Record and replay (`RROPTS`)
 
 ```
--machine virt -bios default -nographic -smp 1 -m $(MEM) -kernel build/rr/kernel.elf \
+-machine virt -bios default -nographic -echr 30 -smp 1 -m $(MEM) -kernel build/rr/kernel.elf \
 -icount shift=auto,rr=record|replay,rrfile=build/rr/replay.bin,rrsnapshot=init \
 -drive file=build/rr/snap.qcow2,if=none,id=rr \
 -global virtio-mmio.force-legacy=false \
@@ -689,7 +689,7 @@ Any other mode prints `unknown mode` and fails.
 
 ```
 cp -f build/fs.img /tmp/t.img
-command qemu-system-riscv64 -machine virt -bios default -nographic -smp 4 -m 128M \
+command qemu-system-riscv64 -machine virt -bios default -nographic -echr 30 -smp 4 -m 128M \
   -semihosting-config enable=on,target=native -kernel build/kernel.elf \
   -global virtio-mmio.force-legacy=false \
   -drive file=/tmp/t.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 \
@@ -711,7 +711,7 @@ build/tools/mkfs --check /tmp/t.img
 - Ports 8080/2323/5555 in use → `make run` fails to start QEMU; use `HTTP_PORT=...` or `HOSTFWD=`.
 - **`can't link soft-float modules with double-float modules`**: leftover kernel `.S` objects from another host or GCC (the tree was first built on Apple Silicon). `build/.cc-id` records `uname -m` and the compiler so the next `make` rebuilds them; `make clean` also clears it.
 - **Intel Mac QEMU**: Homebrew may not bottle `qemu`. If `qemu-system-riscv64` disappears or breaks after `brew upgrade`, `brew reinstall local/qemu/qemu`.
-- Quit QEMU with `Ctrl-A X`; `Ctrl-]` enters the kernel monitor.
+- Quit QEMU with `Ctrl-^ X`; `Ctrl-]` enters the kernel monitor.
 - `make ci` starts by deleting `build/`, including any recording in `build/rr/` and profiles or traces you dumped.
 
 ## Limitations and known issues

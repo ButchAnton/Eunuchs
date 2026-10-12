@@ -55,7 +55,7 @@ Commands: `help regs csr bt mem poke sym dmesg log plat dtb traps ktest crash c 
 plus memory: `meminfo pt v2p p2v page slab heapcheck kmalloc kfree`,
 threads: `ps bt <tid> sched irq locks trace demo`, CPUs: `cpus cpu <n> lockdep`, network: `net netstat`, and `profile` (see below).
 Address arguments accept numbers, `symbol+off`, or `$reg` from the trap frame (`$sepc`, `$sp`, `$a0`, ...).
-Use the up/down arrows for history. To exit QEMU, press `Ctrl-A X`.
+Use the up/down arrows for history. To exit QEMU, press `Ctrl-^ X`.
 
 `crash null|store|wx|uaf|overflow|stack|illegal|ebreak|panic|assert` deliberately triggers each failure path.
 `demo pingpong|spin|deadlock` spawns threads to watch with `ps` and `trace`.
@@ -104,7 +104,7 @@ The system boots into `init`, which prints `/etc/motd` and runs the shell, **`es
 - editing: syntax highlighting, gray autosuggestions from history (Right accepts), Up/Down history search by prefix, `^R` incremental search, Tab completion with a menu on the second Tab, `!!`/`!$`/`^a^b`;
 - `help` lists builtins and keys; `setopt` shows the options; `/etc/eshrc` and `~/.eshrc` are the start-up files.
 
-Under `make run`, QEMU keeps `Ctrl-A` for itself (`Ctrl-A X` quits): press `Ctrl-A Ctrl-A` to move to the start of the line, or use Home.
+Under `make run`, QEMU's monitor escape is `Ctrl-^` (`Ctrl-^ X` quits), so `Ctrl-A` is beginning-of-line in the shell and in emacs.
 
 For debugging scripts and the shell itself: `set -x` traces commands after expansion, `whence -v`/`type` say what a name is, and `strace esh -c '...'` shows the system calls.
 

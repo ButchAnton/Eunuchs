@@ -741,7 +741,6 @@ esh is single-threaded. The asynchronous parts are signal handlers, and they onl
 - **Parsing.** Command substitutions are found by scanning for the matching parenthesis, with a heuristic for `case` patterns inside `$(...)`. Unusual nesting, such as an unbalanced `)` in a comment inside `$(...)`, can end the substitution early.
 - **`$(...)` with large output** is read entirely into memory.
 - **Here-documents over 4000 bytes** need a writable `/tmp`.
-- **QEMU's `-nographic` console takes `^A`** as its escape key (`^A X` quits QEMU). Press `^A ^A` to send it to esh, or use Home.
 - **Window size.** Resizes are noticed only at the next prompt, and only if the terminal answers position queries. There is no `SIGWINCH` from the serial console.
 - **History** is read once at start-up. Commands from other shells running at the same time are not seen until the next shell starts.
 - **Function calls re-parse the body** every time, which costs a little in tight loops.
