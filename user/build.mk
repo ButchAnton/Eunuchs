@@ -8,7 +8,7 @@
 #
 # OUT/sysroot/usr/lib    crt1.o crti.o crtn.o libc.a
 # OUT/sysroot/usr/lib/tcc libtcc1.a runmain.o
-# OUT/bin                 the programs
+# OUT/bin                 the programs (and kld, the kernel's linker)
 
 TCC     = tcc
 OUT     = build/selfhost
@@ -30,7 +30,7 @@ SYSLIBS := $(LIB)/crt1.o $(LIB)/crti.o $(LIB)/crtn.o $(LIB)/libc.a $(TCCLIB)/lib
 
 PROGS   := $(basename $(notdir $(wildcard user/bin/*.c)))
 MULTI   := db edit esh
-ALL     := $(addprefix $(OUT)/bin/,$(PROGS) $(MULTI) tcc)
+ALL     := $(addprefix $(OUT)/bin/,$(PROGS) $(MULTI) tcc kld)
 
 all: $(ALL)
 	@echo "user space built in $(OUT)"
@@ -96,6 +96,11 @@ $(OUT)/bin/edit: $(wildcard user/bin/edit/*.c) $(SYSLIBS)
 $(OUT)/bin/esh: $(wildcard user/bin/esh/*.c) $(SYSLIBS)
 	@mkdir -p $(@D)
 	$(LINK) -o $@ $(filter %.c,$^)
+
+# the kernel's linker (kernel/build.mk uses it)
+$(OUT)/bin/kld: tools/kld/kld.c $(SYSLIBS)
+	@mkdir -p $(@D)
+	$(LINK) -o $@ $<
 
 $(OUT)/bin/tcc: $(wildcard $(TCCSRC)/*.c $(TCCSRC)/*.h) ports/tcc/config.h $(SYSLIBS)
 	@mkdir -p $(@D)

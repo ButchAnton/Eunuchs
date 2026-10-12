@@ -6,6 +6,8 @@ Eunuchs can compile C programs on itself. `/bin/tcc` is TinyCC, a small one-pass
 root@eunuchs:/# cd /usr/src && make && make install
 ```
 
+Since the self-hosting work, Eunuchs also builds its own kernel, linked by `kld`, a linker for the kernel's linker script.
+
 This document covers how tcc is configured, patched and built, how the sysroot is put together, `tcc -run`, the make program, the problems tcc's dialect causes for our code, and how to debug compile problems.
 
 ## Responsibilities and scope
@@ -39,6 +41,9 @@ This document covers how tcc is configured, patched and built, how the sysroot i
 | `user/bin/make.c` | `/bin/make`. |
 | `user/usr-src/Makefile` | `/usr/src/Makefile`: rebuilds every program with tcc. |
 | `tools/run_tests.py` | The `toolchain and editors` stage. |
+| `tools/kld/kld.c` | `kld`, the kernel linker (host `build/tools/kld`, guest `/bin/kld`). |
+| `user/build.mk`, `kernel/build.mk` | User space and the kernel, built on Eunuchs by tcc (and kld). |
+| `tools/selfhost.sh`, `tools/selfhost.py` | `make selfhost`: the two stages in the guest, and their driver on the Mac. |
 
 ## Concepts and data structures
 
@@ -70,6 +75,15 @@ Most are small and marked with "Eunuchs" comments; the fourth is the rewrite of 
 4. The assembler: `tccasm.c`, `tccpp.c`, `tcc.h`, `tcctok.h`, `riscv64-asm.c` and `riscv64-tok.h` ([The assembler](#the-assembler)).
 5. `tccgen.c`: narrowing a 64-bit value held in a register to `unsigned int` zero-extended it. RISC-V keeps 32-bit values sign-extended in registers, unsigned ones included (the psABI, and tcc's own `lw`, `addw` and comparison code assume it), so a value narrowed this way compared unequal to the same value loaded from memory: `sleep_ms() == (unsigned)-1` was false in tcc-built code (the `utests` `eintr` test failed). It now emits `sext.w`.
 6. `tccelf.c`: executables kept `.symtab` and `.strtab` only with `-g` (upstream writes non-allocated sections only then). They are now always kept, as GNU ld does, because the kernel's user backtraces and `elf_symbolize` need them (`ktest elf_load_from_disk` failed on a tcc-built `/bin/hello`). This applies to every program built on Eunuchs.
+7. **Fixes found building the kernel** (most were silent miscompilations; `riscv64-gen.c`, `riscv64-asm.c`, `tccgen.c`, `tccpp.c`, `tcc.h`, `include/stdatomic.h`):
+   - **The epilogue** did `addi sp, s0, …; ld ra, -8(s0); ld s0, -16(s0)`: it read the saved `ra` and `s0` from below `sp` after freeing the frame. An interrupt at that point (the kernel's trap frame and backtrace record land just below `sp`), or a signal frame in user space, overwrote the saved `ra` with `sepc`, so the function returned to its own epilogue forever. It showed up as cross-CPU wakeups taking a whole 10 ms tick and `cp` running 50 times slower on two CPUs, and was found by sampling the CPUs' registers through the QEMU monitor. Now `ld ra; addi t0, s0, …; ld s0; mv sp, t0; ret`.
+   - **`<stdatomic.h>`'s `__atomic_store_n`** stored twice: a plain `*ptr = val`, then the atomic store. A spinlock unlock released the lock, another CPU took it, and the second store released it again (`unlock of spinlock not held`). Now a single store; `__atomic_exchange_n` was added.
+   - **Register variables** (`register T x asm("reg")`): the hardware register number was taken as tcc's internal register number (`a0` = 10 became `fa2`, an FP register in the kernel; `s1` crashed tcc with an assertion in its FP register allocator). The variable now lives on the stack, and asm operands that name it use the register; values move directly between the slot and registers outside `a0`–`a7`/`fa0`–`fa7`. `s0` is refused.
+   - **Inline asm**: the `"K"` constraint (a 5-bit unsigned immediate) is supported, and the `"r"`/`"f"` allocation loops no longer run one past `a7`/`fa7` into `s2`/`fs2`. The assembler accepts `csrw`/`csrs`/`csrc` with a 5-bit immediate (as `csrrwi`/`csrrsi`/`csrrci`, as gas does).
+   - **Constants**: `(void *)0x80200000UL` was sign-extended (the zero-extension of 32-bit unsigned constants applied to `long long` but not to pointers).
+   - **Symbol names**: anonymous symbols (the labels of `auipc` pairs) were named `<no name>` in the symbol table (thousands of them, and kernel backtraces showed `<no name>`); now empty.
+   - **`parse_fence_operand`** subtracted pointers into two different `"iorw"` string literals (a bug from the assembler work): GCC merges identical literals, tcc does not, so the tcc-built tcc assembled `fence rw,rw` as `fence 0,0`. Found because stage 1 and stage 2 differed.
+   - **`SOURCE_DATE_EPOCH`** sets `__DATE__` and `__TIME__` (in UTC), as with GCC, for reproducible builds (the kernel's banner contains its build time).
 
 ### The sysroot (`build/sysroot`, copied into the image)
 
@@ -185,7 +199,7 @@ Nothing in it comes from GCC:
 
 1. **The sysroot**, in `OUT/sysroot/usr/lib` (`OUT` defaults to `build/selfhost`): `crt1.o` (`crt0.S` with `-DNO_GP`), empty `crti.o`/`crtn.o` (assembled from standard input, so the file name they record is `-` whatever `OUT` is), and `libc.a` from `user/lib/*.c`, `setjmp.S`, `syscall.S`, `lib/printf.c` and `lib/string.c` with `-DFMT_FLOAT`.
 2. **tcc's runtime**, in `OUT/sysroot/usr/lib/tcc`: `libtcc1.a` from tcc's own `lib-arm64.c` (the software `long double` arithmetic), `stdatomic.c`, `builtin.c`, `armflush.c`, `atomic.S` and `alloca.S`, and `runmain.o`. Unlike the regular build's `libtcc1.a`, it contains no libgcc.
-3. **Every program**, into `OUT/bin`: each `user/bin/*.c`, `db`, `edit`, `esh`, and `tcc` itself (`third_party/tinycc/tcc.c` with `-DONE_SOURCE=1 -Iports/tcc`): 26 programs.
+3. **Every program**, into `OUT/bin`: each `user/bin/*.c`, `db`, `edit`, `esh`, `tcc` itself (`third_party/tinycc/tcc.c` with `-DONE_SOURCE=1 -Iports/tcc`), and `kld` (`tools/kld/kld.c`).
 
 Headers come from the source tree (`-nostdinc -Iuser/include -Ilib/include -Ithird_party/tinycc/include`), not from `/usr/include`; links use `-B OUT/sysroot/usr/lib/tcc`; archives are made with `tcc -ar`. `make` runs serially.
 
@@ -200,6 +214,45 @@ Headers come from the source tree (`-nostdinc -Iuser/include -Ilib/include -Ithi
 Both stages take about 37 seconds in the guest with 4 CPUs, boot included; the stages are identical and all 19 test stages pass on the self-built image. Logs: `build/selfhost/stage1.log`, `stage2.log` and `console.log`.
 
 The libc needed one change for this: `math.c` and `stdlib.c` no longer use GCC's floating-point builtins, which tcc lacks. They use `HUGE_VAL` and `NAN` (cast to `long double` where needed) instead of `__builtin_inf`/`infl`/`nan`/`nanl`, and inline-assembly helpers `hw_sqrt`/`hw_sqrtf` (`fsqrt.d`/`fsqrt.s`) instead of `__builtin_sqrt`/`sqrtf`, so both compilers compile the same code.
+
+### kld, the kernel linker (`tools/kld/kld.c`)
+
+tcc's linker cannot follow a linker script, and the kernel needs one (`kernel/arch/riscv/kernel.ld`: a higher-half VMA with a different load address, page-aligned regions, `KEEP`ed tables with start and end symbols, `NOLOAD` stacks). `kld` (about 1,600 lines of C) is a static linker for RISC-V ELF64 relocatable objects, from GCC or tcc, that reads that script itself. It builds on the Mac (`build/tools/kld`, `$(KLD)`) and on Eunuchs (`/bin/kld`, built by `user/build.mk` and installed in the self-hosted image).
+
+```
+kld -T script -o kernel.elf [--ksyms] [-M] file.o ...
+```
+
+- **The script subset**: `ENTRY`, `OUTPUT_ARCH`, `sym = expr;` and `PROVIDE(sym = expr);` anywhere, `SECTIONS` with `. = expr;`, output sections with `(NOLOAD)` and `AT(expr)`, input statements `*(pattern …)` with `*` wildcards, `KEEP(…)`, and `COMMON`. Expressions: numbers (with `K`/`M`), symbols, `.`, `ALIGN(n)`, `+ - * /` and parentheses.
+- **Placement**: the first matching statement takes an input section, as in GNU ld; an allocated input section no statement matches is an error; `.eh_frame`, `.note*`, `.comment` and `.riscv.attributes` are dropped. `AT()` sets the difference between the VMA and the LMA, which carries over to the following sections (GNU ld's rule).
+- **Output**: one `PT_LOAD` per allocated output section, the symbol table (locals and globals), and the debug sections with their relocations applied.
+- **Relocations**: `32`/`64`, `BRANCH`, `JAL`, `CALL`/`CALL_PLT`, `GOT_HI20`, `PCREL_HI20`/`PCREL_LO12_I`/`S`, `HI20`/`LO12_I`/`S`, `ADD`/`SUB` 8 to 64, `SUB6`, `SET6`/`8`/`16`/`32`, `32_PCREL`, `SET_ULEB128`/`SUB_ULEB128`, `RVC_BRANCH`/`RVC_JUMP`, with range checks. `ALIGN` and `RELAX` are ignored. There is no relaxation and no string merging. tcc reaches globals through the GOT (`auipc` + `ld`); kld rewrites that to `auipc` + `addi`, so there is no GOT. Padding from `R_RISCV_ALIGN` that only relaxation could remove is an error ("build with -mno-relax"), so GCC objects must be compiled with `-mno-relax` to be linked by kld.
+- **`--ksyms`** synthesizes the `.ksyms` section (`ksyms_num`, `ksyms_addrs`, `ksyms_offs`, `ksyms_names`) itself, byte-identical to what `tools/gen_ksyms.py` makes from a first link (checked on 929 entries). It lays the image out twice and checks that the text did not move. One link instead of two, and no Python. (Both skip tcc's `L..` local labels.)
+- **`-M`** prints a link map.
+
+The GCC-built kernel objects (with `-mno-relax`) linked by kld pass the whole test suite, which validates kld independently of tcc.
+
+### Eunuchs builds its own kernel (`kernel/build.mk`)
+
+```
+cd /mnt/host && make -f kernel/build.mk [OUT=dir] [TCC=compiler] [KLD=linker]
+```
+
+compiles every `.S` and `.c` file of the kernel's directories (the same `KDIRS` as the Makefile, sorted per directory) with tcc (`-nostdinc -Ikernel/include -Ilib/include -Ithird_party/tinycc/include`, plus `-D__ASSEMBLY__` for `.S`), adds tcc's runtime `atomic.S`, `stdatomic.c` and `builtin.c` (tcc turns `__atomic_*` operations and `__builtin_ctz` and friends into calls), and links with `kld -T kernel/arch/riscv/kernel.ld --ksyms` into `OUT/kernel/kernel.elf`. It runs after `user/build.mk`, which builds `kld`.
+
+Changes to the kernel for tcc (the same code under GCC):
+- `stdint.h` moved from `user/include` to `lib/include`, shared by the kernel and the libc (GCC's freestanding one is not available to tcc). It includes the host's (`#include_next`) when not compiling for RISC-V, for the host tests.
+- `kernel/include/types.h`, under `__TINYC__`: `#include <stdatomic.h>` for the `__ATOMIC_*` orders and `__atomic_*_n`, and `__sync_synchronize()` as `fence rw, rw`.
+- `fdt.c`'s `be32` reads bytes instead of `__builtin_bswap32`, which without Zbb is a libgcc call (`__bswapsi2`). The GCC kernel no longer links `-lgcc` at all.
+- `current_fp()` is a macro: as an inline function it was a frame of its own under tcc, which does not inline, and backtraces lost a frame.
+- `kernel.ld` places `.data.ro` and `.data.ro.*` (tcc's read-only data) in `.rodata`.
+- `exec` accepts up to 2048 argument and environment pointers in 128 KiB, with the vectors allocated rather than on the kernel stack ([05](05-processes-and-signals.md)): the kernel's `kld` command line has about 85 arguments. The terminal's line limit (255 bytes, `LINE_MAX` in `tty.c`) is why the build runs from a script, `tools/selfhost.sh`, rather than one typed command.
+
+**`make selfhost`** now builds both user space and the kernel in each stage (`tools/selfhost.sh`, run in the guest: `user/build.mk` then `kernel/build.mk`, with `/bin/tcc` for stage 1 and stage 1's `tcc` for stage 2), with `SOURCE_DATE_EPOCH` set to the last commit's time (`git log -1 --format=%ct`) so `__DATE__`/`__TIME__` are reproducible. The two stages are byte-identical, kernel included. The Makefile then boots **stage 2's kernel** (`build/selfhost/stage2/kernel/kernel.elf`) with `build/selfhost/fs.img` (which also gets `/bin/kld`) and runs the whole test scenario: 19 of 19 stages pass. Both stages build in about 80 seconds in the guest.
+
+**`make tcc-kernel`** does the same on the Mac with `xtcc` and the host `kld`, into `build/tcc-kernel/kernel/kernel.elf`: the quickest way to reproduce a problem in the tcc-built kernel (boot it with `make run`-style options and `-kernel` pointing there, or debug it with GDB).
+
+**Speed**: tcc does almost no optimization, and its kernel runs at about half the speed of GCC's `-O1` kernel (a tcc compile takes 0.59 s against 0.31 s, `cp` 0.23 s against 0.13 s, `ls -l` 0.06 s against 0.03 s), hence `SH_TIMEOUT` (120 s per stage) for its test run. The normal image keeps the GCC kernel.
 
 ### Dialect problems tcc exposed in our code
 
@@ -227,6 +280,9 @@ None of its own: tcc and make are ordinary single-threaded processes. Two builds
 |---|---|
 | `make sysroot` | Builds `build/sysroot` (headers, `libc.a`, start-up files, `libtcc1.a`, `runmain.o`). |
 | `build/tcc/xtcc` | The host cross compiler. |
+| `build/tools/kld` | The kernel linker, on the host. |
+| `make tcc-kernel` | The kernel compiled by `xtcc` and linked by `kld`: `build/tcc-kernel/kernel/kernel.elf`. |
+| `make selfhost` | Both self-hosting stages in the guest, then the test suite on stage 2's kernel and programs. |
 | `build/user/bin/tcc` | `/bin/tcc` with symbols (for GDB and the profiler). |
 
 ### Kernel interfaces it depends on
@@ -250,14 +306,16 @@ None of its own: tcc and make are ordinary single-threaded processes. Two builds
 - **`tcc -run` needs `mprotect`** and places code in the heap; there is no fallback mode.
 - **Self-hosting, measured** (building from `/mnt/host`):
   - **User space: done.** Step 1 (the assembler) and step 2 (`user/build.mk`, above): Eunuchs builds its C library, tcc's runtime and every program, tcc included, and the second generation is identical to the first. It needs the share: the libc's and tcc's sources are not in `/usr/src`.
-  - **The kernel**: 46 of its 76 C files compile with tcc. The blockers: no `stdint.h` for the freestanding kernel build (tcc's headers expect a libc's); the `__ATOMIC_*` constants; the inline-asm `"K"` constraint (a 5-bit CSR immediate); the assembler gaps (`.macro`, `la`, the `fp` register alias, `.dword`, numeric local labels, `.option arch`), now closed: the kernel's `.S` files assemble identically; and a tcc assertion failure in its floating-point register allocator on `kernel/tests/test_debug.c`. Above all, linking: the kernel's linker script (a higher-half VMA different from the load address, page-aligned regions, `KEEP`ed tables with start and end symbols, `NOLOAD` stacks), which tcc's linker cannot express, and the two-pass link whose symbol table is generated by `tools/gen_ksyms.py`, a Python script.
+  - **The kernel: done** (step 3, above): built by tcc and linked by kld on Eunuchs, a byte-identical fixed point, and it passes the test suite. Before the kernel work, 46 of its 76 C files compiled with tcc. The blockers: no `stdint.h` for the freestanding kernel build (tcc's headers expect a libc's); the `__ATOMIC_*` constants; the inline-asm `"K"` constraint (a 5-bit CSR immediate); the assembler gaps (`.macro`, `la`, the `fp` register alias, `.dword`, numeric local labels, `.option arch`), now closed: the kernel's `.S` files assemble identically; and a tcc assertion failure in its floating-point register allocator on `kernel/tests/test_debug.c`. Above all, linking: the kernel's linker script (a higher-half VMA different from the load address, page-aligned regions, `KEEP`ed tables with start and end symbols, `NOLOAD` stacks), which tcc's linker cannot express, and the two-pass link whose symbol table is generated by `tools/gen_ksyms.py`, a Python script.
+- **The self-built kernel has no DWARF** (it is compiled without `-g`); kld's handling of debug-section relocations has been exercised with GCC's DWARF only.
+- **kld does not relax**, so GCC objects need `-mno-relax`; and neither the kernel's nor the libc's sources are in `/usr/src`, so self-hosting needs the 9P share.
 - **`make`**: no parallel builds (`-j` is ignored), no archive member syntax (`lib.a(obj.o)`), no `$(eval)`/`$(call)`/`define`; `vpath` and `unexport` lines are accepted and ignored.
 - **Size**: the sysroot adds about 4 MiB to the 32 MiB image (`libtcc1.a` is most of it, because the regular build includes all of libgcc; the self-built one, without libgcc, shows that is unnecessary).
 
 ## Potential improvements
 
 1. **Line numbers in fault reports** — Have the kernel (or a user-space helper run on a fault) map pcs to file:line through the DWARF line table that `db` already decodes, for programs built with `-g`. Impact: medium. Effort: medium.
-2. **Self-hosting, step by step** — (1) **done**: tcc's assembler handles every `.S` file in the tree, byte-identical to GNU as; (2) **done**: Eunuchs builds its libc, tcc's runtime and every program with tcc, reaching a fixed point (`make selfhost`); (3) the kernel: a freestanding `stdint.h`, `__ATOMIC_*` definitions, the `"K"` constraint, a fix for the register-allocator assertion, and a link path without GNU ld (teach tcc's linker the few script features the kernel needs, separate VMA and LMA, alignment, keep and start/end symbols, NOLOAD, or have the kernel relocate itself from a flat image), with `gen_ksyms` rewritten in C. Also: put the libc's and tcc's sources in `/usr/src` so the image can rebuild everything without the share, and drop libgcc from the regular build's `libtcc1.a` (the self-built one shows it is not needed). Smaller assembler gaps: `%hi`/`%lo`/`%pcrel_*`, automatic compression, `.cfi` unwind tables, `.irpc`, `\@`. Impact: medium. Effort: large.
+2. **After self-hosting** — Steps 1 (the assembler), 2 (user space) and 3 (the kernel, with kld) are done. Next: build the kernel with `-g` and check kld's debug relocations with tcc's DWARF; put the kernel's, the libc's and tcc's sources in `/usr/src` so the image rebuilds itself without the share; relaxation in kld (smaller, faster GCC-built kernels linked by kld); a longer terminal line (`LINE_MAX` is 255); drop libgcc from the regular `libtcc1.a`; and a better code generator, since the tcc kernel runs at half speed. Smaller assembler gaps: `%hi`/`%lo`/`%pcrel_*`, automatic compression, `.cfi` unwind tables, `.irpc`, `\@`. Impact: medium. Effort: large.
 3. **`-run` without `mprotect`** — A fallback that writes the program to `/tmp` and `exec`s it, for kernels or environments without `mprotect`. Impact: low. Effort: small.
 4. **`make -j`** — Run independent recipes in parallel with `fork` and `wait`; Eunuchs has four CPUs by default. Impact: medium. Effort: medium.
 5. **Trim `libtcc1.a`** — Include only the libgcc members that are actually needed (soft `long double`, a few integer helpers) instead of all of them. Impact: low. Effort: small.

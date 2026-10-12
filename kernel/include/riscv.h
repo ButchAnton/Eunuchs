@@ -73,9 +73,8 @@ static inline bool intr_enabled(void) { return csr_read(sstatus) & SSTATUS_SIE; 
 /* Sleep (wfi) for up to `ticks` timer ticks; may wake early. idle.c */
 void cpu_wait_ticks(u64 ticks);
 
-static inline uintptr_t current_fp(void)
-{
-    return (uintptr_t)__builtin_frame_address(0);
-}
+/* The caller's frame pointer. A macro: as an inline function it would be
+   its own frame under a compiler that does not inline (tcc). */
+#define current_fp() ((uintptr_t)__builtin_frame_address(0))
 
 #endif

@@ -5,6 +5,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __TINYC__
+/*
+ * Building with tcc: gcc's builtins the kernel uses. tcc's <stdatomic.h>
+ * has the __ATOMIC_* orders and the __atomic_*_n forms; tcc turns the
+ * __atomic_* operations into calls to its runtime (atomic.S, stdatomic.c),
+ * linked into the kernel, as it does __builtin_ctz (builtin.c).
+ */
+#include <stdatomic.h>
+#define __sync_synchronize() __asm__ __volatile__("fence rw, rw" ::: "memory")
+#endif
+
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;

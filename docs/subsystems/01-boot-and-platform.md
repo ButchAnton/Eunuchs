@@ -78,7 +78,7 @@ Everything is RWX. The identity entry only exists so the instructions right afte
 KERNEL_BASE+0x80200000  __kernel_start
   .text        .text.boot first (_start), then all .text
   ALIGN(4096)  __text_end, __rodata_start
-  .rodata      .srodata, .rodata, .ktests (KTEST table), __ex_table
+  .rodata      .srodata, .rodata, .data.ro* (tcc), .ktests (KTEST table), __ex_table
   ALIGN(4096)  __rodata_end, __data_start
   .data        .sdata, .data
   .bss         __bss_start .. __bss_end (.sbss, .bss, COMMON)

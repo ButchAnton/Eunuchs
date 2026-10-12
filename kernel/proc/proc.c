@@ -21,8 +21,12 @@
 #include <uapi/ptrace.h>
 #include <uapi/syscall.h>
 
-#define MAX_ARGS     32
-#define MAX_ARG_LEN  4096       /* total bytes of argument strings */
+/* exec: arguments and environment, together (a link line for the kernel
+   has ~90 arguments); the vectors and strings are allocated, not on the
+   kernel stack */
+#define MAX_ARGS     2048
+#define MAX_ARG_LEN  (128 * 1024)   /* total bytes of argument strings */
+#define MAX_SPAWN_ARGS 32           /* proc_spawn: the kernel's own /bin/init and tests */
 
 /*
  * proc_lock protects: the process list and parent/child links, process
@@ -236,7 +240,9 @@ static long do_exec(struct proc *p, const char *path, char *const argv[], char *
     while (envp && envp[envc])
         envc++;
     uintptr_t sp = USER_STACK_TOP;
-    u64 vec[1 + MAX_ARGS + 1 + MAX_ARGS + 1 + 2];
+    u64 *vec = kmalloc((1 + argc + 1 + envc + 1 + 2) * sizeof(u64));
+    if (!vec)
+        goto nomem;
     int nvec = 0;
     vec[nvec++] = argc;
     for (int k = 0; k < 2; k++) {
@@ -245,8 +251,10 @@ static long do_exec(struct proc *p, const char *path, char *const argv[], char *
         for (int i = 0; i < n; i++) {
             size_t len = strlen(strs[i]) + 1;
             sp -= len;
-            if (uvm_write(mm, sp, strs[i], len))
+            if (uvm_write(mm, sp, strs[i], len)) {
+                kfree(vec);
                 goto nomem;
+            }
             vec[nvec++] = sp;
         }
         vec[nvec++] = 0;
@@ -254,7 +262,9 @@ static long do_exec(struct proc *p, const char *path, char *const argv[], char *
     vec[nvec++] = 0;                    /* AT_NULL */
     vec[nvec++] = 0;
     sp = ALIGN_DOWN(sp - nvec * 8, 16);
-    if (uvm_write(mm, sp, vec, nvec * 8))
+    int werr = uvm_write(mm, sp, vec, nvec * 8);
+    kfree(vec);
+    if (werr)
         goto nomem;
 
     /* Commit: from here on, the new image replaces the old one. */
@@ -316,10 +326,10 @@ nomem:
     return -ENOMEM;
 }
 
-/* Copy a NULL-terminated user string vector into strings[*used...]. */
-static long copy_strv(uintptr_t uvec, char **out, char *strings, size_t *used)
+/* The number of strings in a NULL-terminated user vector (at most MAX_ARGS). */
+static long count_strv(uintptr_t uvec)
 {
-    int n = 0;
+    long n = 0;
     for (; uvec; n++) {
         u64 uptr;
         if (n == MAX_ARGS)
@@ -328,39 +338,74 @@ static long copy_strv(uintptr_t uvec, char **out, char *strings, size_t *used)
             return -EFAULT;
         if (!uptr)
             break;
-        long r = strncpy_from_user(strings + *used, uptr, MAX_ARG_LEN - *used);
+    }
+    return n;
+}
+
+/* Copy n user strings into strings[*used..cap); out[n] = NULL. -E2BIG: no room. */
+static long copy_strv(uintptr_t uvec, long n, char **out, char *strings, size_t *used, size_t cap)
+{
+    for (long i = 0; i < n; i++) {
+        u64 uptr;
+        if (copy_from_user(&uptr, uvec + i * 8, 8))
+            return -EFAULT;
+        if (!uptr)
+            return -EFAULT;     /* the vector changed under us */
+        long r = strncpy_from_user(strings + *used, uptr, cap - *used);
         if (r < 0)
             return r == -ENAMETOOLONG ? -E2BIG : r;
-        out[n] = strings + *used;
+        out[i] = strings + *used;
         *used += r + 1;
     }
     out[n] = NULL;
     return n;
 }
 
+/*
+ * The vectors are sized from the argument counts, and the strings get 4 KiB
+ * at first: only a long command line (a link) pays for the room it needs,
+ * up to MAX_ARG_LEN.
+ */
 long sys_execve(uintptr_t upath, uintptr_t uargv, uintptr_t uenvp)
 {
     char path[128];
-    char *argv[MAX_ARGS + 1], *envp[MAX_ARGS + 1];
     long r = strncpy_from_user(path, upath, sizeof(path));
     if (r < 0)
         return r;
+    long argc = count_strv(uargv), envc = count_strv(uenvp);
+    if (argc < 0)
+        return argc;
+    if (envc < 0)
+        return envc;
 
-    char *strings = kmalloc(MAX_ARG_LEN);
-    if (!strings)
+    char **argv = kmalloc((argc + 2 + envc + 1) * sizeof(char *));
+    if (!argv)
         return -ENOMEM;
-    size_t used = 0;
-    r = copy_strv(uargv, argv, strings, &used);
-    if (r >= 0) {
-        if (r == 0) {
-            argv[0] = (char *)basename(path);
-            argv[1] = NULL;
+    char **envp = argv + argc + 2;
+    for (size_t cap = 4096;; cap *= 8) {
+        if (cap > MAX_ARG_LEN)
+            cap = MAX_ARG_LEN;
+        char *strings = kmalloc(cap);
+        if (!strings) {
+            r = -ENOMEM;
+            break;
         }
-        r = copy_strv(uenvp, envp, strings, &used);
+        size_t used = 0;
+        r = copy_strv(uargv, argc, argv, strings, &used, cap);
+        if (r >= 0) {
+            if (argc == 0) {
+                argv[0] = (char *)basename(path);
+                argv[1] = NULL;
+            }
+            r = copy_strv(uenvp, envc, envp, strings, &used, cap);
+        }
+        if (r >= 0)
+            r = do_exec(current_proc(), path, argv, envp);
+        kfree(strings);
+        if (r != -E2BIG || cap == MAX_ARG_LEN)
+            break;
     }
-    if (r >= 0)
-        r = do_exec(current_proc(), path, argv, envp);
-    kfree(strings);
+    kfree(argv);
     return r;
 }
 
@@ -369,7 +414,7 @@ long sys_execve(uintptr_t upath, uintptr_t uargv, uintptr_t uenvp)
 struct spawn_args {
     char path[128];
     int argc;
-    char *argv[MAX_ARGS + 1];
+    char *argv[MAX_SPAWN_ARGS + 1];
     char strings[512];
 };
 
@@ -396,7 +441,7 @@ struct proc *proc_spawn(const char *path, char *const argv[])
         return NULL;
     strlcpy(sa->path, path, sizeof(sa->path));
     size_t used = 0;
-    for (int i = 0; argv && argv[i] && i < MAX_ARGS; i++) {
+    for (int i = 0; argv && argv[i] && i < MAX_SPAWN_ARGS; i++) {
         size_t len = strlen(argv[i]) + 1;
         if (used + len > sizeof(sa->strings))
             break;

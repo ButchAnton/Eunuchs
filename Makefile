@@ -73,6 +73,8 @@ UPROGS  += $(addprefix $(BUILD)/user/bin/,$(UMULTI))
 UMULTI_OBJS := $(patsubst user/bin/%.c,$(BUILD)/user/multi/%.o,$(wildcard user/bin/*/*.c))
 # --- Disk image: user programs and a few directories, built by the host mkfs ---
 MKFS    := $(BUILD)/tools/mkfs
+# the kernel linker, for tcc's kernel (tools/kld)
+KLD     := $(BUILD)/tools/kld
 FSIMG   := $(BUILD)/fs.img
 FS_MB   ?= 32
 EUTILS_LINKS = echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile \
@@ -120,7 +122,7 @@ SHAREOPTS = $(if $(HOSTDIR),-fsdev local$(comma)id=hostfs$(comma)path=$(HOSTDIR)
             -device virtio-9p-device$(comma)fsdev=hostfs$(comma)mount_tag=host)
 QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(SHAREOPTS) $(NETOPTS)
 
-.PHONY: all user fsck clean-home run debug gdb test selfhost stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean sysroot
+.PHONY: all user fsck clean-home run debug gdb test selfhost tcc-kernel stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean sysroot
 
 # Written on Apple Silicon. A different host (Intel Mac) or Homebrew GCC
 # can change RISC-V ELF ABI tags; .S files have no header deps, so they
@@ -131,7 +133,7 @@ QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(SHAREOPTS) $(NETO
 CC_ID := $(BUILD)/.cc-id
 $(shell mkdir -p $(BUILD) && printf '%s\n' "$(shell uname -m)" "$(CC)" "$(CFLAGS)" "$(UCFLAGS)" "$(shell $(CC) --version 2>/dev/null | head -1)" "$(shell $(HOSTCC) --version 2>/dev/null | head -1)" > $(CC_ID).tmp && { cmp -s $(CC_ID) $(CC_ID).tmp || mv $(CC_ID).tmp $(CC_ID); } && rm -f $(CC_ID).tmp)
 
-all: $(KERNEL) $(FSIMG)
+all: $(KERNEL) $(FSIMG) $(KLD)
 
 # --- Two-pass link: pass 1 has an empty symbol table; its symbols generate
 # --- the real table for pass 2. .ksyms is last in the image, so no other
@@ -142,7 +144,7 @@ $(BUILD)/ksyms0.S: tools/gen_ksyms.py
 
 $(PASS1): $(KOBJS) $(BUILD)/ksyms0.o $(LDSCRIPT)
 	$(call msg,LD,$@)
-	$(Q)$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(KOBJS) $(BUILD)/ksyms0.o -lgcc
+	$(Q)$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(KOBJS) $(BUILD)/ksyms0.o
 
 $(BUILD)/ksyms.S: $(PASS1) tools/gen_ksyms.py
 	$(call msg,KSYMS,$@)
@@ -150,7 +152,7 @@ $(BUILD)/ksyms.S: $(PASS1) tools/gen_ksyms.py
 
 $(KERNEL): $(KOBJS) $(BUILD)/ksyms.o $(LDSCRIPT)
 	$(call msg,LD,$@)
-	$(Q)$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(KOBJS) $(BUILD)/ksyms.o -lgcc
+	$(Q)$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(KOBJS) $(BUILD)/ksyms.o
 	@$(NM) -n $(PASS1) | grep -i ' t ' > $(BUILD)/pass1.syms
 	@$(NM) -n $@ | grep -i ' t ' > $(BUILD)/pass2.syms
 	@cmp -s $(BUILD)/pass1.syms $(BUILD)/pass2.syms || \
@@ -431,23 +433,38 @@ test: $(KERNEL) $(FSIMG) $(MKFS)
 	@$(PYTHON) tools/run_tests.py --qemu "$(QEMU) $(QEMUBASE)" --image $(FSIMG) \
 		--mkfs $(MKFS) --timeout $(TEST_TIMEOUT) --append "$(APPEND)"
 
-# Self-hosting: Eunuchs builds its own user space with tcc from this tree
-# (shared on /mnt/host), twice: with the image's tcc, then with the tcc that
-# built (tools/selfhost.py; the stages must be identical). Then the test suite
-# runs on an image made from what it built.
+# Self-hosting: Eunuchs builds itself with tcc from this tree (shared on
+# /mnt/host): user space (user/build.mk), then the kernel (kernel/build.mk,
+# linked by kld), twice: with the image's tcc, then with the tcc that built
+# (tools/selfhost.py; the stages must be identical). Then the test suite
+# boots the kernel it built, with an image made from the rest.
 SH_OUT   := $(BUILD)/selfhost/stage2
+SH_KERNEL := $(SH_OUT)/kernel/kernel.elf
 SH_LIBS  := crt1.o crti.o crtn.o libc.a tcc/libtcc1.a tcc/runmain.o
 sh_file   = $(if $(findstring =$(BUILD)/user/stripped/,$(1)),$(subst =$(BUILD)/user/stripped/,=$(SH_OUT)/bin/,$(1)),$(if $(filter $(addprefix %/,$(SH_LIBS)),$(1)),$(subst =$(SYSROOT)/usr/lib/,=$(SH_OUT)/sysroot/usr/lib/,$(1)),$(1)))
-SH_FILES  = $(foreach f,$(FS_FILES),$(call sh_file,$(f)))
+SH_FILES  = $(foreach f,$(FS_FILES),$(call sh_file,$(f))) /bin/kld=$(SH_OUT)/bin/kld
+# per-stage test timeout: tcc's kernel is about half as fast
+SH_TIMEOUT ?= 120
 
 selfhost: $(KERNEL) $(FSIMG) $(MKFS)
 	@$(PYTHON) tools/selfhost.py --qemu "$(QEMU) $(QEMUBASE)" --image $(FSIMG)
 	@if echo "$(SH_FILES)" | tr ' ' '\n' | grep -E '=$(BUILD)/user/stripped/|=$(SYSROOT)/usr/lib/(crt[1in]|libc|tcc/libtcc1|tcc/runmain)\.'; then \
 		echo "selfhost: the files above would still be the gcc-built ones"; exit 1; fi
 	$(Q)$(MKFS) --label root $(BUILD)/selfhost/fs.img $(FS_MB) $(SH_FILES) > /dev/null
-	@echo "selfhost: build/selfhost/fs.img: every program and library built on Eunuchs"
-	@$(PYTHON) tools/run_tests.py --qemu "$(QEMU) $(QEMUBASE)" --image $(BUILD)/selfhost/fs.img \
-		--mkfs $(MKFS) --timeout $(TEST_TIMEOUT) --append "$(APPEND)" --programs $(SH_OUT)/bin
+	@echo "selfhost: $(SH_KERNEL) and build/selfhost/fs.img: built on Eunuchs, by tcc"
+	@$(PYTHON) tools/run_tests.py --qemu "$(QEMU) $(subst -kernel $(KERNEL),-kernel $(SH_KERNEL),$(QEMUBASE))" \
+		--image $(BUILD)/selfhost/fs.img --mkfs $(MKFS) --timeout $(SH_TIMEOUT) --append "$(APPEND)" \
+		--programs $(SH_OUT)/bin
+
+# The kernel compiled by the cross tcc and linked by kld, on the Mac (what
+# selfhost builds on Eunuchs): build/tcc-kernel/kernel/kernel.elf.
+$(KLD): tools/kld/kld.c
+	@mkdir -p $(dir $@)
+	$(call msg,HOSTCC,$@)
+	$(Q)$(HOSTCC) -O1 -g -Wall -Wextra -Werror -o $@ $<
+
+tcc-kernel: $(XTCC) $(KLD)
+	@$(MAKE) --no-print-directory -s -f kernel/build.mk OUT=$(BUILD)/tcc-kernel TCC=$(CURDIR)/$(XTCC) KLD=$(KLD)
 
 # SMP soak test: STRESS_SECS of parallel fork/exec/pipe/file/COW load on
 # $(CPUS) CPUs, booted with lockdep=panic (and the lockup watchdog on), then
@@ -491,12 +508,12 @@ $(BUILD)/host/test_tcp: kernel/net/tcp.c kernel/net/netbuf.c kernel/net/cksum.c
 $(BUILD)/host/%: tests/host/%.c
 	@mkdir -p $(dir $@)
 	$(call msg,HOSTCC,$@)
-	$(Q)$(HOSTCC) $(HOST_CFLAGS) $(if $(filter %test_tcp,$@),-DNET_HOST_TEST) -o $@ $^
+	$(Q)$(HOSTCC) $(HOST_CFLAGS) $(if $(filter %test_tcp,$@),-DNET_HOST_TEST) -o $@ $(filter-out $(CC_ID),$^)
 
 $(KOBJS) $(ULIB) $(UMULTI_OBJS) $(BUILD)/tcc/tcc.o \
   $(BUILD)/ksyms0.o $(BUILD)/ksyms.o \
   $(patsubst user/bin/%.c,$(BUILD)/user/bin/%.o,$(wildcard user/bin/*.c)) \
-  $(XTCC) $(MKFS) $(HOST_TESTS): $(CC_ID)
+  $(XTCC) $(MKFS) $(KLD) $(HOST_TESTS): $(CC_ID)
 
 test-host: $(HOST_TESTS) $(MKFS) $(BUILD)/user/bin/hello $(XTCC)
 	@for t in $(HOST_TESTS); do echo "== $$t"; $$t || exit 1; done

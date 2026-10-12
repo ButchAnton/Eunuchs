@@ -521,7 +521,10 @@ ST_FUNC void put_extern_sym2(Sym *sym, int sh_num,
     char buf1[256];
 
     if (!sym->c) {
-        name = get_tok_str(sym->v, NULL);
+        /* Eunuchs: anonymous symbols (riscv64's labels for the auipc of a
+           pc-relative pair) get an empty name, not "<no name>", so that
+           symbolizers skip them */
+        name = sym->v ? get_tok_str(sym->v, NULL) : "";
         t = sym->type.t;
         if ((t & VT_BTYPE) == VT_FUNC) {
             sym_type = STT_FUNC;
@@ -8427,7 +8430,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
 #endif
         if (v) {
             /* local variable */
-#ifdef CONFIG_TCC_ASM
+#if defined CONFIG_TCC_ASM && !defined TCC_TARGET_RISCV64
 	    if (ad->asm_label) {
 		int reg = asm_parse_regvar(ad->asm_label);
 		if (reg >= 0)
@@ -8445,6 +8448,16 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
 	    }
 
             sym->a = ad->a;
+#if defined CONFIG_TCC_ASM && defined TCC_TARGET_RISCV64
+            /* Eunuchs: the riscv64 code generator cannot keep a variable in
+               an arbitrary register, so a `register T x asm("reg")` lives on
+               the stack, and asm operands that name it use the register
+               (which is what gcc guarantees, too) */
+            if (ad->asm_label && asm_parse_regvar(ad->asm_label) >= 0) {
+                sym->asm_label = ad->asm_label;
+                sym->a.regvar = 1;
+            }
+#endif
         } else {
             /* push local reference */
             vset(type, r, addr);

@@ -84,8 +84,11 @@ typedef struct {
 #define atomic_init(object, desired)                                      \
     atomic_store_explicit(object, desired, __ATOMIC_RELAXED)
 
+/* Eunuchs: once, atomically (this stored a plain *(ptr) = (val) first,
+   which unlocked a spinlock early, and then again) */
 #define __atomic_store_n(ptr, val, order)                                 \
-    (*(ptr) = (val), __atomic_store((ptr), &(typeof(*(ptr))){val}, (order)))
+    ({ typeof(*(ptr)) __val = (val);                                      \
+       __atomic_store((ptr), &__val, (order)); })
 #define atomic_store_explicit(object, desired, order)                     \
     ({ __typeof__ (object) ptr = (object);                                \
        __typeof__ (*ptr) tmp = (desired);                                 \
@@ -115,6 +118,10 @@ typedef struct {
     })
 #define atomic_exchange(object, desired)                                  \
   atomic_exchange_explicit (object, desired, __ATOMIC_SEQ_CST)
+#define __atomic_exchange_n(ptr, val, order)                              \
+    ({ typeof(*(ptr)) __val = (val), __old;                               \
+       __atomic_exchange((ptr), &__val, &__old, (order));                 \
+       __old; })
 #define __atomic_compare_exchange_n(ptr, expected, desired, weak, success, failure) \
     ({ typeof(*(ptr)) __desired = (desired);                              \
        __atomic_compare_exchange((ptr), (expected), &__desired,          \

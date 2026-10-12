@@ -33,9 +33,11 @@ struct fdt_header {
 
 struct platform_info platform;
 
+/* (by bytes, not __builtin_bswap32: without Zbb that is a libgcc call) */
 static inline u32 be32(const void *p)
 {
-    return __builtin_bswap32(*(const u32 *)p);
+    const u8 *b = p;
+    return (u32)b[0] << 24 | (u32)b[1] << 16 | (u32)b[2] << 8 | b[3];
 }
 
 static u64 read_cells(const u8 *p, u32 cells)

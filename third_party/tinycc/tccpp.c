@@ -3390,8 +3390,16 @@ static int macro_subst_tok(
         } else if (v == TOK___DATE__ || v == TOK___TIME__) {
             time_t ti;
             struct tm *tm;
-            time(&ti);
-            tm = localtime(&ti);
+            /* Eunuchs: reproducible builds, as with gcc: SOURCE_DATE_EPOCH
+               (seconds since 1970) is the time, in UTC */
+            const char *sde = getenv("SOURCE_DATE_EPOCH");
+            if (sde && *sde) {
+                ti = (time_t)strtoll(sde, NULL, 10);
+                tm = gmtime(&ti);
+            } else {
+                time(&ti);
+                tm = localtime(&ti);
+            }
             if (v == TOK___DATE__) {
                 static char const ab_month_name[12][4] = {
                     "Jan", "Feb", "Mar", "Apr", "May", "Jun",

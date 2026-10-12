@@ -252,7 +252,7 @@ Keys are emacs-style, as in zsh's default keymap:
 | Keys | Action |
 |---|---|
 | Left/Right, `^B`/`^F` | Character left/right. Right, `^F`, End or `^E` at the end of the line accepts the gray suggestion. |
-| `^A`/`^E`, Home/End | Start/end of the (current line of the) buffer. Under `make run`, QEMU uses `^A` as its own escape key: press `^A ^A`, or use Home. |
+| `^A`/`^E`, Home/End | Start/end of the (current line of the) buffer. (Under `make run`, QEMU's escape key is `^^`, so `^A` reaches esh.) |
 | `Alt-B`/`Alt-F`, `^Left`/`^Right` | Word left/right (`Alt-F` at the end accepts one word of the suggestion). Words are letters, digits and the characters in `$WORDCHARS` (default `*?_-.[]~=&;!#$%^(){}<>`, without `/`). |
 | Backspace, `^D`/Delete | Delete left / under the cursor. `^D` on an empty line exits (unless `ignoreeof`); at the end of a non-empty line it lists completions. |
 | `^W`, `Alt-Backspace` / `Alt-D` | Kill the word left / right. |

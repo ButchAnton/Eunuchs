@@ -245,6 +245,8 @@ def forms(rng):
     for m in "csrrw csrrs csrrc".split():
         b.append(lambda m=m: "%s %s, %s, %s" % (m, X(), rng.choice(["sstatus", "sepc", "satp", "0x7c0",
                                                                     str(imm(0, 4095))]), X()))
+    for m in "csrw csrs csrc".split():
+        b.append(lambda m=m: "%s %s, %d" % (m, rng.choice(["sstatus", "sie", "0x7c0"]), imm(0, 31)))
     for m in "csrrwi csrrsi csrrci".split():
         b.append(lambda m=m: "%s %s, %d, %d" % (m, X(), imm(0, 4095), imm(0, 31)))
     b.append(lambda: "li %s, %#x" % (X(), rng.getrandbits(64)))

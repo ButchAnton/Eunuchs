@@ -101,7 +101,7 @@ sp                      : argc
 
 The kernel also sets `a0 = argc`, `a1 = sp + 8` and `a2 = envp`, but `_start` does not rely on them: it reloads `argc` from `0(sp)` and computes `argv = sp + 8` and `envp = argv + argc + 1` itself. The auxiliary vector contains only `AT_NULL`; libc never reads it.
 
-Limits come from `sys_execve`/`copy_strv`: at most `MAX_ARGS` = 32 argument pointers and 32 environment pointers, and `MAX_ARG_LEN` = 4096 bytes of strings in total (both vectors together); more fails with `E2BIG`. The path is copied into a 128-byte buffer. An empty `argv` is replaced by the basename of the path.
+Limits come from `sys_execve`/`copy_strv`: at most `MAX_ARGS` = 2048 argument pointers and 2048 environment pointers, and `MAX_ARG_LEN` = 128 KiB of strings in total (both vectors together); more fails with `E2BIG`. The path is copied into a 128-byte buffer. An empty `argv` is replaced by the basename of the path.
 
 ### errno and the return convention
 

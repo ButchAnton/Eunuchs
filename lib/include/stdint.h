@@ -1,6 +1,15 @@
 #ifndef _STDINT_H
 #define _STDINT_H
 
+/*
+ * Shared by the kernel and the C library (gcc's freestanding <stdint.h>
+ * defines the same types; tcc has none). Host tests built for the Mac get
+ * the host's own.
+ */
+#ifndef __riscv
+#include_next <stdint.h>
+#else
+
 /* LP64: char 8, short 16, int 32, long and pointers 64 bits. */
 
 typedef signed char int8_t;
@@ -70,5 +79,7 @@ typedef unsigned long uintmax_t;
 #define UINT64_C(c) c##UL
 #define INTMAX_C(c) c##L
 #define UINTMAX_C(c) c##UL
+
+#endif /* __riscv */
 
 #endif

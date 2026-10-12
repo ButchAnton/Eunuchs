@@ -9,7 +9,7 @@ import re
 import sys
 
 TEXT_TYPES = {"t", "T", "W"}
-SKIP = re.compile(r"^(\.L|\$|__ksym)")
+SKIP = re.compile(r"^(\.L|\$|__ksym|L\.\.)")       # L..: tcc's local labels (as kld)
 
 
 def main():

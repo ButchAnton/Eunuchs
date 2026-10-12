@@ -29,6 +29,7 @@ SECTIONS
     .rodata : {
         *(.srodata .srodata.*)
         *(.rodata .rodata.*)
+        *(.data.ro .data.ro.*)          /* tcc's read-only data */
 
         /* In-kernel unit tests (KTEST) */
         . = ALIGN(8);

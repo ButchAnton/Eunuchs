@@ -164,7 +164,7 @@ Invariants:
 
 `kinit` (`kernel/core/main.c`) calls `proc_spawn("/bin/init", argv)`, or the binary named by the `init=` boot option. With the `utest` option it runs `init -1 /bin/utests [arg]` and then `proc_wait_kernel`.
 
-1. Copies the path and up to `MAX_ARGS` (32) arguments into a `struct spawn_args` (512 bytes of string space). If no arguments are given, argv[0] is the basename.
+1. Copies the path and up to `MAX_SPAWN_ARGS` (32) arguments into a `struct spawn_args` (512 bytes of string space). If no arguments are given, argv[0] is the basename.
 2. `proc_alloc(basename, NULL)`: no parent.
 3. Creates a suspended kernel thread running `user_entry`. If this process is pid 1 it records `initproc`.
 4. Opens `/dev/console` three times as fds 0–2 (it panics if `/dev` is not mounted), sets `cwd` to the root, `umask` to 022, `pgid = sid = pid` (a new session), and calls `tty_set_ctty`, which makes the console this process's controlling terminal and the foreground group.
@@ -186,7 +186,7 @@ On failure (no `mm` or no thread) the child is unlinked under `proc_lock` and fr
 
 `sys_execve`:
 - copies the path (up to 128 bytes);
-- copies argv and envp with `copy_strv` into one 4 KiB (`MAX_ARG_LEN`) kmalloc buffer, with at most `MAX_ARGS` = 32 pointers each (more gives `-E2BIG`; a string that overflows the buffer gives `-E2BIG`);
+- copies argv and envp with `copy_strv` into one 128 KiB (`MAX_ARG_LEN`) kmalloc buffer, with at most `MAX_ARGS` = 2048 pointers each, the pointer arrays also `kmalloc`ed rather than on the kernel stack (more gives `-E2BIG`; a string that overflows the buffer gives `-E2BIG`);
 - uses the basename of the path if argv is empty, then calls `do_exec`.
 
 `do_exec` builds everything new first and commits only at the end, so a failure leaves the caller untouched:
@@ -623,7 +623,7 @@ The monitor's `kill` sends SIGKILL with `spin_lock_debug`, so it works even if t
   - `sigsuspend` returns `EINTR` even when the only signal was a stop/continue.
 - **Exec costs and limits**:
   - The whole file is kept in kernel memory for every running image (shared only across `fork`), and every segment is copied eagerly. Text pages are not shared between processes that exec the same file.
-  - At most 32 argv and 32 envp entries in 4 KiB total, and no auxv beyond `AT_NULL`.
+  - At most 2048 argv and 2048 envp entries in 128 KiB of strings (raised from 32 and 4 KiB for the kernel's `kld` command line in self-hosting), and no auxv beyond `AT_NULL`. `do_exec` builds the initial stack's pointer vector in a `kmalloc`ed array too.
   - Programs larger than one 4 MiB `kmalloc` cannot be loaded.
 - **Pids are never reused**, and `next_pid` is a plain `int`. procfs inode numbers (`PID_BASE + pid * 8`, `u32`) overflow after about 5×10⁸ pids.
 - **Linear scans**: `proc_find` is O(n), `proc_nth` is O(n²), and a full `/proc` readdir calls `proc_nth_pid` once per entry. All of it runs under the global `proc_lock` with interrupts disabled.

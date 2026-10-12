@@ -325,8 +325,9 @@ ST_FUNC void load(int r, SValue *sv)
                 fc = SIGN7(fc);
                 rb = rr;
                 do32bit = 0;
-            } else if (bt == VT_LLONG) {
-                /* A 32bit unsigned constant for a 64bit type.
+            } else if (bt == VT_LLONG || bt == VT_PTR) {
+                /* A 32bit unsigned constant for a 64bit type (Eunuchs: a
+                   pointer too, like (void *)0x80200000UL).
                    lui always sign extends, so we need to do an explicit zext.*/
                 zext = 1;
             }
@@ -932,9 +933,14 @@ ST_FUNC void gfunc_epilog(void)
     loc = (loc - num_va_regs * 8);
     d = v = (-loc + 15) & -16;
 
-    EI(0x13, 0, 2, 8, num_va_regs * 8); // addi sp, s0, num_va_regs*8
+    /* Eunuchs: restore ra and s0 before freeing the frame. This moved sp
+       first and then read them from below it, where an interrupt (the
+       kernel's trap frame) or a signal frame can land in between: the
+       function then returned to its own epilogue, forever. */
     EI(0x03, 3, 1, 8, -8); // ld ra, -8(s0)
+    EI(0x13, 0, 5, 8, num_va_regs * 8); // addi t0, s0, num_va_regs*8
     EI(0x03, 3, 8, 8, -16); // ld s0, -16(s0)
+    EI(0x13, 0, 2, 5, 0); // mv sp, t0
     EI(0x67, 0, 0, 1, 0); // jalr x0, 0(x1), aka ret
 
     large_ofs_ind = ind;

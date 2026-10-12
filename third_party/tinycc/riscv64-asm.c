@@ -433,7 +433,8 @@ static void asm_emit_u(int token, uint32_t opcode, const Operand* rd, const Oper
 
 /* a fence operand: some of i, o, r, w (in that order) */
 static int parse_fence_operand(){
-    const char *p = get_tok_str(tok, NULL), *order = "iorw";
+    static const char iorw[] = "iorw";
+    const char *p = get_tok_str(tok, NULL), *order = iorw;
     int bits = 0;
     if (tok < TOK_IDENT)
         return -1;
@@ -441,7 +442,7 @@ static int parse_fence_operand(){
         const char *c = strchr(order, *p);
         if (!c)
             return -1;
-        bits |= 8 >> (c - "iorw");
+        bits |= 8 >> (c - iorw);
         order = c + 1;
     }
     next();
@@ -656,17 +657,23 @@ static void asm_binary_opcode(TCCState* s1, int token)
         asm_emit_opcode(0x73 | (2 << 12) | (asm_csr_num(token, &ops[1]) << 20) | ENCODE_RD(ops[0].reg));
         return;
     case TOK_ASM_csrw:
-        /* csrrw x0, csr, rs */
-        asm_emit_opcode(0x73 | (1 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(ops[1].reg));
-        return;
     case TOK_ASM_csrs:
-        /* csrrs x0, csr, rs */
-        asm_emit_opcode(0x73 | (2 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(ops[1].reg));
+    case TOK_ASM_csrc: {
+        /* csrr{w,s,c} x0, csr, rs; with a 5-bit immediate (as gas allows,
+           and as an "rK" asm operand gives) csrr{w,s,c}i x0, csr, uimm */
+        int f3 = token == TOK_ASM_csrw ? 1 : token == TOK_ASM_csrs ? 2 : 3;
+        uint32_t src;
+        if (ops[1].type == OP_REG && !REG_IS_FLOAT(ops[1].reg)) {
+            src = ops[1].reg;
+        } else if (ops[1].type == OP_IM12S && ops[1].e.v <= 31) {
+            src = ops[1].e.v;
+            f3 += 4;
+        } else {
+            tcc_error("'%s': expected a register or an immediate 0-31", get_tok_str(token, NULL));
+        }
+        asm_emit_opcode(0x73 | (f3 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(src));
         return;
-    case TOK_ASM_csrc:
-        /* csrrc x0, csr, rs */
-        asm_emit_opcode(0x73 | (3 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(ops[1].reg));
-        return;
+    }
     case TOK_ASM_csrwi:
         /* csrrwi x0, csr, uimm */
         asm_emit_opcode(0x73 | (5 << 12) | (asm_csr_num(token, &ops[0]) << 20) | ENCODE_RS1(ops[1].e.v));
@@ -2150,6 +2157,39 @@ static int tcc_freg(int r){
     return REG_VALUE(r) - 10 + 8;
 }
 
+/* Move an asm operand between memory and hardware register REG (integer
+   0-31, float 32-63). tcc's code generator only has a0-a7 and fa0-fa7;
+   another register (a register variable's, like s1) is loaded or stored
+   directly from the variable's stack slot. */
+static void asm_move_operand(int reg, SValue *sv, int is_store)
+{
+    int fp = REG_IS_FLOAT(reg), size, align, f3;
+    int64_t off = (int64_t)sv->c.i;
+    if (REG_VALUE(reg) >= 10 && REG_VALUE(reg) <= 17) {
+        int r = fp ? tcc_freg(reg) : tcc_ireg(reg);
+        if (is_store)
+            store(r, sv);
+        else
+            load(r, sv);
+        return;
+    }
+    size = type_size(&sv->type, &align);
+    if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != (VT_LOCAL | VT_LVAL)
+        || off < -2048 || off > 2047 || (size & (size - 1)) || size > 8
+        || (fp && size < 4) || REG_VALUE(reg) == 8)
+        tcc_error("asm operand in %s%d: only a local variable (not in s0) can be used",
+                  fp ? "f" : "x", REG_VALUE(reg));
+    f3 = size == 1 ? 0 : size == 2 ? 1 : size == 4 ? 2 : 3;
+    if (!is_store && !fp && size < 4 && (sv->type.t & VT_UNSIGNED))
+        f3 |= 4;                                /* lbu, lhu */
+    if (is_store)   /* s{b,h,w,d} / fs{w,d} reg, off(s0) */
+        gen_le32((fp ? 0x27 : 0x23) | (f3 << 12) | ENCODE_RS1(8) | ENCODE_RS2(reg)
+                 | ((off & 0x1f) << 7) | ((off >> 5 & 0x7f) << 25));
+    else            /* l{b,h,w,d}[u] / fl{w,d} reg, off(s0) */
+        gen_le32((fp ? 0x07 : 0x03) | (f3 << 12) | ENCODE_RD(reg) | ENCODE_RS1(8)
+                 | ((off & 0xfff) << 20));
+}
+
 /* generate prolog and epilog code for asm statement */
 ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
                          int nb_outputs, int is_output,
@@ -2212,12 +2252,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
                     load(tcc_ireg(op->reg), &sv);
                 } else if (i >= nb_outputs || op->is_rw) {
                     /* load value in register */
-                    if ((op->vt->type.t & VT_BTYPE) == VT_FLOAT ||
-                        (op->vt->type.t & VT_BTYPE) == VT_DOUBLE) {
-                        load(tcc_freg(op->reg), op->vt);
-                    } else {
-                        load(tcc_ireg(op->reg), op->vt);
-                    }
+                    asm_move_operand(op->reg, op->vt, 0);
                     /* RV64: long long fits in a single 64-bit register;
                        the load/store above already handles it correctly */
                 }
@@ -2241,12 +2276,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
                         store(tcc_ireg(op->reg), &sv);
                     }
                 } else {
-                    if ((op->vt->type.t & VT_BTYPE) == VT_FLOAT ||
-                        (op->vt->type.t & VT_BTYPE) == VT_DOUBLE) {
-                        store(tcc_freg(op->reg), op->vt);
-                    } else {
-                        store(tcc_ireg(op->reg), op->vt);
-                    }
+                    asm_move_operand(op->reg, op->vt, 1);
                     /* RV64: long long fits in a single 64-bit register */
                 }
             }
@@ -2296,6 +2326,7 @@ static inline int constraint_priority(const char *str)
             pr = 3;
             break;
         case 'I': // 12 bit signed immedate
+        case 'K': // 5 bit unsigned immediate (csrrwi, csrsi, ...)
         case 'i': // immediate integer operand, including symbolic constants [general]
         case 'm': // memory operand [general]
         case 'g': // general-purpose-register, memory, immediate integer [general]
@@ -2393,10 +2424,10 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
             operands[k].input_index = i;
             op->priority = 5;
         } else if ((op->vt->r & VT_VALMASK) == VT_LOCAL
-                   && op->vt->sym
-                   && (reg = op->vt->sym->r & VT_VALMASK) < VT_CONST) {
+                   && op->vt->sym && op->vt->sym->a.regvar) {
+            /* a register variable: its register */
             op->priority = 1;
-            op->reg = reg;
+            op->reg = asm_parse_regvar(op->vt->sym->asm_label);
         } else {
             op->priority = constraint_priority(str);
         }
@@ -2465,7 +2496,7 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
             /* From a0 to a7 */
             if ((reg = op->reg) >= 0)
                 goto reg_found;
-            else for (reg = 10; reg <= 18; reg++) {
+            else for (reg = 10; reg <= 17; reg++) {
                 if (!is_reg_allocated(reg))
                     goto reg_found;
             }
@@ -2481,7 +2512,7 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
             /* From fa0 to fa7 */
             if ((reg = op->reg) >= 0)
                 goto reg_found;
-            else for (reg = 42; reg <= 50; reg++) {
+            else for (reg = 42; reg <= 49; reg++) {
                 if (!is_reg_allocated(reg))
                     goto reg_found;
             }
@@ -2489,6 +2520,11 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
         case 'I': // I-Type 12 bit signed immediate
         case 'i': // immediate integer operand, including symbolic constants
             if (!((op->vt->r & (VT_VALMASK | VT_LVAL)) == VT_CONST))
+                goto try_next;
+            break;
+        case 'K': // 5 bit unsigned immediate
+            if (!((op->vt->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+                || (uint64_t)op->vt->c.i > 31)
                 goto try_next;
             break;
         case 'm': // memory operand
@@ -2504,7 +2540,7 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
             if (j < nb_outputs || c == 'm') {
                 if ((op->vt->r & VT_VALMASK) == VT_LLOCAL) {
                     /* any general register: from a0 to a7 */
-                    for (reg = 10; reg <= 18; reg++) {
+                    for (reg = 10; reg <= 17; reg++) {
                         if (!(regs_allocated[reg] & REG_IN_MASK))
                             goto reg_found1;
                     }

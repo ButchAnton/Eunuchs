@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""make selfhost: Eunuchs builds its own user space.
+"""make selfhost: Eunuchs builds itself.
 
 Boots Eunuchs with this source tree shared on /mnt/host and runs
-user/build.mk there twice:
+user/build.mk and kernel/build.mk there twice:
 
   stage 1  with the image's /bin/tcc (which gcc built), into build/selfhost/stage1
   stage 2  with stage 1's tcc, into build/selfhost/stage2
 
 Each stage builds the C library and tcc's runtime into a sysroot, then every
-program, tcc included. The two stages must be byte-for-byte identical: tcc
-built by tcc builds the same user space as tcc built by gcc (a fixed point).
-The Makefile then makes build/selfhost/fs.img from stage 2 and runs the test
-suite on it.
+program (tcc and kld, the kernel's linker, included), then the kernel. The
+two stages must be byte-for-byte identical: tcc built by tcc builds the same
+system as tcc built by gcc (a fixed point). The Makefile then boots stage 2's
+kernel with an image made from stage 2 and runs the test suite.
 
 Usage: selfhost.py --qemu "QEMU COMMAND" --image build/fs.img
 """
@@ -21,6 +21,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 
@@ -28,6 +29,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_tests import Console, ROOT  # noqa: E402
 
 OUT = os.path.join(ROOT, "build", "selfhost")
+
+
+def source_date_epoch():
+    """The time of the last commit (or now, outside git)."""
+    try:
+        return int(subprocess.run(["git", "-C", ROOT, "log", "-1", "--format=%ct"], capture_output=True,
+                                  text=True, check=True).stdout.strip())
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return int(time.time())
 
 
 def differences(a, b):
@@ -59,9 +69,6 @@ def main():
         "-fsdev", "local,id=hostfs,path=%s,security_model=none" % ROOT,
         "-device", "virtio-9p-device,fsdev=hostfs,mount_tag=host",
         "-append", "panic=shutdown"]
-    build = ("make -f user/build.mk OUT=build/selfhost/stage1 > build/selfhost/stage1.log 2>&1 && "
-             "make -f user/build.mk OUT=build/selfhost/stage2 TCC=build/selfhost/stage1/bin/tcc "
-             "> build/selfhost/stage2.log 2>&1")
     t0 = time.time()
     status = None
     with open(os.path.join(OUT, "console.log"), "w") as log:
@@ -69,7 +76,12 @@ def main():
         try:
             con.expect("root@eunuchs:/# ", 30)
             # the marker is assembled by the shell, so the echoed command line can't match it
-            con.line("cd /mnt/host && %s; s=$?; m=SELFHOST; echo ${m}-STATUS=$s." % build)
+            # (the stages are in tools/selfhost.sh: a long command line would
+            # not fit the terminal's line)
+            # __DATE__ and __TIME__ from the last commit, so both stages and
+            # every rebuild of one commit stamp the same time
+            con.line("cd /mnt/host && SOURCE_DATE_EPOCH=%d sh tools/selfhost.sh; s=$?; m=SELFHOST; "
+                     "echo ${m}-STATUS=$s." % source_date_epoch())
             con.expect("SELFHOST-STATUS=", a.timeout)
             con.expect(".", 5)
             m = re.search(r"SELFHOST-STATUS=(\d+)\.", con.log_text())
@@ -91,7 +103,8 @@ def main():
     if diff:
         print("selfhost: stage 1 and stage 2 differ:\n  " + "\n  ".join(diff[:20]))
         return 1
-    print("selfhost: %d programs and the C library; stage 1 and stage 2 are identical" % len(progs))
+    print("selfhost: the kernel, %d programs and the C library; stage 1 and stage 2 are identical"
+          % len(progs))
     return 0
 
 

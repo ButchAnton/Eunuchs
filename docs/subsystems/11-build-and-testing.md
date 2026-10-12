@@ -53,7 +53,7 @@ Out of scope: the efs on-disk format and the fsck rules (see the filesystem docu
 | Python | `PYTHON` | `python3` | `gen_ksyms.py`, `run_tests.py`, `ci.py`, `timeout.py`, trace/profile tools, `test_fsck.py` |
 | Host compiler | `HOSTCC` | `clang` | `mkfs` and the host tests |
 
-Install with `brew install qemu riscv64-elf-gcc riscv64-elf-gdb` (README). The Homebrew GCC must have multilib `libgcc` for both `rv64imac/lp64` (kernel) and `rv64gc/lp64d` (user), because both links pass `-lgcc`. The Makefile is written for GNU Make 3.81, the version macOS ships: user build rules are placed before the generic kernel pattern rules because 3.81 picks the first matching pattern rule, not the most specific one (comment "rules before the generic kernel ones" in `Makefile`).
+Install with `brew install qemu riscv64-elf-gcc riscv64-elf-gdb` (README). The Homebrew GCC must have multilib `libgcc` for both `rv64imac/lp64` (kernel) and `rv64gc/lp64d` (user), because both links used to pass `-lgcc`; today only user programs do (the kernel no longer needs libgcc). The Makefile is written for GNU Make 3.81, the version macOS ships: user build rules are placed before the generic kernel pattern rules because 3.81 picks the first matching pattern rule, not the most specific one (comment "rules before the generic kernel ones" in `Makefile`).
 
 ### Compiler flags and why
 
@@ -71,7 +71,7 @@ Install with `brew install qemu riscv64-elf-gcc riscv64-elf-gdb` (README). The H
 | `-Wall -Wextra -Werror -std=gnu11` | Warnings are errors everywhere |
 | `-Ikernel/include -Ilib/include` | Kernel headers and the shared `lib/` headers |
 
-Link: `LDFLAGS = -nostdlib -Wl,--no-warn-rwx-segments -T kernel/arch/riscv/kernel.ld`, plus `-lgcc` at the end of the link line.
+Link: `LDFLAGS = -nostdlib -Wl,--no-warn-rwx-segments -T kernel/arch/riscv/kernel.ld`, without `-lgcc`: the kernel avoids every libgcc helper (`fdt.c`'s `be32` reads bytes instead of calling `__builtin_bswap32`, which needs `__bswapsi2` without Zbb). The same objects can also be linked by `kld` if they are compiled with `-mno-relax` ([13](13-toolchain.md#kld-the-kernel-linker-toolskldkldc)).
 
 Avoid libgcc helpers that use lookup tables. `__builtin_ctz` and friends can become libgcc calls, and Homebrew's libgcc is compiled for the `medlow` model, so its table reference cannot reach a high-half kernel at link time. `kernel/proc/signal.c` (`lowest_bit`), `kernel/debug/lockdep.c` (`lowest_bit`) and `kernel/mm/kstack.c` (hand-written popcount loop) have comments saying so. User programs live at `0x10000` and do not have this problem.
 
@@ -116,7 +116,8 @@ User link: `$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ prog.o $(UL
 | `build/ktest-trace.bin`, `ktest-trace.json` | Event trace from the first test boot, and its Perfetto conversion |
 | `build/stress.img` | `make stress` scratch image |
 | `build/tcc/xtcc`, `build/tcc/tcc.o`, `build/tcc/rt/`, `build/tcc/libgcc/` | The host cross TinyCC, `/bin/tcc`'s object, tcc's runtime objects (built by `xtcc`), and the members extracted from `libgcc.a` ([13](13-toolchain.md)) |
-| `build/selfhost/` | `make selfhost`: `boot.img`, `stage1/` and `stage2/` (each `sysroot/`, `bin/`, `obj/`), `stage1.log`, `stage2.log`, `console.log`, and `fs.img` (the image with stage 2's programs and libraries) |
+| `build/selfhost/` | `make selfhost`: `boot.img`, `stage1/` and `stage2/` (each `sysroot/`, `bin/`, `obj/`, `kernel/` with `kernel.elf`), `stage1.log`, `stage2.log`, `console.log`, and `fs.img` (the image with stage 2's programs and libraries, booted with stage 2's kernel) |
+| `build/tcc-kernel/`, `build/tools/kld` | `make tcc-kernel`: the kernel compiled by `xtcc` and linked by the host `kld` |
 | `build/sysroot/usr/{include,lib}` | What the image gets in `/usr/include` and `/usr/lib` (`make sysroot`) |
 | `build/rr/` | Record/replay: `kernel.elf`, `base.img`, `fs.qcow2`, `snap.qcow2`, `replay.bin`, `append`, `record.log`, `replay.log` |
 | `build/ci/<step>.log` | `make ci` per-step logs |
@@ -129,7 +130,7 @@ User link: `$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ prog.o $(UL
 | Order | Section | Contents | Symbols |
 |---|---|---|---|
 | 1 | `.text` | `.text.boot` first, then all text | `__kernel_start`, `__text_end` |
-| 2 | `.rodata` (page-aligned) | `.srodata`, `.rodata`; then 8-aligned `.ktests` (`KEEP`), then 8-aligned `__ex_table` (`KEEP`) | `__rodata_start`, `__ktests_start/end`, `__ex_table_start/end`, `__rodata_end` |
+| 2 | `.rodata` (page-aligned) | `.srodata`, `.rodata`, `.data.ro`/`.data.ro.*` (tcc's read-only data); then 8-aligned `.ktests` (`KEEP`), then 8-aligned `__ex_table` (`KEEP`) | `__rodata_start`, `__ktests_start/end`, `__ex_table_start/end`, `__rodata_end` |
 | 3 | `.data` + `.bss` (page-aligned) | `.sdata`, `.data`; `.sbss`, `.bss`, `COMMON` | `__data_start`, `__bss_start/end`, `__data_end` |
 | 4 | `.stacks` (NOLOAD, 32 KiB-aligned) | boot and emergency stacks; each 32 KiB slot's lower half is a guard | `__stacks_start/end` |
 | 5 | `.ksyms` (page-aligned) | symbol table, last so its size cannot move anything else | `__ksyms_start`, `__kernel_end` |
@@ -418,7 +419,7 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 3. Print `ci: <step> ok|FAILED (Ns)` per step (on a TTY a `...` placeholder is overwritten with `\r`). On failure print the last 20 log lines and stop, unless `--keep-going`.
 4. Print `ci: X of Y steps passed in Ns` and exit 0 only if every step ran and passed.
 
-`--quick` drops `test (1 CPU)`, `soak` and `selfhost`. A full run is 7 steps (about 4 minutes). Pass flags with `make ci CI_FLAGS="--quick --keep-going"`. GNU make exports command-line variables to recipe environments, so `make ci STRESS_SECS=30` reaches `ci.py` through `$STRESS_SECS`.
+`--quick` drops `test (1 CPU)`, `soak` and `selfhost`. A full run is 7 steps (about 4.5 minutes, of which `selfhost` is about 2). Pass flags with `make ci CI_FLAGS="--quick --keep-going"`. GNU make exports command-line variables to recipe environments, so `make ci STRESS_SECS=30` reaches `ci.py` through `$STRESS_SECS`.
 
 ## Concurrency and locking
 
@@ -453,7 +454,8 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 | `replay-check` | kernel, image | Record and replay `panic=shutdown ktest`; require identical output |
 | `flamegraph` | (`build/profile.bin`) | `euprof.py report`, `svg` and `folded`, all with `--no-idle` |
 | `trace-json` | (`build/trace.bin`) | `eutrace.py perfetto` → `build/trace.json` |
-| `selfhost` | kernel, image, mkfs | Eunuchs builds its own user space twice with tcc in the guest (`tools/selfhost.py`), requires the two stages identical, makes `build/selfhost/fs.img` from stage 2 and runs the whole `make test` scenario on it ([13](13-toolchain.md#eunuchs-builds-its-own-user-space-userbuildmk-make-selfhost)) |
+| `selfhost` | kernel, image, mkfs | Eunuchs builds its own user space and kernel twice with tcc (and `kld`) in the guest (`tools/selfhost.py` runs `tools/selfhost.sh` there, with `SOURCE_DATE_EPOCH` = the last commit's time), requires the two stages byte-identical, makes `build/selfhost/fs.img` from stage 2, and runs the whole `make test` scenario booting stage 2's kernel, with `SH_TIMEOUT` (default 120 s) per stage because that kernel is about half as fast ([13](13-toolchain.md#eunuchs-builds-its-own-kernel-kernelbuildmk)) |
+| `tcc-kernel` | `build/tcc/xtcc`, `build/tools/kld` | `kernel/build.mk` on the Mac: `build/tcc-kernel/kernel/kernel.elf` |
 | `clean` | | `rm -rf build` (keeps `home.img`) |
 | `sysroot` | `/bin/tcc`'s runtime, `libc.a` | Stage `build/sysroot` (headers, start-up files, `libc.a`, `libtcc1.a`, `runmain.o`), which the image copies to `/usr` ([13](13-toolchain.md)) |
 | `clean-home` | | `rm -f home.img` |
@@ -475,6 +477,7 @@ Internal file targets you may name directly: `build/tcc/xtcc` (the host cross Ti
 | `STRESS_SECS` | `120` | Duration of `make stress` (`ci.py` uses 60 unless overridden) |
 | `FS_MB` | `32` | Disk image size |
 | `HOSTDIR` | the project directory | The Mac directory shared read-write on `/mnt/host` by `run`, `debug` and `qemu-log`; empty to share nothing |
+| `SH_TIMEOUT` | `120` | Seconds per boot stage when `make selfhost` tests the tcc-built kernel |
 | `HOME_IMG` | `home.img` | The persistent `/home` disk image |
 | `HOME_MB` | `64` | Its size when it is created (an existing image is not resized) |
 | `HTTP_PORT` | `8080` | Host port → guest TCP 80 |
@@ -491,7 +494,7 @@ Boot options most used with these targets (the full list is printed by the `help
 | Tool | Usage |
 |---|---|
 | `tools/run_tests.py` | `--qemu "CMD"` (required; QEMU without disk), `--image` (required), `--mkfs` (required), `--timeout` (default 60), `--append` (default empty), `--programs DIR` (the programs in the image, default `build/user/stripped`; the 9P stage compares the guest's copy of `/bin/cat` with `DIR/cat`) |
-| `tools/selfhost.py` | `--qemu "CMD" --image build/fs.img [--timeout 900]`: boots with the repository shared, runs both stages of `user/build.mk`, compares them |
+| `tools/selfhost.py` | `--qemu "CMD" --image build/fs.img [--timeout 900]`: boots with the repository shared, runs `sh tools/selfhost.sh` in the guest (both stages of `user/build.mk` and `kernel/build.mk`; a script because a typed command line is limited to 255 bytes), compares the stages |
 | `tools/ci.py` | `--quick`, `--keep-going`, `--stress-secs N` (default `$STRESS_SECS` or 60); honours `$MAKE` |
 | `tools/timeout.py` | `timeout.py SECONDS CMD...`: exit status of CMD, or 124 after killing it |
 | `tools/gen_ksyms.py` | stdin: `nm -n` output; stdout: assembly |
