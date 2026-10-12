@@ -62,7 +62,7 @@ Use the up/down arrows for history. To exit QEMU, press `Ctrl-^ X`.
 
 ## Disk and filesystems
 
-The root filesystem is **efs** on a virtio disk, `build/fs.img` (volume label `root`). `make` builds it with the host tool `build/tools/mkfs`. It holds the user programs from `user/bin`, `/etc/motd`, and empty `/dev`, `/proc`, `/tmp` and `/home`. The image is rebuilt whenever a program changes, which discards files created at run time.
+The root filesystem is **efs** on a virtio disk, `build/fs.img` (volume label `root`). `make` builds it with the host tool `build/tools/mkfs`. It holds the user programs from `user/bin`, `/etc/motd`, empty `/dev`, `/proc`, `/tmp` and `/home`, the toolchain in `/usr`, and the system's own source tree in `/usr/src/eunuchs` (64 MiB in all). The image is rebuilt whenever a program changes, which discards files created at run time.
 
 `make run` (and `debug`, `qemu-log`) also attaches a second disk, `home.img` in the top directory (label `home`, 64 MiB, with `/guest` owned by uid 1000). The kernel mounts it on `/home`, so files kept there survive rebuilds and `make clean`; `make clean-home` deletes it. The kernel picks disks by label, not order: `/` is the disk labelled `root` (or disk 0), `/home` the one labelled `home`. The boot log says which (`mounted efs (disk1) on /home`). `make test` boots with the root disk only.
 

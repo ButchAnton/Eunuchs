@@ -55,17 +55,17 @@ All sizes come from `efs_format.h`. A block is `EFS_BSIZE` = 4096 bytes, which i
 
 **Layout.** `tools/mkfs/mkfs.c: do_mkfs` decides it:
 
-| Region | Blocks | Default image (`FS_MB=32`, 8192 blocks) |
+| Region | Blocks | Default image (`FS_MB=64`, 16384 blocks) |
 |---|---|---|
 | boot block (unused) | 1 | 0 |
 | superblock | 1 | 1 |
 | log header | 1 | 2 (`logstart`, always 2) |
 | log data | `EFS_LOGSIZE` = 64 | 3–66 |
-| inode table | ⌈`ninodes` / `EFS_IPB`⌉ = 1024/32 = 32 | 67–98 (`inodestart`) |
-| free bitmap | ⌈`size` / 32768⌉ | 99 (`bmapstart`) |
-| data | the rest | 100–8191 (`datastart`), 8092 blocks |
+| inode table | ⌈`ninodes` / `EFS_IPB`⌉ = 2048/32 = 64 | 67–130 (`inodestart`) |
+| free bitmap | ⌈`size` / 32768⌉ | 131 (`bmapstart`) |
+| data | the rest | 132–16383 (`datastart`), 16252 blocks |
 
-`nlog` = `EFS_LOGSIZE + 1` = 65 (header included). mkfs always uses `ninodes` = 1024. One bitmap block covers 32768 blocks (128 MiB). The bitmap has one bit per block of the whole disk, so mkfs marks metadata blocks 0..`datastart-1` as used.
+`nlog` = `EFS_LOGSIZE + 1` = 65 (header included). mkfs gives one inode per 8 blocks (32 KiB of disk), at least 1024: 2048 for the default 64 MiB image, 1024 for 32 MiB or smaller disks (images made before this change always have 1024). The kernel takes `ninodes` from the superblock. One bitmap block covers 32768 blocks (128 MiB). The bitmap has one bit per block of the whole disk, so mkfs marks metadata blocks 0..`datastart-1` as used.
 
 **`struct efs_super`** (64 bytes, in block 1): `magic` = `EFS_MAGIC` 0x53465545 ("EUFS"), `version` = 1, `bsize`, `size` (total blocks), `ninodes`, `nlog`, `logstart`, `inodestart`, `bmapstart`, `datastart`, `mkfs_time` (ns since the epoch), and `label[16]`, the volume label (`root`, `home`; NUL-padded, not necessarily NUL-terminated when all 16 bytes are used). Images made before the label existed have zeros there, which reads as an empty label; the version was not bumped.
 
@@ -95,7 +95,7 @@ file block bn            where
 1036 .. 1036+1048575     dbl = addrs[13];  dbl[(bn-1036)/1024][(bn-1036)%1024]  (+4 GiB)
 ```
 
-`EFS_MAXFILE` = (12 + 1024 + 1024²) × 4096 = 4,299,210,752 bytes. In practice the disk is the limit: 8092 data blocks in the default image. A pointer of 0 inside the map is a hole, which reads as zeros (`efs_read` uses a static zero block).
+`EFS_MAXFILE` = (12 + 1024 + 1024²) × 4096 = 4,299,210,752 bytes. In practice the disk is the limit: 16252 data blocks in the default image. A pointer of 0 inside the map is a hole, which reads as zeros (`efs_read` uses a static zero block).
 
 **Directories** are ordinary files made of `struct efs_dirent` records (64 bytes, `EFS_DPB` = 64 per block): `u32 ino` and `char name[60]` (`EFS_NAMELEN` = 59 plus NUL). `ino == 0` is a free slot. Every directory has `.` and `..`, and the root's `..` points to itself. Entries are never compacted, so a directory never shrinks.
 
@@ -141,6 +141,7 @@ file block bn            where
   - `covered`: the directory it is mounted on, `NULL` for `/`.
   - `ns_lock`: a mutex that serializes all namespace changes.
   - `path[32]`, `priv` (efs: `struct efs_info`), and `errors`, which counts `fs_error` reports.
+  - `dev`: the mount's number, 1, 2, … in the order `vfs_mount_disk` is called (`/` is 1, then `/home` if mounted, `/dev`, `/proc`, and the 9P shares), reported as `st_dev`.
 - **`struct inode`**: one in-memory copy per (sb, ino) while referenced.
   - `refcnt` is protected by `icache_lock`. Everything else is protected by `lock`, a mutex.
   - `valid` is set by the first `ilock`, which calls `read_inode`.
@@ -488,7 +489,7 @@ All of these take `sb->ns_lock` and run as one transaction, so each is atomic ac
   - procfs files and `/dev/kmsg` (`priv` set) are seekable; `SEEK_END` uses the snapshot length.
   - Seeking past EOF is allowed, and a later write leaves a hole.
 - **`fstat` / `fstatat`**: `vfs_stat` fills `struct stat`.
-  - `st_mode` = mode | `S_IFDIR`/`S_IFCHR`/`S_IFREG`; `st_blocks` = ⌈size/512⌉ (0 for devices); `st_dev` is always 0. Times are POSIX `struct timespec`s: `st_mtim` and `st_ctim` hold seconds and nanoseconds split from the inode's nanosecond `mtime`/`ctime`, and `st_mtime`/`st_ctime` are macros for their `tv_sec` (until this change they were `u64` nanosecond fields). efs keeps no access time, so `st_atim`/`st_atime` are macros for the modification time. Filesystems that keep no times (devfs, procfs) report the boot time (`boot_time_ns`, from the RTC minus the uptime).
+  - `st_mode` = mode | `S_IFDIR`/`S_IFCHR`/`S_IFREG`; `st_blocks` = ⌈size/512⌉ (0 for devices); `st_dev` is the mount's number, `sb->dev`, so (`st_dev`, `st_ino`) identifies a file across filesystems. Times are POSIX `struct timespec`s: `st_mtim` and `st_ctim` hold seconds and nanoseconds split from the inode's nanosecond `mtime`/`ctime`, and `st_mtime`/`st_ctime` are macros for their `tv_sec` (until this change they were `u64` nanosecond fields). efs keeps no access time, so `st_atim`/`st_atime` are macros for the modification time. Filesystems that keep no times (devfs, procfs) report the boot time (`boot_time_ns`, from the RTC minus the uptime).
   - A pipe gets `S_IFIFO|0600`. For a procfs snapshot, `st_size` is the snapshot's length.
 - **`utimensat`** (88, `kernel/proc/cred.c: do_utimensat`), behind libc's `utimensat`, `futimens` and `touch`:
   - A NULL path means the open file `dirfd` (that is `futimens`); otherwise `dirfd` must be `AT_FDCWD` (`EINVAL`) and the path is looked up.
@@ -624,7 +625,7 @@ Each request is one `p9_transact`: the message is built in a `kmalloc`ed buffer,
   - `/dir/[:mode[:uid[:gid]]]`: a directory, created with any missing parents.
 - Blocks and inodes are allocated sequentially (`next_block`, `next_ino`).
 
-The Makefile builds `build/fs.img` with `FS_MB ?= 32` from the user programs (`/bin/*`; the `eutils` names are hard links), `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc`, `/dev/`, `/proc/`, `/tmp/:0777`, `/www/`, `/home/` and `/home/guest/:0755:1000:1000`. The image is rebuilt whenever a program changes, which discards run-time files. It gets `--label root`.
+The Makefile builds `build/fs.img` with `FS_MB ?= 64` (it was 32 until the image carried its own source tree) from the user programs (`/bin/*`; the `eutils` names are hard links), `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc`, `/dev/`, `/proc/`, `/tmp/:0777`, `/www/`, `/home/` and `/home/guest/:0755:1000:1000`. The image is rebuilt whenever a program changes, which discards run-time files. It gets `--label root`.
 
 The persistent `/home` disk, `home.img` (`HOME_IMG ?= home.img` in the top directory, `HOME_MB ?= 64`), is made once with `--label home` and the single spec `/guest/:0755:1000:1000`, so it holds `/guest` owned by uid and gid 1000 (`guest` in `/etc/passwd`, home `/home/guest`). The Makefile never rebuilds it, so what is created there survives `make` and `make clean`; `make clean-home` deletes it. `make run`, `debug` and `qemu-log` attach it as a second virtio disk; the test scenarios do not. The root image keeps its own `/home/guest`, which is what you see when no home disk is attached.
 
@@ -864,7 +865,7 @@ Export them to Perfetto as described in `DEBUGGING.md`.
   - `commit`, `install` and `write_head` ignore `bwrite` results, so a failed log write can be followed by a successful commit-point write.
 - `MAXOPBLOCKS` (16) is a reservation, not a limit.
   - `free_ind` logs every indirect block it empties, even though those blocks are about to be freed.
-  - Deleting or truncating a file with N inner double-indirect blocks logs at least N+4 blocks. On images much larger than the default 32 MiB, freeing a file of a few hundred MiB in one transaction can exceed 64 blocks and panic with "transaction too big".
+  - Deleting or truncating a file with N inner double-indirect blocks logs at least N+4 blocks. On images much larger than the default 64 MiB, freeing a file of a few hundred MiB in one transaction can exceed 64 blocks and panic with "transaction too big".
   - A large rename-over (unlink of a big target plus link, unlink and `..` updates) can also exceed its 16-block reservation.
 
 **Locking:**
@@ -879,14 +880,14 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 - `ctime` is set only when the inode is allocated and by `utimensat`: `chmod`, `chown` and `link` do not update it.
 - No access time: `utimensat` ignores `times[0]` and `stat` reports the modification time as `st_atime`.
 - `utimensat` accepts only `AT_FDCWD` (or a NULL path with an fd) and ignores its flags (there are no symlinks for `AT_SYMLINK_NOFOLLOW` to matter).
-- `st_dev` is always 0, so inode numbers from efs, devfs and procfs collide in `stat`, and so do those of the root and `/home` filesystems (both start at inode 1). Tools that detect hard links or loops by (`st_dev`, `st_ino`) can be fooled across the mount.
+- `st_dev` is a mount sequence number, not derived from the disk: it can change between boots if the set of mounts changes (for example `/home` attached or not), and a failed mount still uses up a number.
 - Ids are 16 bits; there are no supplementary groups and no sticky bit.
 - `faccessat` checks the effective ids, where POSIX uses the real ids.
 - `chdir` does not require search (`X`) permission on the target directory itself.
 
 **Limits:**
 - 32 descriptors per process. `PATH_MAX` 256. Names up to 59 bytes, but `struct dirent.d_name` is 59 bytes including the NUL, so `getdents64` truncates a 59-byte name to 58 bytes (`do_getdents64` uses `strlcpy`).
-- 1024 inodes, fixed by mkfs. A 64-block log per filesystem.
+- The inode count is fixed when mkfs makes the disk (one per 32 KiB, at least 1024). A 64-block log per filesystem.
 - Up to four disks (`MAX_DISKS`), but only two are ever mounted: the one labelled `root` (or disk 0) on `/` and the one labelled `home` on `/home`. There is no way to mount another disk or another path, and only disks 0 and 1 have `/dev` nodes. If two disks carry the same label, the lower-numbered one wins silently.
 - All disks share the 128 buffers of the cache.
 - Directories never shrink.
@@ -907,7 +908,6 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 - **Host types and names**: symbolic links, devices, FIFOs and sockets appear as regular files (the type is only "directory or not"); names longer than 59 bytes are skipped in listings (and cannot be looked up through a listing's name); uids and gids above 65535 are truncated.
 - **No `Tfsync`**: `fsync` does nothing on the share either; writes reach the Mac's page cache, not necessarily its disk.
 - **No unmount or remount**, and only tags whose `/mnt/TAG` exists in the image (`host`) are mounted.
-- `st_dev` is 0 here too, so inode numbers collide with the other filesystems'.
 
 **procfs:**
 - Output is truncated at 64 KiB with no indication.
@@ -979,7 +979,7 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 13. **Harden `vfs_getcwd`**: return `-ENAMETOOLONG` when the depth limit is hit instead of returning a partial path, and do not touch `de` unless an entry was found. Impact: low. Effort: small.
 14. **Restrict the crash-injection hook**: require `euid == 0` for `DBG_FSCRASH` in `kernel/proc/syscall.c`, so unprivileged users (e.g. `guest`) cannot stop the machine. Impact: low. Effort: small.
 15. **9pfs follow-ups**: reclaim nodes and clunk their fids when their inodes are freed; a short-lived attribute and dentry cache to cut the round trips; map host uids to guest uids (or present the share as owned by one guest user); symbolic links (`Treadlink`, `Tsymlink`); `Tfsync` for `fsync`; names longer than 59 bytes. Impact: medium. Effort: medium.
-16. **A mount table instead of two fixed labels**: read `/etc/fstab` (label → path) from the root filesystem in `vfs_init`, or add a `mount` system call taking a disk number or label; give every disk a `/dev/diskN` node; and report a distinct `st_dev` per superblock so `(st_dev, st_ino)` identifies a file. Impact: medium. Effort: medium.
+16. **A mount table instead of two fixed labels**: read `/etc/fstab` (label → path) from the root filesystem in `vfs_init`, or add a `mount` system call taking a disk number or label; and give every disk a `/dev/diskN` node. Impact: medium. Effort: medium.
 17. **Better observability for the log**:
     - Expose the per-transaction block high-water mark per operation type, and the time threads spend in `"log space"`.
     - Add a trace event for `log_begin` waits.

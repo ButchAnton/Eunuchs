@@ -76,7 +76,7 @@ MKFS    := $(BUILD)/tools/mkfs
 # the kernel linker, for tcc's kernel (tools/kld)
 KLD     := $(BUILD)/tools/kld
 FSIMG   := $(BUILD)/fs.img
-FS_MB   ?= 32
+FS_MB   ?= 64
 EUTILS_LINKS = echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile \
                true false yes kill date dmesg free sleep strace su dbg uname clear
 FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(notdir $(p))) \
@@ -88,7 +88,8 @@ FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(no
            /home/ /home/guest/:0755:1000:1000 /mnt/ /mnt/host/ \
            $(foreach f,$(SYS_FILES),$(patsubst $(SYSROOT)%,%,$(f))=$(f)) \
            $(foreach f,$(filter user/bin/%,$(USR_SRC)),/usr/src/$(patsubst user/bin/%,%,$(f))=$(f)) \
-           /usr/src/Makefile=user/usr-src/Makefile
+           /usr/src/Makefile=user/usr-src/Makefile \
+           $(foreach f,$(EU_SRC),/usr/src/eunuchs/$(f)=$(f))
 DISKOPTS = -global virtio-mmio.force-legacy=false \
            -drive file=$(1),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
@@ -217,6 +218,12 @@ SYS_HDRS  := $(patsubst user/include/%,$(SYSROOT)/usr/include/%,$(shell find use
 SYS_LIBS  := $(addprefix $(SYSROOT)/usr/lib/,crt1.o crti.o crtn.o libc.a tcc/libtcc1.a tcc/runmain.o)
 # /usr/src: the programs' sources and a Makefile to rebuild them with tcc
 USR_SRC   := $(wildcard user/bin/*.c user/bin/*/*.c user/bin/*/*.h) user/usr-src/Makefile
+# /usr/src/eunuchs: the source tree Eunuchs builds itself from (user/build.mk,
+# kernel/build.mk, tools/selfhost.sh), so it can without the Mac's share
+EU_SRC    := $(shell find kernel lib user/include user/lib user/bin -type f \( -name '*.[chS]' -o -name '*.ld' \) | sort) \
+             kernel/build.mk user/build.mk ports/tcc/config.h tools/kld/kld.c tools/selfhost.sh \
+             $(wildcard $(TCC_SRC)/*.c $(TCC_SRC)/*.h $(TCC_SRC)/*.def $(TCC_SRC)/include/*.h \
+                        $(TCC_SRC)/lib/*.c $(TCC_SRC)/lib/*.S) $(TCC_SRC)/COPYING
 SYS_FILES := $(SYS_HDRS) $(SYS_LIBS)
 UPROGS    += $(BUILD)/user/bin/tcc
 
@@ -293,7 +300,7 @@ $(MKFS): tools/mkfs/mkfs.c kernel/include/efs_format.h
 	$(Q)$(HOSTCC) -O1 -g -Wall -Wextra -Werror -Ikernel/include -o $@ $<
 
 # Rebuilt whenever a program changes, which discards files created at run time.
-$(FSIMG): $(MKFS) $(patsubst $(BUILD)/user/bin/%,$(BUILD)/user/stripped/%,$(UPROGS)) user/etc/* user/www/* $(SYS_FILES) $(USR_SRC)
+$(FSIMG): $(MKFS) $(patsubst $(BUILD)/user/bin/%,$(BUILD)/user/stripped/%,$(UPROGS)) user/etc/* user/www/* $(SYS_FILES) $(USR_SRC) $(EU_SRC)
 	$(call msg,MKFS,$@)
 	$(Q)$(MKFS) --label root $@ $(FS_MB) $(FS_FILES) > /dev/null
 

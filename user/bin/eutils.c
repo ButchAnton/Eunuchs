@@ -88,12 +88,20 @@ static int rm_tree(const char *path, int force)
     return rc;
 }
 
+/* Copy a file; a new one gets from's permission bits (less the umask). */
 static int copy(const char *from, const char *to)
 {
     int in = open(from, O_RDONLY);
     if (in < 0)
         return fail(from);
-    int out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    struct stat st, dst;
+    mode_t mode = fstat(in, &st) == 0 ? st.st_mode & 0777 : 0644;
+    if (stat(to, &dst) == 0 && dst.st_dev == st.st_dev && dst.st_ino == st.st_ino) {
+        close(in);
+        eprintf("cp: %s and %s are the same file\n", from, to);
+        return 1;               /* O_TRUNC would empty it */
+    }
+    int out = open(to, O_WRONLY | O_CREAT | O_TRUNC, mode);
     if (out < 0) {
         close(in);
         return fail(to);
@@ -108,6 +116,127 @@ static int copy(const char *from, const char *to)
         }
     close(in);
     close(out);
+    return rc;
+}
+
+/* cp -r: a directory and everything in it (names read first, as rm_tree) */
+static int copy_tree(const char *from, const char *to)
+{
+    struct stat st;
+    if (stat(from, &st) < 0)
+        return fail(from);
+    if (!S_ISDIR(st.st_mode))
+        return copy(from, to);
+    /* the names first (before `to` may appear among them), then the copies */
+    DIR *d = opendir(from);
+    if (!d)
+        return fail(from);
+    char **names = 0;
+    int n = 0, cap = 0, rc = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 32;
+            char **more = realloc(names, cap * sizeof(char *));
+            if (!more) {
+                closedir(d);
+                errno = ENOMEM;
+                rc = fail(from);
+                goto out;
+            }
+            names = more;
+        }
+        if (!(names[n] = strdup(de->d_name))) {
+            closedir(d);
+            errno = ENOMEM;
+            rc = fail(from);
+            goto out;
+        }
+        n++;
+    }
+    closedir(d);
+    if (mkdir(to, st.st_mode & 0777) < 0 && errno != EEXIST) {
+        rc = fail(to);
+        goto out;
+    }
+    struct stat tst;
+    if (stat(to, &tst) == 0 && tst.st_dev == st.st_dev && tst.st_ino == st.st_ino) {
+        eprintf("cp: %s and %s are the same directory\n", from, to);
+        rc = 1;
+        goto out;
+    }
+    for (int i = 0; i < n; i++) {
+        char a[PATH_MAX], b[PATH_MAX];
+        snprintf(a, sizeof(a), "%s/%s", from, names[i]);
+        snprintf(b, sizeof(b), "%s/%s", to, names[i]);
+        /* a copy made inside the tree being copied: not copied again */
+        struct stat as, ts;
+        if (stat(a, &as) == 0 && stat(to, &ts) == 0 && as.st_dev == ts.st_dev && as.st_ino == ts.st_ino)
+            continue;
+        rc |= copy_tree(a, b);
+    }
+out:
+    for (int i = 0; i < n; i++)
+        free(names[i]);
+    free(names);
+    return rc;
+}
+
+/* cp [-r] SOURCE... DEST: into DEST/name when DEST is a directory (or there
+   are several sources); directories only with -r */
+static int cp_main(int argc, char **argv)
+{
+    int i = 1, recursive = 0, rc = 0;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "--")) {
+            i++;
+            break;
+        }
+        for (char *f = argv[i] + 1; *f; f++) {
+            if (*f == 'r' || *f == 'R') {
+                recursive = 1;
+            } else {
+                eprintf("cp: unknown option -%c\nusage: cp [-r] SOURCE... DEST\n", *f);
+                return 2;
+            }
+        }
+    }
+    if (argc - i < 2) {
+        eprintf("usage: cp [-r] SOURCE... DEST\n");
+        return 2;
+    }
+    const char *dest = argv[argc - 1];
+    struct stat st;
+    int into = stat(dest, &st) == 0 && S_ISDIR(st.st_mode);
+    if (argc - i > 2 && !into) {
+        eprintf("cp: %s: not a directory\n", dest);
+        return 1;
+    }
+    for (; i < argc - 1; i++) {
+        const char *src = argv[i];
+        char target[PATH_MAX];
+        if (into) {
+            /* the last name in src, ignoring trailing slashes (src/ -> src) */
+            size_t len = strlen(src);
+            while (len > 1 && src[len - 1] == '/')
+                len--;
+            const char *base = src + len;
+            while (base > src && base[-1] != '/')
+                base--;
+            snprintf(target, sizeof(target), "%s/%.*s", dest, (int)(src + len - base), base);
+        } else {
+            snprintf(target, sizeof(target), "%s", dest);
+        }
+        struct stat ss;
+        if (stat(src, &ss) == 0 && S_ISDIR(ss.st_mode) && !recursive) {
+            eprintf("cp: %s is a directory (use -r)\n", src);
+            rc = 1;
+            continue;
+        }
+        rc |= copy_tree(src, target);
+    }
     return rc;
 }
 
@@ -622,8 +751,8 @@ int main(int argc, char **argv)
     } else if (!strcmp(prog, "mv") && argc == 3) {
         if (rename(argv[1], argv[2]) < 0)
             rc = fail(argv[1]);
-    } else if (!strcmp(prog, "cp") && argc == 3) {
-        rc = copy(argv[1], argv[2]);
+    } else if (!strcmp(prog, "cp")) {
+        rc = cp_main(argc, argv);
     } else if (!strcmp(prog, "wc")) {
         int i = 1;
         if (argc > 1 && argv[1][0] == '-') {

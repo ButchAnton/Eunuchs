@@ -330,6 +330,13 @@ def main():
         ("V=hi sh -c 'echo inner=$V'", "inner=hi"),
         ("mkdir -p /tmp/p/q/r && mkdir -p /tmp/p/q && touch /tmp/p/q/r/f && ls /tmp/p/q/r", "f"),
         ("rm -rf /tmp/p && rm -f /tmp/nonexistent && ls /tmp/p", "cannot access '/tmp/p'"),
+        # cp -r copies a tree; a copied program keeps its execute bit
+        ("mkdir -p /tmp/c/d && echo copied > /tmp/c/d/f && cp -r /tmp/c /tmp/c2 && cat /tmp/c2/d/f",
+         "copied"),
+        ("cp /bin/true /tmp/t && /tmp/t && echo still runs", "still runs"),
+        # not onto itself (that would truncate it), and not into its own copy forever
+        ("cp /tmp/c2/d/f /tmp/c2/d/f; cat /tmp/c2/d/f", "same file\r\ncopied"),
+        ("cp -r /tmp/c /tmp/c/sub && ls /tmp/c/sub/d", "f"),
         ("false || echo or-ok && echo and-ok", "and-ok"),
         ("nosuch", "esh: command not found: nosuch"),
         ("segv null", "esh: segmentation fault (core dumped)  segv null"),

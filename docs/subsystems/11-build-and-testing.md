@@ -107,7 +107,7 @@ User link: `$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ prog.o $(UL
 | `build/user/bin/<prog>` | Full user binaries with DWARF (for GDB) |
 | `build/user/stripped/<prog>` | `objcopy --strip-debug` copies; the symbol table stays so the kernel can symbolize user backtraces |
 | `build/tools/mkfs` | Host mkfs/fsck |
-| `build/fs.img` | The 32 MiB root filesystem image |
+| `build/fs.img` | The 64 MiB root filesystem image |
 | `build/host/test_*` | Host test binaries |
 | `build/kernel.asm` | `make disasm` output |
 | `build/net.pcap` | Packet capture of every `make run`/`debug`/`qemu-log` |
@@ -156,7 +156,7 @@ The kernel's `ksym_lookup`/`ksym_find`/`ksym_format` (`kernel/debug/ksyms.c`) se
 
 ### Disk image contents (`FS_FILES` in the Makefile)
 
-`$(MKFS) --label root build/fs.img $(FS_MB) $(FS_FILES)` with `FS_MB ?= 32`. The label is how the kernel recognizes the root disk when several are attached. Spec syntax (from `do_mkfs` in `tools/mkfs/mkfs.c`):
+`$(MKFS) --label root build/fs.img $(FS_MB) $(FS_FILES)` with `FS_MB ?= 64` (32 until the image carried its own source tree). The label is how the kernel recognizes the root disk when several are attached. Spec syntax (from `do_mkfs` in `tools/mkfs/mkfs.c`):
 
 | Spec | Meaning |
 |---|---|
@@ -171,11 +171,12 @@ What goes in:
 - hard links `/bin/sh` → `esh`, `/bin/less` → `more`, and `/bin/vi`, `/bin/view`, `/bin/emacs`, `/bin/em` → `edit`;
 - `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` from `user/etc/`, `/www/index.html` from `user/www/`;
 - empty `/dev/`, `/proc/`, `/tmp/` (mode 0777), `/www/`, `/home/`, `/home/guest/` (0755, uid 1000, gid 1000), `/mnt/` and `/mnt/host/` (the 9P mount point);
+- the whole source tree needed to rebuild the system (`EU_SRC`, 294 files) under `/usr/src/eunuchs/` ([13](13-toolchain.md#the-source-tree-in-the-image-usrsrceunuchs));
 - the toolchain's sysroot (`SYS_FILES`: everything under `build/sysroot`, at the same path without that prefix: `/usr/include`, `/usr/lib`, `/usr/lib/tcc`) and the program sources (`USR_SRC`: `user/bin/*.c` and `user/bin/*/*.{c,h}` under `/usr/src`, plus `user/usr-src/Makefile` as `/usr/src/Makefile`).
 
 **The home disk.** `home.img` (`HOME_IMG ?= home.img`, in the top directory, not `build/`) is a separate image made by `$(MKFS) --label home home.img $(HOME_MB) /guest/:0755:1000:1000` with `HOME_MB ?= 64`. Its rule has only an order-only dependency on mkfs, so it is created once and never rebuilt: files saved under `/home` survive `make`, `make clean` and kernel changes. `make clean-home` deletes it. `*.img` is in `.gitignore`.
 
-The mkfs layout: block 1 superblock, the log from block 2 (`EFS_LOGSIZE + 1` blocks), inode blocks for 1024 inodes, the bitmap, then data. Exit codes: 0 clean, 1 errors found, 2 usage or I/O error.
+The mkfs layout: block 1 superblock, the log from block 2 (`EFS_LOGSIZE + 1` blocks), inode blocks for one inode per 32 KiB of disk, at least 1024 (2048 in the default image), the bitmap, then data. Exit codes: 0 clean, 1 errors found, 2 usage or I/O error.
 
 ### Test result protocol
 
@@ -372,7 +373,7 @@ Every boot gets `panic=shutdown lockdep=panic` first and `--append` last. Stage 
 
 The crash stages use `dbg_fscrash()` from `utests` (`scenario`): write `part1`, arm the crash point (`after-commit` or `after-log`), append `part2`. The kernel stops inside that commit with exit status 3. The `-check` boots require `part1part2` (committed, so it must be replayed) or `part1` (not committed, so it must vanish).
 
-**Interactive shell steps** (stage 14): `echo hello | cat`; `ls / | grep bin > /tmp/x; cat /tmp/x`; `echo abc > /tmp/f; wc -c /tmp/f`; `cat` then `^C` and `echo status=$?` → `status=130`; `sleep 30` then `^Z` → `esh: suspended  sleep 30`; `jobs` → `[1]  + suspended  sleep 30`; `kill %1` → `[1]  + terminated  sleep 30` (reported as soon as it happens); `sleep 1 &` and `wait`; `V=hi sh -c 'echo inner=$V'`; `mkdir -p /tmp/p/q/r` (and again on an existing path) with a file inside; `rm -rf /tmp/p` and `rm -f` of a missing file, after which `ls /tmp/p` fails; `false || echo or-ok && echo and-ok`; `nosuch` → `esh: command not found: nosuch`; `segv null` → `esh: segmentation fault (core dumped)  segv null`; arrays (`x=(a b c); echo ${#x} $x[2] ${(U)x[3]}` → `3 b C`); a function with `return 3`; `for` over `{1..3}`; arithmetic, `${HOME:-none}` and `~`; `[[ abc == a* ]]`; a here-document typed over three lines (`PS2` prompts); `su guest` → prompt `guest@eunuchs:~% `, `id` → `uid=1000(guest)`, `touch /etc/nope` → `Permission denied`, `exit`; `cat /proc/self/status | grep pgid`. A step waits for its expected text, then for the next `@eunuchs:` prompt.
+**Interactive shell steps** (stage 14): `echo hello | cat`; `ls / | grep bin > /tmp/x; cat /tmp/x`; `echo abc > /tmp/f; wc -c /tmp/f`; `cat` then `^C` and `echo status=$?` → `status=130`; `sleep 30` then `^Z` → `esh: suspended  sleep 30`; `jobs` → `[1]  + suspended  sleep 30`; `kill %1` → `[1]  + terminated  sleep 30` (reported as soon as it happens); `sleep 1 &` and `wait`; `V=hi sh -c 'echo inner=$V'`; `mkdir -p /tmp/p/q/r` (and again on an existing path) with a file inside; `rm -rf /tmp/p` and `rm -f` of a missing file, after which `ls /tmp/p` fails; `cp -r` of a small tree and `cat` of the copied file; `cp /bin/true /tmp/t && /tmp/t` (a copied program keeps its execute bit); `cp` of a file onto itself ("same file", and the content survives); `cp -r /tmp/c /tmp/c/sub` terminates, with `sub/d/f`; `false || echo or-ok && echo and-ok`; `nosuch` → `esh: command not found: nosuch`; `segv null` → `esh: segmentation fault (core dumped)  segv null`; arrays (`x=(a b c); echo ${#x} $x[2] ${(U)x[3]}` → `3 b C`); a function with `return 3`; `for` over `{1..3}`; arithmetic, `${HOME:-none}` and `~`; `[[ abc == a* ]]`; a here-document typed over three lines (`PS2` prompts); `su guest` → prompt `guest@eunuchs:~% `, `id` → `uid=1000(guest)`, `touch /etc/nope` → `Permission denied`, `exit`; `cat /proc/self/status | grep pgid`. A step waits for its expected text, then for the next `@eunuchs:` prompt.
 
 **Toolchain and editors steps** (stage 15): writes a small C program to `/tmp/h.c` with `echo`; `tcc -o /tmp/h /tmp/h.c && /tmp/h` and `tcc -run /tmp/h.c | cat` must both print `tcc says 42`; `cd /usr/src && make bin/cat && bin/cat /etc/passwd` must show `guest:x:1000`; then `vi /tmp/v.txt` with keys `ihello from vi`, Esc, `yyp:s/vi/ex/`, `:wq`, and `cat` must show both lines; then `emacs /tmp/e.txt`, typing `hello from emacs`, `C-x C-s`, `C-x C-c`, and `cat` must show it; finally `tcc -g` compiles a two-function program and `db -batch -ex 'break add' -ex run -ex bt -ex finish -ex continue` must print `Breakpoint 1, add (a=2, b=3) at /tmp/d.c:3`, a `#1` backtrace frame, `Value returned is $1 = 5` and `exited normally`.
 
@@ -419,7 +420,7 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 3. Print `ci: <step> ok|FAILED (Ns)` per step (on a TTY a `...` placeholder is overwritten with `\r`). On failure print the last 20 log lines and stop, unless `--keep-going`.
 4. Print `ci: X of Y steps passed in Ns` and exit 0 only if every step ran and passed.
 
-`--quick` drops `test (1 CPU)`, `soak` and `selfhost`. A full run is 7 steps (about 4.5 minutes, of which `selfhost` is about 2). Pass flags with `make ci CI_FLAGS="--quick --keep-going"`. GNU make exports command-line variables to recipe environments, so `make ci STRESS_SECS=30` reaches `ci.py` through `$STRESS_SECS`.
+`--quick` drops `test (1 CPU)`, `soak` and `selfhost`. A full run is 7 steps (about 5 minutes, of which `selfhost` is about 2). Pass flags with `make ci CI_FLAGS="--quick --keep-going"`. GNU make exports command-line variables to recipe environments, so `make ci STRESS_SECS=30` reaches `ci.py` through `$STRESS_SECS`.
 
 ## Concurrency and locking
 
@@ -454,7 +455,7 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 | `replay-check` | kernel, image | Record and replay `panic=shutdown ktest`; require identical output |
 | `flamegraph` | (`build/profile.bin`) | `euprof.py report`, `svg` and `folded`, all with `--no-idle` |
 | `trace-json` | (`build/trace.bin`) | `eutrace.py perfetto` → `build/trace.json` |
-| `selfhost` | kernel, image, mkfs | Eunuchs builds its own user space and kernel twice with tcc (and `kld`) in the guest (`tools/selfhost.py` runs `tools/selfhost.sh` there, with `SOURCE_DATE_EPOCH` = the last commit's time), requires the two stages byte-identical, makes `build/selfhost/fs.img` from stage 2, and runs the whole `make test` scenario booting stage 2's kernel, with `SH_TIMEOUT` (default 120 s) per stage because that kernel is about half as fast ([13](13-toolchain.md#eunuchs-builds-its-own-kernel-kernelbuildmk)) |
+| `selfhost` | kernel, image, mkfs | Eunuchs builds its own user space and kernel twice with tcc (and `kld`) in the guest, from the image's own `/usr/src/eunuchs` into `/tmp/selfhost` on the guest's disk (`tools/selfhost.py` runs `tools/selfhost.sh` there with `SOURCE_DATE_EPOCH` = the last commit's time), copies the results to `build/selfhost` over the 9P share, requires the two stages byte-identical, makes `build/selfhost/fs.img` from stage 2, and runs the whole `make test` scenario booting stage 2's kernel, with `SH_TIMEOUT` (default 120 s) per stage because that kernel is about half as fast ([13](13-toolchain.md#eunuchs-builds-its-own-kernel-kernelbuildmk)) |
 | `tcc-kernel` | `build/tcc/xtcc`, `build/tools/kld` | `kernel/build.mk` on the Mac: `build/tcc-kernel/kernel/kernel.elf` |
 | `clean` | | `rm -rf build` (keeps `home.img`) |
 | `sysroot` | `/bin/tcc`'s runtime, `libc.a` | Stage `build/sysroot` (headers, start-up files, `libc.a`, `libtcc1.a`, `runmain.o`), which the image copies to `/usr` ([13](13-toolchain.md)) |
@@ -475,7 +476,7 @@ Internal file targets you may name directly: `build/tcc/xtcc` (the host cross Ti
 | `APPEND` | empty | Kernel boot options; for `test`/`stress` appended to every boot after the stage's own options (the first occurrence of a key wins, so it cannot override `panic`, `lockdep`, `ktest` or `utest` there) |
 | `TEST_TIMEOUT` | `60` | Seconds per boot/fsck stage in `make test` |
 | `STRESS_SECS` | `120` | Duration of `make stress` (`ci.py` uses 60 unless overridden) |
-| `FS_MB` | `32` | Disk image size |
+| `FS_MB` | `64` | Disk image size |
 | `HOSTDIR` | the project directory | The Mac directory shared read-write on `/mnt/host` by `run`, `debug` and `qemu-log`; empty to share nothing |
 | `SH_TIMEOUT` | `120` | Seconds per boot stage when `make selfhost` tests the tcc-built kernel |
 | `HOME_IMG` | `home.img` | The persistent `/home` disk image |
@@ -494,7 +495,7 @@ Boot options most used with these targets (the full list is printed by the `help
 | Tool | Usage |
 |---|---|
 | `tools/run_tests.py` | `--qemu "CMD"` (required; QEMU without disk), `--image` (required), `--mkfs` (required), `--timeout` (default 60), `--append` (default empty), `--programs DIR` (the programs in the image, default `build/user/stripped`; the 9P stage compares the guest's copy of `/bin/cat` with `DIR/cat`) |
-| `tools/selfhost.py` | `--qemu "CMD" --image build/fs.img [--timeout 900]`: boots with the repository shared, runs `sh tools/selfhost.sh` in the guest (both stages of `user/build.mk` and `kernel/build.mk`; a script because a typed command line is limited to 255 bytes), compares the stages |
+| `tools/selfhost.py` | `--qemu "CMD" --image build/fs.img [--timeout 900]`: boots with the repository shared, runs `cd /usr/src/eunuchs && SH_OUT=/tmp/selfhost sh tools/selfhost.sh` in the guest (a script because a typed command line is limited to 255 bytes), copies the results back with `cp -r` into `/mnt/host/build/selfhost`, compares the stages |
 | `tools/ci.py` | `--quick`, `--keep-going`, `--stress-secs N` (default `$STRESS_SECS` or 60); honours `$MAKE` |
 | `tools/timeout.py` | `timeout.py SECONDS CMD...`: exit status of CMD, or 124 after killing it |
 | `tools/gen_ksyms.py` | stdin: `nm -n` output; stdout: assembly |

@@ -533,7 +533,7 @@ Only processes are listed. Kernel threads are in `/proc/threads` and the monitor
 
 ### eutils
 
-`eutils` (`user/bin/eutils.c`) is one binary. `main` takes the basename of `argv[0]` and dispatches with a chain of `strcmp`s. The disk image has `/bin/eutils` plus one hard link per name in `EUTILS_LINKS`, made by mkfs's `/path=@/existing` syntax. An unknown name prints `eutils: unknown tool 'X'` and exits with 2. Running `/bin/eutils` directly ends up there too. Some tools (`ln`, `mv`, `cp`, `chmod`, `chown`) are only matched when the argument count is right, so a usage error also produces the "unknown tool" message.
+`eutils` (`user/bin/eutils.c`) is one binary. `main` takes the basename of `argv[0]` and dispatches with a chain of `strcmp`s. The disk image has `/bin/eutils` plus one hard link per name in `EUTILS_LINKS`, made by mkfs's `/path=@/existing` syntax. An unknown name prints `eutils: unknown tool 'X'` and exits with 2. Running `/bin/eutils` directly ends up there too. Some tools (`ln`, `mv`, `chmod`, `chown`) are only matched when the argument count is right, so a usage error also produces the "unknown tool" message.
 
 ### Network programs
 
@@ -654,7 +654,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `touch` | `touch [-c] FILE...` | Sets the modification time to now (`utimensat`); creates a missing file (0644) unless `-c`. |
 | `ln` | `ln OLD NEW` | Hard links only; exactly two arguments. |
 | `mv` | `mv OLD NEW` | `rename`; exactly two arguments; a directory target is not handled. |
-| `cp` | `cp FROM TO` | Exactly two arguments; creates `TO` with 0644. |
+| `cp` | `cp [-r] SOURCE... DEST` | With several sources, or when `DEST` is a directory, each source goes to `DEST/<basename>`. Directories need `-r` (`copy_tree`, which reads a directory's names before copying, as `rm_tree` does). A new file gets the source's permission bits less the umask, so a copied program stays executable; an existing file keeps its mode. `--` ends options; an unknown option is a usage error (2). It refuses to copy a file onto itself (same `st_dev` and `st_ino`: `cp: A and B are the same file`, exit 1, the file untouched), including `cp f dir` when `dir/f` is `f`. `copy_tree` reads the source's names before creating the target, skips an entry that is the target itself and refuses a target that is the source directory, so `cp -r dir dir/sub` copies once. Trailing slashes are ignored when naming the copy (`cp -r src/ destdir` makes `destdir/src`, as GNU cp does). Out of memory gives `ENOMEM`. |
 | `wc` | `wc [-lwc] [FILE...]` | Words are split on space, tab and newline. |
 | `stat` | `stat PATH...` | Inode, type, size, blocks, links, mode. |
 | `head` | `head [-n N \| -N] [FILE]` | Default 10 lines; reads a byte at a time. |
@@ -681,7 +681,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 
 ### Files in the disk image
 
-`FS_FILES` in the Makefile, processed in order by `build/tools/mkfs` (image size `FS_MB` = 32 MiB):
+`FS_FILES` in the Makefile, processed in order by `build/tools/mkfs` (image size `FS_MB` = 64 MiB):
 
 | Path | Source |
 |---|---|
@@ -694,6 +694,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `/usr/lib/crt1.o`, `crti.o`, `crtn.o`, `libc.a` | the start-up files and the libc as an archive, from `build/sysroot` |
 | `/usr/lib/tcc/` | `libtcc1.a`, `runmain.o` and tcc's own headers |
 | `/usr/src/` | the sources of every program (`user/bin/`) and `user/usr-src/Makefile` |
+| `/usr/src/eunuchs/` | the whole source tree needed to rebuild the system (kernel, libc, programs, tcc, kld, build scripts): `cd /usr/src/eunuchs && sh tools/selfhost.sh` ([13](13-toolchain.md#the-source-tree-in-the-image-usrsrceunuchs)) |
 | `/bin/<applet>` for every `EUTILS_LINKS` name | hard link to `/bin/eutils` (`=@/bin/eutils`) |
 | `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` | `user/etc/` |
 | `/dev/`, `/proc/` | empty mount points |
@@ -779,7 +780,7 @@ libc:
 Commands:
 
 - **`tail -n 0`** prints the whole input: the loop `++lines == n` never matches 0. `tail` also ignores a failed `realloc`.
-- **Usage errors in `ln`, `mv`, `cp`, `chmod` and `chown`** produce `eutils: unknown tool 'X'` because the argument-count check is part of the dispatch condition.
+- **Usage errors in `ln`, `mv`, `chmod` and `chown`** produce `eutils: unknown tool 'X'` because the argument-count check is part of the dispatch condition.
 - **Commands read one byte per system call**: `head`, `grep` (they could use stdio now), and `esh` when reading commands from a pipe or the `read` builtin (so that input meant for later commands stays unread). `top` writes one byte per call. This is slow, and very visible under `strace`.
 - **The editor** (beyond the missing features listed in [its section](#the-editor-vi-and-emacs)):
   - `:{range}w FILE` writes the whole buffer, and `:w !cmd` writes a file named `!cmd` (use `:{range}!cmd` to filter instead). `:g` runs only `d`, `s` and `p` (the default, which reports the count).

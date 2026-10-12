@@ -180,7 +180,11 @@ int vfs_mount(const struct fs_type *type, const char *path)
 
 int vfs_mount_disk(const struct fs_type *type, const char *path, int disk)
 {
+    static u32 next_dev = 1;
     struct super_block *sb = kzalloc(sizeof(*sb));
+    if (!sb)
+        return -ENOMEM;
+    sb->dev = __atomic_fetch_add(&next_dev, 1, __ATOMIC_RELAXED);
     sb->disk = disk;
     sb->type = type;
     sb->ops = type->ops;
@@ -393,6 +397,7 @@ void vfs_stat(struct inode *ip, struct stat *st)
     if (ip->sb->ops->refresh)           /* attributes another host may have changed (ip is locked) */
         ip->sb->ops->refresh(ip);
     memset(st, 0, sizeof(*st));
+    st->st_dev = ip->sb->dev;
     st->st_ino = ip->ino;
     st->st_mode = ip->mode | (ip->type == I_DIR ? S_IFDIR : ip->type == I_CHR ? S_IFCHR : S_IFREG);
     st->st_nlink = ip->nlink;

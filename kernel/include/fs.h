@@ -125,6 +125,7 @@ struct super_block {
     char path[32];
     void *priv;
     int disk;                   /* the disk a disk-based filesystem lives on */
+    u32 dev;                    /* st_dev: 1, 2, ... in mount order */
     u64 errors;                 /* inconsistencies detected while running */
     struct list_head node;
 };

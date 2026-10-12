@@ -154,7 +154,7 @@ The **VFS** (`fs/vfs.c`) has an in-memory inode cache (each inode with a mutex),
 | bitmap | the free-block bitmap |
 | data | file and directory blocks |
 
-- 4 KiB blocks and 1024 inodes. Each file has 12 direct blocks plus a single- and a double-indirect block.
+- 4 KiB blocks, and one inode per 32 KiB of disk (at least 1024; 2048 in the 64 MiB image). Each file has 12 direct blocks plus a single- and a double-indirect block.
 - Directories are files of fixed-size entries.
 - Every change happens inside a transaction (`log.c`, re-entrant per thread). The transaction is written to the log, committed, then installed. Recovery at mount replays committed transactions and drops incomplete ones, so a power failure at any point leaves the filesystem consistent (the `fs.crash=` boot option simulates one).
 - **Buffer cache** (`bcache.c`): 128 buffers, each with its own mutex.

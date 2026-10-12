@@ -197,7 +197,9 @@ static int do_mkfs(const char *path, int size_mb, int nspecs, char **specs)
     sb->version = EFS_VERSION;
     sb->bsize = EFS_BSIZE;
     sb->size = nblocks;
-    sb->ninodes = 1024;
+    /* one inode per 8 blocks (32 KiB), at least 1024: a 64 MiB disk holds
+       /usr/src's source tree and a self-hosted build of it */
+    sb->ninodes = nblocks / 8 > 1024 ? nblocks / 8 : 1024;
     sb->nlog = EFS_LOGSIZE + 1;
     sb->logstart = 2;
     sb->inodestart = sb->logstart + sb->nlog;

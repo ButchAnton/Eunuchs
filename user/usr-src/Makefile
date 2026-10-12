@@ -5,6 +5,10 @@
 #   make install      copy the new programs over /bin (as root)
 #   make clean
 #
+# The whole system's source, kernel included, is in /usr/src/eunuchs:
+# `cd /usr/src/eunuchs && sh tools/selfhost.sh` rebuilds all of it (twice,
+# into build/selfhost; it needs about 20 MB free).
+#
 # Each top-level .c file is a program; db/, edit/ and esh/ are programs made
 # of several files. CFLAGS=-g gives programs db can debug at source level. The headers and libraries are in /usr/include and /usr/lib.
 

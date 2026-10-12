@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """make selfhost: Eunuchs builds itself.
 
-Boots Eunuchs with this source tree shared on /mnt/host and runs
-user/build.mk and kernel/build.mk there twice:
+Boots Eunuchs and runs tools/selfhost.sh in the image's own source tree,
+/usr/src/eunuchs, into /tmp/selfhost on its own disk, as it would with no Mac
+at all: user/build.mk and kernel/build.mk, twice:
 
-  stage 1  with the image's /bin/tcc (which gcc built), into build/selfhost/stage1
-  stage 2  with stage 1's tcc, into build/selfhost/stage2
+  stage 1  with the image's /bin/tcc (which gcc built)
+  stage 2  with stage 1's tcc
+
+Then it copies stage1/, stage2/ and the logs over the share (mounted on
+/mnt/host) into build/selfhost.
 
 Each stage builds the C library and tcc's runtime into a sysroot, then every
 program (tcc and kld, the kernel's linker, included), then the kernel. The
@@ -80,12 +84,20 @@ def main():
             # not fit the terminal's line)
             # __DATE__ and __TIME__ from the last commit, so both stages and
             # every rebuild of one commit stamp the same time
-            con.line("cd /mnt/host && SOURCE_DATE_EPOCH=%d sh tools/selfhost.sh; s=$?; m=SELFHOST; "
-                     "echo ${m}-STATUS=$s." % source_date_epoch())
+            con.line("cd /usr/src/eunuchs && SOURCE_DATE_EPOCH=%d SH_OUT=/tmp/selfhost sh tools/selfhost.sh; "
+                     "s=$?; m=SELFHOST; echo ${m}-STATUS=$s." % source_date_epoch())
             con.expect("SELFHOST-STATUS=", a.timeout)
             con.expect(".", 5)
             m = re.search(r"SELFHOST-STATUS=(\d+)\.", con.log_text())
             status = int(m.group(1)) if m else None
+            # the results (or the logs of a failure) to the Mac
+            con.line("cp -r /tmp/selfhost/stage1 /tmp/selfhost/stage2 /tmp/selfhost/*.log "
+                     "/mnt/host/build/selfhost; m=COPIED; echo ${m}-$?.")
+            con.expect("COPIED-", 300)
+            con.expect(".", 5)
+            if not re.search(r"COPIED-0\.", con.log_text()) and status == 0:
+                print("selfhost: copying the results to the Mac failed")
+                status = None
         except Exception as e:
             print("selfhost: %s" % e)
         con.close()
