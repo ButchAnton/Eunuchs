@@ -62,31 +62,32 @@ Use the up/down arrows for history. To exit QEMU, press `Ctrl-^ X`.
 
 ## Booting
 
-QEMU starts **eboot**, the boot loader (`build/eboot.elf`), which loads `/boot/kernel.elf` from the root disk ([01](subsystems/01-boot-and-platform.md#0-the-boot-loader-bootebootc)). Its lines come first on the console:
+QEMU starts **eboot**, the boot loader (`build/eboot.elf`), which loads `/kernel.elf` from the disk's `boot` partition ([01](subsystems/01-boot-and-platform.md#0-the-boot-loader-bootebootc)). Its lines come first on the console:
 
 | Message | Meaning |
 |---|---|
 | `eboot: Eunuchs boot loader` | it started |
-| `eboot: root disk at 0x…` (with `(a committed transaction in the log: read through it)` after a crash) | the disk it chose |
-| `eboot: loaded /boot/kernel.elf (N KiB), entry 0x…` | it jumped to that kernel |
-| `eboot: /boot/kernel.elf: not found` / `not a RISC-V 64-bit ELF executable` / `does not fit below the boot loader` (with the segment) / `bad program headers` / `read error` | that kernel was refused; it tries `/boot/kernel.old.elf` next |
+| `eboot: boot: a committed transaction in the log: read through it` | the partition's log holds a committed transaction (after a crash); eboot reads through it |
+| `eboot: loaded boot:/kernel.elf (N KiB), entry 0x…` | it jumped to that kernel |
+| `eboot: boot:/kernel.elf: not found` / `not a RISC-V 64-bit ELF executable` / `does not fit below the boot loader` (with the segment) / `bad program headers` / `read error` | that kernel was refused; it tries `boot.old:/kernel.elf` next |
+| `eboot: boot.old:/kernel.elf: no such partition` | the image has boot partitions, but not that one |
 | `eboot: no kernel to boot`, `eboot: powering off` | neither kernel worked |
-| `eboot: no disk with an efs filesystem` | no usable root disk |
+| `eboot: no disk with an efs filesystem` | no usable volume |
 | a legacy-virtio message | QEMU without `-global virtio-mmio.force-legacy=false` |
 
-The kernel's banner then says which compiler built it (`by gcc 16.2.0` or `by tcc`). `make run BOOT=direct` skips eboot and has QEMU load `build/kernel.elf` (the old way), for when the loader itself is in doubt. Debugging through the loader works: `make debug` + `make gdb` set breakpoints in the kernel before it is loaded, and since QEMU's GDB breakpoints don't patch memory, eboot's copying doesn't erase them. GDB reads `build/kernel.elf`, whose code is the same as the stripped `/boot/kernel.elf`. To try a kernel on Eunuchs, keep the old one (`cp /boot/kernel.elf /boot/kernel.old.elf`), copy the new one to `/boot/kernel.elf`, and `reboot`; if it does not boot, eboot falls back to the old one only if the new one is unloadable, not if it crashes later (then use `make run BOOT=direct` or rebuild the image).
+On a bare efs image (no partition table) the kernels are the root's `/boot/kernel.elf` and `/boot/kernel.old.elf`. The kernel's banner then says which compiler built it (`by gcc 16.2.0` or `by tcc`). `make run BOOT=direct` skips eboot and has QEMU load `build/kernel.elf` (the old way), for when the loader itself is in doubt. Debugging through the loader works: `make debug` + `make gdb` set breakpoints in the kernel before it is loaded, and since QEMU's GDB breakpoints don't patch memory, eboot's copying doesn't erase them. GDB reads `build/kernel.elf`, whose code is the same as the stripped `/boot/kernel.elf`. To try a kernel on Eunuchs, `kinstall NEW` (the current one moves to `/boot.old`) and `reboot`, or `kinstall -r NEW`; `kinstall --rollback` swaps them back. On the Mac, with QEMU stopped, `build/tools/eudisk kernel install disk.img KERNEL` and `eudisk kernel rollback disk.img` do the same. eboot falls back to `boot.old` only if the new kernel is unloadable, not if it crashes later (then roll back, or use `make run BOOT=direct`).
 
 ## Disk and filesystems
 
-The root filesystem is **efs** on a virtio disk, `build/fs.img` (volume label `root`). `make` builds it with the host tool `build/tools/mkfs`. It holds the user programs from `user/bin`, `/etc/motd`, empty `/dev`, `/proc`, `/tmp` and `/home`, the toolchain in `/usr`, and the system's own source tree in `/usr/src/eunuchs` (64 MiB in all). The image is rebuilt whenever a program changes, which discards files created at run time.
+The disk is one GPT disk image with an **efs** filesystem in each of four partitions: `boot` (16 MiB, mounted on `/boot`, holding `kernel.elf`), `boot.old` (16 MiB, `/boot.old`, the previous kernel), `root` (64 MiB, `/`: the user programs, `/etc`, the toolchain in `/usr`, the system's own source tree in `/usr/src/eunuchs`) and `home` (64 MiB, `/home`, with `/guest` owned by uid 1000). Each partition's efs label is its GPT name. The host tool `build/tools/eudisk` makes and edits the images. `make test` uses `build/fs.img`, made afresh whenever anything in it changes.
 
-`make run` (and `debug`, `qemu-log`) also attaches a second disk, `home.img` in the top directory (label `home`, 64 MiB, with `/guest` owned by uid 1000). The kernel mounts it on `/home`, so files kept there survive rebuilds and `make clean`; `make clean-home` deletes it. The kernel picks disks by label, not order: `/` is the disk labelled `root` (or disk 0), `/home` the one labelled `home`. The boot log says which (`mounted efs (disk1) on /home`). `make test` boots with the root disk only.
+`make run` (and `debug`, `qemu-log`) uses **`disk.img`** in the top directory. It is made once, then brought up to date in place by every `make` (`eudisk install`): programs and sources that changed are replaced (if you had edited one, your copy goes to `/var/backup/DATE-TIME/`), configuration files you edited in `/etc` stay and the new version arrives as `FILE.new`, and a new kernel goes to `boot` with the previous one moved to `boot.old`. So files you create anywhere survive rebuilds and `make clean`; `rm disk.img` gives a fresh one (an old `home.img`, from before the single disk, is copied into the new image's home partition once). With QEMU stopped, `build/tools/eudisk ls -l disk.img:/etc`, `cat`, `get`, `put`, `rm`, `fsck` and `info` work on it from the Mac, and `make gui` opens it in the Eudisk app; while QEMU runs, eudisk refuses to write (`--force` overrides). The boot log lists the volumes (`blk: disk0p1: 16 MiB "boot"`) and the mounts (`vfs: mounted efs (disk0p3) on /`).
 
 **The Mac's files**: `make run` (and `debug`, `qemu-log`) also shares the project directory through virtio-9p; the kernel mounts it on `/mnt/host`. It is the real directory, read-write, so what you do there happens on the Mac (`make run HOSTDIR=` shares nothing, `HOSTDIR=dir` another directory). Inside, `ls /mnt/host`, `cat /mnt/host/kernel/core/main.c`, or build: `cd /mnt/host/user/bin && make -f /usr/src/Makefile BIN=/tmp/bin`. `mounts` shows the 9P request and error counts, and `/proc/9p` (or the monitor's `blk`) the transport's. A `9p share "host" not mounted` line at boot means the image lacks `/mnt/host`.
 
-devfs is mounted on `/dev` (`console null zero kmsg disk0 disk1 tty tty0`; `disk1` only when a second disk is attached); procfs is mounted on `/proc`.
+devfs is mounted on `/dev` (`console null zero kmsg disk0 tty tty0`, the partitions `disk0p1`…`disk0p4`, and `disk1` when a second disk is attached); procfs is mounted on `/proc`.
 
-**fsck**: `make fsck` checks `build/fs.img` (`build/tools/mkfs --check IMAGE`; run it by hand on `home.img`, with QEMU stopped). It prints the volume label and reports:
+**fsck**: `make fsck` checks `build/fs.img` and `disk.img` (`build/tools/mkfs --check IMAGE`, every partition of a GPT image; `eudisk fsck IMAGE[:PART]` does the same; with QEMU stopped). It prints each volume's label and reports:
 - superblock and log problems, and notes a committed log awaiting replay
 - `.`/`..` errors, bad names, wrong link counts
 - blocks outside the data area or used twice

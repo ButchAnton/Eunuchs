@@ -2,16 +2,19 @@
  * eboot: the Eunuchs boot loader.
  *
  * QEMU loads it (the -kernel of make run and make test) and OpenSBI enters
- * it in S-mode with the MMU off: a0 = hart id, a1 = the device tree. It finds
- * the root disk (the virtio block device whose efs volume label is "root",
- * else the first one, as the kernel decides), reads /boot/kernel.elf from it,
- * loads the segments at their physical addresses and jumps to the entry with
- * a0 and a1 as they came: the kernel can't tell it from QEMU loading it. If
- * that kernel is missing or bad, it tries /boot/kernel.old.elf; if neither
- * works it says why and powers off.
+ * it in S-mode with the MMU off: a0 = hart id, a1 = the device tree. It reads
+ * the virtio disks' partition tables (GPT, kernel/include/gpt_format.h) and
+ * reads /kernel.elf from the efs partition named "boot", loads the segments
+ * at their physical addresses and jumps to the entry with a0 and a1 as they
+ * came: the kernel can't tell it from QEMU loading it. If that kernel is
+ * missing or bad, it tries /kernel.elf on "boot.old"; if neither works it
+ * says why and powers off. (A disk without boot partitions, such as a bare
+ * efs image: /boot/kernel.elf, then /boot/kernel.old.elf, on the root volume,
+ * the one labelled "root", else the first that is not a boot slot.)
  *
- * So Eunuchs can run a kernel it built: copy it to /boot/kernel.elf (keeping
- * the old one as /boot/kernel.old.elf) and reboot.
+ * So Eunuchs can run a kernel it built: install it in boot (the kernel there
+ * moving to boot.old: kinstall, or eudisk kernel install on the Mac) and
+ * reboot.
  *
  * Everything polls and runs at physical addresses. eboot lives at 0x82000000
  * (eboot.ld); a kernel must fit between 0x80200000 (after OpenSBI) and that.
@@ -19,6 +22,7 @@
  * still in the efs log, as the kernel's recovery would replay it.
  */
 #include <efs_format.h>
+#include <gpt_format.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -121,6 +125,15 @@ static int label_is(const char *label, const char *want)
     return !want[i] && (i == 16 || !label[i]);
 }
 
+static int memeq(const void *a, const void *b, size_t n)
+{
+    const u8 *p = a, *q = b;
+    while (n--)
+        if (*p++ != *q++)
+            return 0;
+    return 1;
+}
+
 static int streq(const char *a, const char *b)
 {
     while (*a && *a == *b)
@@ -217,6 +230,7 @@ static struct { u32 type, reserved; u64 sector; } req;
 static volatile u8 req_status;
 static u16 used_seen;
 static uintptr_t dev;               /* the disk in use */
+static u64 vol_base;                /* the first sector of the volume in use */
 
 static void blk_reset(uintptr_t d)
 {
@@ -299,19 +313,21 @@ static int read_block(u32 b, void *buf)
     for (u32 i = 0; i < logh.n && i < EFS_LOGSIZE; i++)
         if (logh.blocks[i] == b)
             from = sb.logstart + 1 + i;
-    return blk_read((u64)from * EFS_SECTORS_PER_BLOCK, buf, EFS_SECTORS_PER_BLOCK);
+    return blk_read(vol_base + (u64)from * EFS_SECTORS_PER_BLOCK, buf, EFS_SECTORS_PER_BLOCK);
 }
 
-/* The efs superblock and log of the current disk; 0 if there is an efs. */
-static int efs_open(void)
+/* The efs superblock and log of the volume at sector base of the current
+   disk; 0 if there is an efs. */
+static int efs_open(u64 base)
 {
     logh.n = 0;
-    if (blk_read(1 * EFS_SECTORS_PER_BLOCK, sbuf, EFS_SECTORS_PER_BLOCK))
+    vol_base = base;
+    if (blk_read(base + 1 * EFS_SECTORS_PER_BLOCK, sbuf, EFS_SECTORS_PER_BLOCK))
         return -1;
     memcpy(&sb, sbuf, sizeof(sb));
     if (sb.magic != EFS_MAGIC || sb.bsize != EFS_BSIZE)
         return -1;
-    if (blk_read((u64)sb.logstart * EFS_SECTORS_PER_BLOCK, sbuf, EFS_SECTORS_PER_BLOCK))
+    if (blk_read(base + (u64)sb.logstart * EFS_SECTORS_PER_BLOCK, sbuf, EFS_SECTORS_PER_BLOCK))
         return -1;
     memcpy(&logh, sbuf, sizeof(logh));
     if (logh.magic != EFS_LOG_MAGIC)
@@ -435,13 +451,14 @@ static int bad(const char *path, const char *why)
     return -1;
 }
 
-/* Load the kernel in `path`; its physical entry address in *entry. */
-static int load_kernel(const char *path, uintptr_t *entry)
+/* Load the kernel in `file` (called `path` in messages); its physical entry
+   address in *entry. */
+static int load_kernel(const char *file, const char *path, uintptr_t *entry)
 {
     struct efs_dinode d;
     struct ehdr eh;
     struct phdr ph[MAX_PHDRS];
-    if (!lookup(path, &d))
+    if (!lookup(file, &d))
         return bad(path, "not found");
     if (d.type != EFS_T_FILE)
         return bad(path, "not a file");
@@ -496,42 +513,137 @@ static int load_kernel(const char *path, uintptr_t *entry)
     return 0;
 }
 
+/* ---- volumes: GPT partitions, or whole disks ---- */
+
+#define MAX_VOLS 16
+
+static struct vol {
+    uintptr_t dev;
+    u64 base;                       /* first sector */
+    char name[GPT_NAME_LEN + 1];    /* the GPT partition name; "" for a whole disk */
+    char label[17];                 /* the efs volume label */
+} vols[MAX_VOLS];
+static int nvols;
+
+static u8 gptbuf[GPT_NENTRIES * GPT_ENTRY_SIZE] __attribute__((aligned(16)));
+
+static void add_vol(uintptr_t d, u64 base, const char *name)
+{
+    if (nvols == MAX_VOLS || efs_open(base))
+        return;                     /* not efs: nothing to boot from */
+    struct vol *v = &vols[nvols++];
+    v->dev = d;
+    v->base = base;
+    int i = 0;
+    for (; name[i] && i < GPT_NAME_LEN; i++)
+        v->name[i] = name[i];
+    v->name[i] = 0;
+    memcpy(v->label, sb.label, 16);
+    v->label[16] = 0;
+}
+
+/* The efs volumes of the current disk: its GPT partitions (from the primary
+   table; QEMU's disks are never damaged halfway) or the whole disk. */
+static void scan_disk(uintptr_t d)
+{
+    struct gpt_header h;
+    if (blk_read(1, sbuf, 1) == 0) {
+        memcpy(&h, sbuf, sizeof(h));
+        u32 want = h.header_crc;
+        h.header_crc = 0;
+        if (h.signature == GPT_SIGNATURE && h.header_size >= GPT_HEADER_SIZE && h.entry_size == GPT_ENTRY_SIZE &&
+            h.num_entries && h.num_entries <= GPT_NENTRIES && gpt_crc32(&h, GPT_HEADER_SIZE) == want &&
+            blk_read(h.entries_lba, gptbuf, GPT_ENTRY_SECTORS) == 0 &&
+            gpt_crc32(gptbuf, h.num_entries * GPT_ENTRY_SIZE) == h.entries_crc) {
+            static const u8 unused[16];
+            for (u32 i = 0; i < h.num_entries; i++) {
+                const struct gpt_entry *e = (const void *)(gptbuf + i * GPT_ENTRY_SIZE);
+                if (memeq(e->type, unused, 16) || e->last_lba < e->first_lba)
+                    continue;
+                char name[GPT_NAME_LEN + 1];
+                gpt_name(e, name);
+                add_vol(d, e->first_lba, name);
+            }
+            return;
+        }
+    }
+    add_vol(d, 0, "");
+}
+
+/* The volume called `want`: by GPT name, else by efs label. */
+static struct vol *find_vol(const char *want)
+{
+    for (int i = 0; i < nvols; i++)
+        if (streq(vols[i].name, want))
+            return &vols[i];
+    for (int i = 0; i < nvols; i++)
+        if (label_is(vols[i].label, want))
+            return &vols[i];
+    return NULL;
+}
+
+static int is_boot_vol(const struct vol *v)
+{
+    return streq(v->name, "boot") || streq(v->name, "boot.old") || label_is(v->label, "boot") ||
+           label_is(v->label, "boot.old");
+}
+
 /* ---- main ---- */
 
-static const char *const kernels[] = { "/boot/kernel.elf", "/boot/kernel.old.elf" };
+static const struct {
+    const char *vol;                /* (NULL: the root volume) */
+    const char *path, *shown;
+} kernels[] = {
+    { "boot", "/kernel.elf", "boot:/kernel.elf" },
+    { "boot.old", "/kernel.elf", "boot.old:/kernel.elf" },
+    { NULL, "/boot/kernel.elf", "/boot/kernel.elf" },          /* no boot partitions */
+    { NULL, "/boot/kernel.old.elf", "/boot/kernel.old.elf" },
+};
 
 __attribute__((noreturn)) void eboot_main(long hartid, void *dtb)
 {
-    uintptr_t devs[MAX_VIRTIO], root = 0, first = 0;
+    uintptr_t devs[MAX_VIRTIO];
     puts_("eboot: Eunuchs boot loader\n");
     int n = virtio_devices(dtb, devs, MAX_VIRTIO);
     for (int i = 0; i < n; i++) {
         if (blk_init(devs[i]))
             continue;
-        if (efs_open() == 0) {
-            if (!first)
-                first = devs[i];
-            if (!root && label_is(sb.label, "root"))
-                root = devs[i];
-        }
+        scan_disk(devs[i]);
         blk_reset(devs[i]);
     }
-    if (!root)
-        root = first;
-    if (!root) {
+    if (!nvols) {
         puts_("eboot: no disk with an efs filesystem\n");
         power_off();
     }
-    blk_init(root);
-    efs_open();
-    puts_("eboot: root disk at ");
-    putnum(root, 16);
-    puts_(logh.n ? " (a committed transaction in the log: read through it)\n" : "\n");
+    struct vol *root = find_vol("root");
+    for (int i = 0; i < nvols && !root; i++)        /* else the first that is not a boot slot */
+        if (!is_boot_vol(&vols[i]))
+            root = &vols[i];
+    if (!root)
+        root = &vols[0];
+    int have_boot = find_vol("boot") || find_vol("boot.old");
     for (unsigned k = 0; k < sizeof(kernels) / sizeof(kernels[0]); k++) {
-        uintptr_t entry = 0;
-        if (load_kernel(kernels[k], &entry))
+        struct vol *v = kernels[k].vol ? find_vol(kernels[k].vol) : have_boot ? NULL : root;
+        if (!v) {
+            if (kernels[k].vol && have_boot) {
+                puts_("eboot: ");
+                puts_(kernels[k].shown);
+                puts_(": no such partition\n");
+            }
             continue;
-        blk_reset(root);                    /* the kernel finds the disk as QEMU left it */
+        }
+        blk_init(v->dev);
+        efs_open(v->base);
+        if (logh.n) {
+            puts_("eboot: ");
+            puts_(v->name[0] ? v->name : v->label);
+            puts_(": a committed transaction in the log: read through it\n");
+        }
+        uintptr_t entry = 0;
+        int r = load_kernel(kernels[k].path, kernels[k].shown, &entry);
+        blk_reset(v->dev);                  /* the kernel finds the disk as QEMU left it */
+        if (r)
+            continue;
         asm volatile("fence.i" ::: "memory");
         ((void (*)(long, void *))entry)(hartid, dtb);
     }

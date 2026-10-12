@@ -222,7 +222,7 @@ int vfs_mount_disk(const struct fs_type *type, const char *path, int disk)
         root_inode = sb->root;
     list_add_tail(&sb->node, &mounts);
     if (type == &efs_type)
-        pr_info("mounted %s (disk%d) on %s\n", type->name, disk, path);
+        pr_info("mounted %s (%s) on %s\n", type->name, blk_name(disk), path);
     else
         pr_info("mounted %s on %s\n", type->name, path);
     return 0;
@@ -987,31 +987,65 @@ void *vfs_read_all(const char *path, size_t *size, int *err)
     return data;
 }
 
-/* The disk whose efs volume label is `label`, or -1. */
-static int disk_labeled(const char *label)
+/* The volume named `label`: by its GPT partition name, else by its efs
+   volume label; -1 if there is none. */
+static int volume_labeled(const char *label)
 {
-    for (int d = 0; d < blk_count(); d++) {
+    for (int v = 0; v < blk_count(); v++)
+        if (!strcmp(blk_label(v), label))
+            return v;
+    for (int v = 0; v < blk_count(); v++) {
         char l[17];
-        if (efs_label(d, l) == 0 && !strcmp(l, label))
-            return d;
+        if (efs_label(v, l) == 0 && !strcmp(l, label))
+            return v;
     }
     return -1;
+}
+
+/* A boot slot (by GPT name or efs label): never the root filesystem. */
+static bool is_boot_volume(int v)
+{
+    char l[17];
+    const char *g = blk_label(v);
+    if (!strcmp(g, "boot") || !strcmp(g, "boot.old"))
+        return true;
+    return efs_label(v, l) == 0 && (!strcmp(l, "boot") || !strcmp(l, "boot.old"));
+}
+
+/* The root filesystem: the volume labelled "root", else the first efs volume
+   that is not a boot slot, else volume 0. */
+static int root_volume(void)
+{
+    int root = volume_labeled("root");
+    if (root >= 0)
+        return root;
+    for (int v = 0; v < blk_count(); v++) {
+        char l[17];
+        if (efs_label(v, l) == 0 && !is_boot_volume(v))
+            return v;
+    }
+    return 0;
 }
 
 void vfs_init(void)
 {
     bcache_init();
-    /* / is the disk labelled "root" (or the first one), /home the one labelled "home" */
-    int root = disk_labeled("root");
-    if (root < 0)
-        root = 0;
+    blk_scan_volumes();
+    /* / is the volume labelled "root" (see root_volume); /home, /boot and
+       /boot.old the ones labelled so, when there are */
+    int root = root_volume();
     if (vfs_mount_disk(&efs_type, "/", root))
         panic("cannot mount the root filesystem");
-    int home = disk_labeled("home");
-    if (home >= 0 && home != root) {
-        int hr = vfs_mount_disk(&efs_type, "/home", home);
-        if (hr)
-            pr_warn("/home (disk%d) not mounted: %s\n", home, errno_name(-hr));
+    static const char *const others[][2] = {
+        { "home", "/home" }, { "boot", "/boot" }, { "boot.old", "/boot.old" },
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(others); i++) {
+        int v = volume_labeled(others[i][0]);
+        if (v < 0 || v == root)
+            continue;
+        int r = vfs_mount_disk(&efs_type, others[i][1], v);
+        if (r)
+            pr_warn("%s (%s) not mounted: %s\n", others[i][1], blk_name(v), errno_name(-r));
     }
     int r = vfs_mount(&devfs_type, "/dev");
     if (r)

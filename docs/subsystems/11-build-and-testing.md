@@ -107,7 +107,9 @@ User link: `$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ prog.o $(UL
 | `build/user/bin/<prog>` | Full user binaries with DWARF (for GDB) |
 | `build/user/stripped/<prog>` | `objcopy --strip-debug` copies; the symbol table stays so the kernel can symbolize user backtraces |
 | `build/tools/mkfs` | Host mkfs/fsck |
-| `build/fs.img` | The 64 MiB root filesystem image |
+| `build/fs.img` | The tests' disk image (GPT: boot, boot.old, root, home; 160 MiB) |
+| `disk.img` (top directory) | The disk image `make run` uses, kept and updated in place |
+| `build/tools/eudisk`, `build/gui/` | The image tool and the Eudisk app's build |
 | `build/eboot.elf`, `build/boot/` | The boot loader (QEMU's `-kernel`) and its objects |
 | `build/kernel.boot` | The kernel without DWARF, installed as `/boot/kernel.elf` and `/boot/kernel.old.elf` |
 | `build/host/test_*` | Host test binaries |
@@ -158,28 +160,71 @@ The kernel's `ksym_lookup`/`ksym_find`/`ksym_format` (`kernel/debug/ksyms.c`) se
 
 ### Disk image contents (`FS_FILES` in the Makefile)
 
-`$(MKFS) --label root build/fs.img $(FS_MB) $(FS_FILES)` with `FS_MB ?= 64` (32 until the image carried its own source tree). The label is how the kernel recognizes the root disk when several are attached. Spec syntax (from `do_mkfs` in `tools/mkfs/mkfs.c`):
+The images are **GPT disks** with four efs partitions, `DISK_LAYOUT = boot:$(BOOT_MB) boot.old:$(BOOT_MB) root:$(FS_MB) home:$(HOME_MB)` (16, 16, 64 and 64 MiB by default; each partition's efs label is its GPT name), made by the host tool `build/tools/eudisk` (`tools/eudisk/eudisk.c` on the efs library `tools/efs`). The `mkdisk` recipe builds a new image as `IMAGE.new` and renames it when complete:
+
+```
+eudisk create IMAGE.new $(DISK_LAYOUT)
+eudisk install IMAGE.new root $(FS_FILES)
+eudisk install IMAGE.new home /guest/:0755:1000:1000
+eudisk kernel install --to boot IMAGE.new build/kernel.boot
+eudisk kernel install --to boot.old IMAGE.new build/kernel.boot
+mv -f IMAGE.new IMAGE
+```
+
+Spec syntax (`eudisk install`, as mkfs's):
 
 | Spec | Meaning |
 |---|---|
 | `/path=hostfile` | Copy a host file in (uid/gid 0; mode 0755 if the host file is executable, else 0644) |
 | `/path=@/existing` | Hard link to an entry listed earlier |
-| `/dir/[:mode[:uid[:gid]]]` | Create a directory, optionally with octal mode and owner |
+| `/dir/[:mode[:uid[:gid]]]` | Create a directory, optionally with octal mode and owner (applied only if it does not exist yet) |
+| `+/path=hostfile` | A configuration file: once the user has edited it, an update keeps theirs and writes the new one as `PATH.new` |
 
 What goes in:
 
-- `/boot/kernel.elf` and `/boot/kernel.old.elf`: both `build/kernel.boot`, the kernel without DWARF (`objcopy --strip-debug`), which the boot loader loads;
+- in the `boot` and `boot.old` partitions, `/kernel.elf`: `build/kernel.boot`, the kernel without DWARF (`objcopy --strip-debug`), which the boot loader loads;
+- in `home`, `/guest` (0755, uid and gid 1000); in `root`, the following:
 - every `user/bin/*.c` program as `/bin/<name>` (stripped copy);
 - hard links to `/bin/eutils` for `echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile true false yes kill date dmesg free sleep strace su dbg uname clear` (`EUTILS_LINKS`);
 - hard links `/bin/sh` → `esh`, `/bin/less` → `more`, and `/bin/vi`, `/bin/view`, `/bin/emacs`, `/bin/em` → `edit`;
-- `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` from `user/etc/`, `/www/index.html` from `user/www/`;
-- empty `/dev/`, `/proc/`, `/tmp/` (mode 0777), `/www/`, `/home/`, `/home/guest/` (0755, uid 1000, gid 1000), `/mnt/` and `/mnt/host/` (the 9P mount point);
+- `+/etc/motd`, `+/etc/passwd`, `+/etc/group`, `+/etc/hostname`, `+/etc/eshrc` from `user/etc/` (configuration files), `/www/index.html` from `user/www/`;
+- empty `/dev/`, `/proc/`, `/tmp/` (mode 0777), `/www/`, `/home/`, `/home/guest/` (0755, uid 1000, gid 1000), `/mnt/` and `/mnt/host/` (the 9P mount point), and the mount points `/boot/` and `/boot.old/`;
 - the whole source tree needed to rebuild the system (`EU_SRC`, 294 files) under `/usr/src/eunuchs/` ([13](13-toolchain.md#the-source-tree-in-the-image-usrsrceunuchs));
 - the toolchain's sysroot (`SYS_FILES`: everything under `build/sysroot`, at the same path without that prefix: `/usr/include`, `/usr/lib`, `/usr/lib/tcc`) and the program sources (`USR_SRC`: `user/bin/*.c` and `user/bin/*/*.{c,h}` under `/usr/src`, plus `user/usr-src/Makefile` as `/usr/src/Makefile`).
 
-**The home disk.** `home.img` (`HOME_IMG ?= home.img`, in the top directory, not `build/`) is a separate image made by `$(MKFS) --label home home.img $(HOME_MB) /guest/:0755:1000:1000` with `HOME_MB ?= 64`. Its rule has only an order-only dependency on mkfs, so it is created once and never rebuilt: files saved under `/home` survive `make`, `make clean` and kernel changes. `make clean-home` deletes it. `*.img` is in `.gitignore`.
+**Two images.**
+- **`build/fs.img`**, the tests' image: made afresh with `mkdisk` whenever anything in it changes (the programs, `/etc`, the sysroot, the sources, the kernel, eudisk).
+- **`disk.img`** (`DISK_IMG ?= disk.img`, in the top directory), what `make run`, `debug` and `qemu-log` boot: made once with `mkdisk` (and, if a `home.img` from the old two-disk layout is there, its files copied into the new home partition with `eudisk copy home.img:/ disk.img:home:/`, after which `home.img` can go; if the copy skips anything, `make` prints a note and goes on, and `eudisk copy home.img:/ disk.img:home:/` retries it), and from then on **updated in place** by every `make`: `eudisk install disk.img root $(FS_FILES)`, `eudisk install disk.img home …`, and `eudisk kernel install disk.img build/kernel.boot` (the kernel in `boot` moves to `boot.old`). `make clean` leaves it; `rm disk.img` gives a fresh one.
 
-The mkfs layout: block 1 superblock, the log from block 2 (`EFS_LOGSIZE + 1` blocks), inode blocks for one inode per 32 KiB of disk, at least 1024 (2048 in the default image), the bitmap, then data. Exit codes: 0 clean, 1 errors found, 2 usage or I/O error.
+**`eudisk install` keeps your work.** It records what it installed in `/var/lib/eudisk/manifest` on the partition (one line per file: CRC32, size, path; or a hard link). A file still as installed is replaced in place, so its inode and hard links survive. A file you changed (or one it did not install) is first copied to `/var/backup/YYYYMMDD-HHMMSS/PATH` (local time, one directory per run). A `+` configuration file you edited stays, and the new version is written as `PATH.new`. Files it installed earlier that are no longer in the specs are removed if unchanged, otherwise left and reported. It prints `IMAGE:PART: N new, N updated, N unchanged[, N removed][, N of yours backed up in DIR][, N of your configuration files kept]`, and saves the image only if something changed.
+
+### eudisk (`tools/eudisk`)
+
+A Mac command-line tool to examine and change images, a GPT disk or a bare efs filesystem. Places are written `IMAGE:PATH` (the `root` partition, or the first efs partition) or `IMAGE:PART:PATH` (`PART` is a GPT name or efs label), e.g. `disk.img:/etc/passwd`, `disk.img:home:/guest`.
+
+| Command | Does |
+|---|---|
+| `create IMAGE NAME:MB...` | a new image: protective MBR, primary and backup GPT (1 MiB-aligned partitions, random GUIDs, the efs type GUID), an empty efs in each partition labelled with its name (names of 1–16 characters, up to 16 partitions); it refuses if `IMAGE` exists (`--force` overrides) |
+| `info [--json] IMAGE` | partitions, use and the kernels in the boot slots |
+| `ls [-lR] [--json] IMAGE[:PART]:PATH` | a directory listing |
+| `cat IMAGE[:PART]:PATH` | a file to standard output |
+| `get [-r] IMAGE[:PART]:PATH LOCAL` | copy out (mode bits kept) |
+| `put [-r] [-m MODE] [-o UID:GID] LOCAL IMAGE[:PART]:PATH` | copy in; an existing file is replaced in place |
+| `mkdir [-p] [-m MODE] [-o UID:GID] IMAGE[:PART]:PATH`, `rm [-r] IMAGE[:PART]:PATH` | (`rm` saves the image only if the path is gone) |
+| `copy IMAGE[:PART]:PATH IMAGE[:PART]:PATH` | a tree between filesystems (or within one), keeping owners, modes, times and hard links; existing files are left alone (and the exit status is 1), and existing directories, the destination root included, keep their own owner, mode and time (only directories it creates get the source's). A hard link whose first name was skipped can come out as a separate file |
+| `fsck IMAGE[:PART]` | check every efs partition (or one; an unknown name is `no partition NAME`, exit 1) |
+| `kernel [--json] IMAGE` | the kernels in `boot` and `boot.old` (size, validity, banner) |
+| `kernel install [--to SLOT] IMAGE KERNEL` | the kernel in `boot` goes to `boot.old` and `KERNEL` to `boot` (nothing if it is already there); `--to` writes one slot without rotating |
+| `kernel rollback IMAGE` | swap `boot` and `boot.old` (if `boot` is empty, move the `boot.old` kernel into it) |
+| `install IMAGE PART SPEC...` | system files, with the policy above |
+
+A kernel is accepted only if it is a RISC-V 64-bit ELF executable containing the banner `Eunuchs 0.1 (riscv64), `; the rest of that line (`built DATE TIME by CC`) is shown as its description. Every command loads the whole image into memory (replaying a committed log transaction there); commands that change it write the whole image to a temporary file, `fsync` it and rename it over the original, so an interrupted save leaves the old image. They refuse while a `qemu-system` process has the image open (found with `ps`, by its `file=` argument), unless `--force` is given. `--json` is accepted by `info`, `ls` and `kernel`. Exit status: 0 done, 1 failed, 2 usage. `mkfs` (`tools/mkfs/mkfs.c`) is rebuilt on the same library: it still makes bare efs images, and `mkfs --check` checks every partition of a GPT image.
+
+### Eudisk, the Mac app (`tools/eudisk-gui`, `make gui`)
+
+A SwiftUI app (a SwiftPM package for macOS 14) that drives `eudisk --json`. `make gui` builds it (`swift build -c release` into `build/gui`) and opens `disk.img`, or `IMAGE=…`. The sidebar shows the partitions with usage bars and the kernels in the two slots with Install… and Roll Back; the main area is a file table (name, size, mode, owner, links, modified) with double-click navigation and a path bar, and a preview (text, or a hex dump of the first 1 KiB). The toolbar imports (also by dragging files in from the Finder), exports, makes folders, deletes, checks the image (`fsck`) and reloads. While QEMU has the image open, every write is disabled ("in use by QEMU: read-only"; refreshed on reload). It finds the tool through `$EUDISK`, beside its own executable, or as `build/tools/eudisk` in or above the image's directory. `EUDISK_SNAPSHOT=file.png` renders the window to a PNG and quits, for testing.
+
+The efs layout in each partition (as from mkfs): block 1 superblock, the log from block 2 (`EFS_LOGSIZE + 1` blocks), inode blocks for one inode per 32 KiB of disk, at least 1024 (2048 in the default image), the bitmap, then data. Exit codes: 0 clean, 1 errors found, 2 usage or I/O error.
 
 ### Test result protocol
 
@@ -248,11 +293,7 @@ Disk (`DISKOPTS`, a function of the image path):
     -device virtio-blk-device,drive=hd0
 ```
 
-Home disk (`HOMEOPTS`, part of `QEMUOPTS`, so used by `run`, `debug` and `qemu-log` only; the test scenarios, `stress` and record/replay boot with the root disk alone):
-
-```
--drive file=home.img,if=none,format=raw,id=hd1 -device virtio-blk-device,drive=hd1
-```
+`make run`, `debug` and `qemu-log` attach `disk.img` with `DISKOPTS`; the tests attach a scratch copy of `build/fs.img` the same way. There is one disk: `/home` is a partition of it.
 
 Host share (`SHAREOPTS`, part of `QEMUOPTS`, so `run`, `debug` and `qemu-log`; empty when `HOSTDIR` is empty):
 
@@ -273,7 +314,7 @@ Network (`NETOPTS`, used by `run`, `debug`, `qemu-log`):
 
 | Target | Command |
 |---|---|
-| `run` | `QEMUBASE + DISKOPTS(build/fs.img) + HOMEOPTS + SHAREOPTS + NETOPTS -append "$(APPEND)"` |
+| `run` | `QEMUBASE + DISKOPTS(disk.img) + SHAREOPTS + NETOPTS -append "$(APPEND)"` |
 | `debug` | as `run` plus `-s -S` (GDB stub on TCP 1234, CPUs halted) |
 | `gdb` | `riscv64-elf-gdb -q -x tools/gdb/init.gdb build/kernel.elf` (connects to `localhost:1234`, loads `tools/gdb/eunuchs.py`) |
 | `qemu-log` | as `run` plus `-d int,guest_errors,unimp -D build/qemu.log` |
@@ -307,13 +348,15 @@ Network (`NETOPTS`, used by `run`, `debug`, `qemu-log`):
    - `test_tcp`: `kernel/net/tcp.c kernel/net/netbuf.c kernel/net/cksum.c` (with `-DNET_HOST_TEST`)
 2. Each binary runs in turn (`== build/host/test_X`); the first failure stops the target.
 3. `tests/host/test_fsck.py build/tools/mkfs build/user/bin/hello` runs next. It needs a cross-built `hello`, so `test-host` also requires the RISC-V toolchain.
-4. `tests/host/test_tcc_asm.py build/tcc/xtcc third_party/tinycc riscv64-elf-` runs last (`test-host` depends on `$(XTCC)`, so `make ci` covers it).
+4. `tests/host/test_eudisk.py build/tools/eudisk build/kernel.boot`.
+5. `tests/host/test_tcc_asm.py build/tcc/xtcc third_party/tinycc riscv64-elf-` runs last (`test-host` depends on `$(XTCC)`, so `make ci` covers it).
 
 What they check:
 
 - **test_printf**: `ksnprintf` against host `snprintf` for 26 integer formats × 8 values, long/size/intmax/ptrdiff conversions, 7 string formats × 4 strings, `%c`, `%%`, `*` widths (including negative), `%p`, and truncation (return value 11, buffer `"trun"`).
 - **test_buddy**: zone of 3000 pages (not a power of two) at PFN `0x80000` with a reserved hole [1500, 1537): initial layout, exhaustion and shuffled free with full coalescing, 200,000 random alloc/free steps with an ownership map that detects overlap and misalignment, error paths (tail free, double free, reserved free, order `MAX_ORDER + 1`).
 - **test_tcp**: endpoints A (10.0.0.1) and B (10.0.0.2) over a simulated wire with loss, duplication and delay on a simulated millisecond clock. Scenarios: RFC 1071 checksums; small exchange; bulk both ways; 5% and 20% loss; 10% duplication; 30 ms latency with 5% loss; receiver stall (zero window); 25 randomized seeds (60 KB each way, 10% loss, 5% duplicates, some with 500 ms stalls); simultaneous close (at most 8 segments, both in TIME_WAIT); refused; reset on close with unread data; listen backlog; timeout. At the end it requires `nb_live == 0` (no leaked packet buffers). `test_tcp -v`/`-vv` logs state changes; `test_tcp -v LOSS [SEED DUP STALL]` runs one 60 KB transfer for debugging.
+- **test_eudisk.py**: creates a four-partition image and checks `info` and `fsck`; an `install` of a file, a hard link, a `+` configuration file and a directory; after user edits (with `put`) and a re-install with a new version and a link dropped: the edited program replaced with a backup in `/var/backup`, the edited configuration file kept with `conf.new` beside it, a user file and the home partition untouched, the dropped link removed; a second install reporting `0 new, 0 updated`; a non-kernel rejected; `kernel install` rotating and saying `already` for the same kernel; `kernel rollback`; `mkdir -o` and `copy` to a second image keeping owners, and a second `copy` leaving files alone; both images clean at the end.
 - **test_tcc_asm.py**: tcc's RISC-V assembler against GNU as. Each input is assembled by `xtcc` (the same source as the guest's `/bin/tcc`) and by GNU `as` (`-march=rv64g`, so it does not compress, and `-mno-relax`); `.eh_frame` is stripped, both objects are linked by GNU `ld` at `0x80000000` with any undefined symbols `--defsym`ed, and the loaded bytes must be identical. The inputs: the 9 `.S` files of the kernel and libc (`boot`, `fp`, `safe`, `switch`, `trapentry`, `uaccess`, `crt0` with `-DNO_GP`, `setjmp`, `syscall`); a file of directives and pseudo-instructions (macros, `.irp`, `.rept`, `.equ`/`.set`, `.option`, section types, `la`/`lla`/`call`/`tail`, loads and stores of symbols, and every data size: `.word` followed by `.byte`, `.half`, `.short`, `.2byte`, `.4byte`, `.8byte` and `.long`, so a wrong size cannot hide in the zero padding at the end of a section); and every instruction form tcc knows, base and compressed, with random registers and immediates for two fixed seeds (about 2,000 base and 900 compressed instructions each). It fails on the tcc from before the assembler work (all 14 comparisons) and catches a deliberately reintroduced `srl` encoding bug.
 - **test_fsck.py**: builds a 4 MiB image (`/bin/a`, hard link `/bin/b`, `/etc/x`, `/tmp/`) and requires `--check` to pass it, then flips one thing at a time and requires a non-zero exit with a specific message: used block marked free, leaked block, wrong link count, block used twice, orphaned inode, bad `..` entry, bad superblock magic.
 
@@ -335,7 +378,7 @@ KTEST RESULT: PASS|FAIL
 
 ### The user test run (`utest`)
 
-With `utest` (no value) `kinit` spawns `/bin/init -1 /bin/utests`, which runs `utests` once and exits with its status. `utests` runs all 46 entries of its `tests[]` table in order. Each prints `[ RUN      ]`, calls `dbg_mark(name)` (a trace marker), and prints `[       OK ]` or `[  FAILED  ]`. `CHECK(cond)` prints the file and line and marks the test failed. At the end it writes `/home/persist.txt` ("survives reboots") for the next stage and prints `UTEST RESULT:`.
+With `utest` (no value) `kinit` spawns `/bin/init -1 /bin/utests`, which runs `utests` once and exits with its status. `utests` runs all 46 entries of its `tests[]` table in order. Each prints `[ RUN      ]`, calls `dbg_mark(name)` (a trace marker), and prints `[       OK ]` or `[  FAILED  ]`. `CHECK(cond)` prints the file and line and marks the test failed. At the end it writes `/persist.txt` ("survives reboots") for the next stage and prints `UTEST RESULT:`.
 
 With `utest=<mode>`, `kinit` passes the mode as `argv[1]` and `utests` runs `scenario(mode)` instead of the suite. After `ktest` and/or `utest`, if `tracedump=<path>` is set, `kinit` writes the trace buffer to that host path through semihosting, then calls `platform_exit(failed ? 1 : 0)`.
 
@@ -381,7 +424,7 @@ The crash stages use `dbg_fscrash()` from `utests` (`scenario`): write `part1`, 
 
 **Toolchain and editors steps** (stage 15): writes a small C program to `/tmp/h.c` with `echo`; `tcc -o /tmp/h /tmp/h.c && /tmp/h` and `tcc -run /tmp/h.c | cat` must both print `tcc says 42`; `cd /usr/src && make bin/cat && bin/cat /etc/passwd` must show `guest:x:1000`; then `vi /tmp/v.txt` with keys `ihello from vi`, Esc, `yyp:s/vi/ex/`, `:wq`, and `cat` must show both lines; then `emacs /tmp/e.txt`, typing `hello from emacs`, `C-x C-s`, `C-x C-c`, and `cat` must show it; finally `tcc -g` compiles a two-function program and `db -batch -ex 'break add' -ex run -ex bt -ex finish -ex continue` must print `Breakpoint 1, add (a=2, b=3) at /tmp/d.c:3`, a `#1` backtrace frame, `Value returned is $1 = 5` and `exited normally`.
 
-**Boot loader steps** (stage 16, on a separate copy of the image: `interactive()` takes an `image=` argument): `su guest` and `reboot` must fail with `Operation not permitted`; as root, `rm /boot/kernel.elf && reboot` must show `eboot: /boot/kernel.elf: not found`, `eboot: loaded /boot/kernel.old.elf`, the kernel's banner and a root prompt; then `rm /boot/kernel.old.elf && reboot` must give `eboot: no kernel to boot` and `eboot: powering off`.
+**Boot loader steps** (stage 16, on a separate copy of the image: `interactive()` takes an `image=` argument): as `guest`, `reboot` gives `Operation not permitted` and `kinstall --rollback` `Permission denied`; as root, `kinstall` lists `/boot.old/kernel.elf`, `kinstall /bin/hello` is refused (`not a Eunuchs kernel`), `kinstall /boot.old/kernel.elf` says it is `in /boot/kernel.elf already`, `kinstall --rollback` swaps (`(was in /boot.old/kernel.elf)`); then `rm /boot/kernel.elf && reboot` must show `eboot: boot:/kernel.elf: not found`, `eboot: loaded boot.old:/kernel.elf`, the kernel's banner and a root prompt, and `rm /boot.old/kernel.elf && reboot` must give `eboot: no kernel to boot` and `eboot: powering off`.
 
 **Host share steps** (stage 17): `run_tests.py` first recreates `build/test-share` with `from-mac.txt`, `gone.txt` and an empty `sub/`, and boots with that directory shared (`interactive()` now takes extra QEMU arguments). In the guest: `cat /mnt/host/from-mac.txt`; write `from-guest.txt`, `mkdir d`, `mv` the file into it and `ls` it; `cp /bin/cat` into the share, `rm gone.txt`, `chmod 600 from-mac.txt`; `cd /mnt/host/sub && pwd`; `tcc -o /mnt/host/hello /usr/src/echod.c`; a directory listed, then changed (`rm` of one of its files), must list without the removed name (a second listing never reuses the first one's buffered `Treaddir` batch), and `rm -rf` of the tree works; finally `tcc -o /tmp/asmtest /mnt/host/asmtest.S /mnt/host/asmtest.c && /tmp/asmtest` (the two files are copied from `tests/guest/` into the share) must print `sum=55 shifts=f000000006064245 big=123456789abcdef0 table=4321 inc=42 call=20`: tcc's assembler running on Eunuchs, exercising a macro with a default argument, `.irp`, numeric local labels in both directions, shifts, a 64-bit `li`, `la` of `.data`, an `lr`/`sc` loop, a call back into C, and the `fp` register name. **Mac side** (stage 18, no boot): `d/g.txt` holds `made in eunuchs`, `cat.bin` is byte-identical to `build/user/stripped/cat`, `gone.txt` is gone, `from-mac.txt` has mode 0600, and `hello` exists and starts with `\x7fELF`.
 
@@ -444,15 +487,15 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 |---|---|---|
 | `all` (default) | kernel, image, `kld`, `eboot.elf` | Build `build/kernel.elf`, `build/eboot.elf`, `build/tools/kld` and `build/fs.img` (and so all user programs and mkfs) |
 | `user` | | Build all user programs |
-| `fsck` | mkfs | `build/tools/mkfs --check build/fs.img` |
-| `run` | kernel, `eboot.elf`, image, `home.img` | Boot interactively with the root and home disks and a NIC |
-| `debug` | kernel, image, `home.img` | As `run`, halted, GDB stub on :1234 |
+| `fsck` | mkfs | `build/tools/mkfs --check` on `build/fs.img`, and on `disk.img` if it exists (every partition) |
+| `run` | kernel, `eboot.elf`, `disk.img` | Boot interactively from `disk.img` (made or updated first), with the host share and a NIC |
+| `debug` | kernel, `eboot.elf`, `disk.img` | As `run`, halted, GDB stub on :1234 |
 | `gdb` | kernel | Attach GDB with `tools/gdb/init.gdb` |
-| `qemu-log` | kernel, image, `home.img` | As `run`, with QEMU tracing of interrupts, guest errors and unimplemented features to `build/qemu.log` |
+| `qemu-log` | kernel, `disk.img` | As `run`, with QEMU tracing of interrupts, guest errors and unimplemented features to `build/qemu.log` |
 | `disasm` | kernel | `objdump -dS` to `build/kernel.asm` |
 | `test` | kernel, image, mkfs | The 20-stage scenario |
 | `stress` | kernel, image, mkfs | SMP soak for `STRESS_SECS`, then fsck |
-| `test-host` | host tests, mkfs, `build/user/bin/hello`, `build/tcc/xtcc` | Host-native tests, including tcc's assembler against GNU as |
+| `test-host` | host tests, mkfs, eudisk, `build/kernel.boot`, `build/user/bin/hello`, `build/tcc/xtcc` | Host-native tests, including tcc's assembler against GNU as and eudisk |
 | `ci` | | `tools/ci.py $(CI_FLAGS)` |
 | `record` | kernel, image | Interactive one-CPU session recorded into `build/rr/` |
 | `replay` | (a recording) | Re-execute the recording |
@@ -463,9 +506,9 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 | `trace-json` | (`build/trace.bin`) | `eutrace.py perfetto` → `build/trace.json` |
 | `selfhost` | kernel, image, mkfs | Eunuchs builds its own user space and kernel twice with tcc (and `kld`) in the guest, from the image's own `/usr/src/eunuchs` into `/tmp/selfhost` on the guest's disk (`tools/selfhost.py` runs `tools/selfhost.sh` there with `SOURCE_DATE_EPOCH` = the last commit's time), copies the results to `build/selfhost` over the 9P share, requires the two stages byte-identical, makes `build/selfhost/fs.img` from stage 2, and runs the whole `make test` scenario booting stage 2's kernel, with `SH_TIMEOUT` (default 120 s) per stage because that kernel is about half as fast ([13](13-toolchain.md#eunuchs-builds-its-own-kernel-kernelbuildmk)) |
 | `tcc-kernel` | `build/tcc/xtcc`, `build/tools/kld` | `kernel/build.mk` on the Mac: `build/tcc-kernel/kernel/kernel.elf` |
-| `clean` | | `rm -rf build` (keeps `home.img`) |
+| `clean` | | `rm -rf build` (keeps `disk.img`) |
 | `sysroot` | `/bin/tcc`'s runtime, `libc.a` | Stage `build/sysroot` (headers, start-up files, `libc.a`, `libtcc1.a`, `runmain.o`), which the image copies to `/usr` ([13](13-toolchain.md)) |
-| `clean-home` | | `rm -f home.img` |
+| `gui` | `build/tools/eudisk` | Build and open the Eudisk app on `disk.img` (or `IMAGE=…`) |
 
 Internal file targets you may name directly: `build/tcc/xtcc` (the host cross TinyCC), `build/kernel.elf`, `build/kernel.pass1.elf`, `build/fs.img`, `build/tools/mkfs`, `build/user/bin/<prog>`, `build/host/test_<name>`.
 
@@ -482,12 +525,14 @@ Internal file targets you may name directly: `build/tcc/xtcc` (the host cross Ti
 | `APPEND` | empty | Kernel boot options; for `test`/`stress` appended to every boot after the stage's own options (the first occurrence of a key wins, so it cannot override `panic`, `lockdep`, `ktest` or `utest` there) |
 | `TEST_TIMEOUT` | `60` | Seconds per boot/fsck stage in `make test` |
 | `STRESS_SECS` | `120` | Duration of `make stress` (`ci.py` uses 60 unless overridden) |
-| `FS_MB` | `64` | Disk image size |
+| `FS_MB` | `64` | The root partition's size |
+| `BOOT_MB` | `16` | The size of the `boot` and `boot.old` partitions |
+| `DISK_IMG` | `disk.img` | The image `make run` uses, kept and updated in place |
+| `IMAGE` | `$(DISK_IMG)` | The image `make gui` opens |
 | `BOOT` | `eboot` | `eboot`: QEMU starts the boot loader, which loads `/boot/kernel.elf` from the root disk; `direct`: QEMU loads `build/kernel.elf` (record/replay always does) |
 | `HOSTDIR` | the project directory | The Mac directory shared read-write on `/mnt/host` by `run`, `debug` and `qemu-log`; empty to share nothing |
 | `SH_TIMEOUT` | `120` | Seconds per boot stage when `make selfhost` tests the tcc-built kernel |
-| `HOME_IMG` | `home.img` | The persistent `/home` disk image |
-| `HOME_MB` | `64` | Its size when it is created (an existing image is not resized) |
+| `HOME_MB` | `64` | The home partition's size (when an image is created) |
 | `HTTP_PORT` | `8080` | Host port → guest TCP 80 |
 | `SHELL_PORT` | `2323` | Host port → guest TCP 23 (`rshd`) |
 | `UDP_PORT` | `5555` | Host port → guest UDP 7 (`echod`) |
@@ -647,7 +692,7 @@ Boot options most used with these targets (the full list is printed by the `help
 | `file_rw` | Create/`O_EXCL`/append/lseek/overwrite/`fstat`/truncate/`EBADF`/unlink |
 | `big_file` | 4.5 MiB file through direct, indirect and double-indirect blocks |
 | `dirs` | mkdir, link counts, 100 entries (more than one block), `ENOTEMPTY`, `EISDIR`, rmdir |
-| `link_rename` | Hard links, rename over a file, moving a directory across directories updates `..`, `EINVAL`, `EPERM` for directory links |
+| `link_rename` | Hard links, rename over a file, moving a directory across directories (to `/ut_m2` on the root filesystem) updates `..`, `EINVAL`, `EPERM` for directory links, and `EXDEV` for a rename to `/home` when it is another filesystem |
 | `paths` | `.`/`..`/`//` handling, `ENOTDIR`, `ENAMETOOLONG`, relative paths, `getcwd` incl. `/proc/self` and `/dev/..` |
 | `fds` | `dup`, `dup2`, shared offsets across fork, `EMFILE` before 40 descriptors |
 | `devices_and_proc` | `/dev/null`, `/dev/zero`, `/dev/console`, `/proc/meminfo`, `/proc/self/status`, `/proc/<pid>`, `/dev/kmsg` |
@@ -672,11 +717,11 @@ Boot options most used with these targets (the full list is printed by the `help
 
 | Mode | Does |
 |---|---|
-| `persist-check` | `/home/persist.txt` contains `survives reboots` (written by the suite); deletes it |
-| `crash-commit-write` | Writes `/home/crash1.txt` = `part1`, `dbg_fscrash("after-commit")`, appends `part2`; the machine stops (exit 3) |
-| `crash-commit-check` | `/home/crash1.txt` is `part1part2` after recovery |
-| `crash-log-write` | Same with `/home/crash2.txt` and `after-log` |
-| `crash-log-check` | `/home/crash2.txt` is `part1` (the append vanished) |
+| `persist-check` | `/persist.txt` contains `survives reboots` (written by the suite); deletes it |
+| `crash-commit-write` | Writes `/crash1.txt` = `part1`, `dbg_fscrash("after-commit")`, appends `part2`; the machine stops (exit 3) |
+| `crash-commit-check` | `/crash1.txt` is `part1part2` after recovery |
+| `crash-log-write` | Same with `/crash2.txt` and `after-log` |
+| `crash-log-check` | `/crash2.txt` is `part1` (the append vanished) |
 | `stress[:secs]` | Runs `/bin/stress -j 8 -t <secs>` (default 8) |
 
 Any other mode prints `unknown mode` and fails.
@@ -738,7 +783,7 @@ build/tools/mkfs --check /tmp/t.img
 - **Running `ktest` from the monitor** runs every test in the monitor's context. Tests that create threads, sleep or wait for other CPUs depend on a running scheduler and on the other CPUs, which the monitor normally stops. Expect only self-contained tests (for example `ktest printf_`, `ktest ksyms`) to be reliable there. (This is inferred from the code, not verified.)
 - **Kernel tests are always linked into the kernel.** `kernel/tests` is in `KDIRS`; there is no build option to leave them out.
 - **Incomplete rebuild dependencies.** Objects do not depend on the Makefile or on `CFLAGS`/`UCFLAGS`, so changing flags needs `make clean`. `build/fs.img` does not depend on the Makefile, so changing `FS_FILES`, `EUTILS_LINKS` or `FS_MB` does not rebuild the image (touch a user program or `rm build/fs.img`). User `.S` files are compiled without `-MMD` (they include no headers today).
-- **Rebuilding the image discards guest data.** Any user-program change rebuilds `build/fs.img` from scratch. Only `/home`, on the separate `home.img` under `make run`, is kept.
+- **`build/fs.img` is rebuilt from scratch** whenever anything in it changes; run-time files live in `disk.img`, which `make` updates in place instead.
 - **Shared scratch paths.** Two `make test` (or two `make stress`, or record/replay-check) runs in one checkout collide on fixed paths, and the timeout path's `pkill -f build/test-fs.img` kills the other run's QEMU.
 - **`free_port()` is racy.** The port is released before QEMU binds it.
 - **`tracedump=build/ktest-trace.bin` is relative to QEMU's working directory.** `make test` runs from the repository root, so it works; running `run_tests.py` from another directory writes the trace elsewhere, and the runner then silently skips the Perfetto conversion.
@@ -747,7 +792,7 @@ build/tools/mkfs --check /tmp/t.img
 - **mkfs takes file modes from the host** (0755 if executable, else 0644); there is no spec syntax for other modes or owners of files. `SIZE_MB` is parsed with `atoi` without validation, and a `--label` longer than 16 bytes is silently cut.
 - **The pass-1/pass-2 check compares only text symbols** (`grep -i ' t '`), not data or rodata addresses. This is enough as long as `.ksyms` stays last in `kernel.ld`.
 - **Record/replay is one CPU only**, with no semihosting and no host port forwarding (`RROPTS`). `rr_prepare` writes the options with `echo '$(1)'`, so an `APPEND` containing a single quote breaks it.
-- **The home disk is never checked or tested.** `make test` and `make ci` boot without `home.img`, so mounting a second disk is exercised only interactively, and `make fsck` checks `build/fs.img` only. An image made by an older mkfs (no label) is not mounted on `/home`; `make clean-home` recreates it.
+- **`disk.img` is only as tested as `build/fs.img`**: the update path (`eudisk install` on an existing image, kernel rotation) is covered by `tests/host/test_eudisk.py`, not by booting an updated image.
 - **Documentation drift:** `docs/DEBUGGING.md` lists the networking stage before the interactive shell; `run_tests.py` runs the shell first. It also says a kernel test can be added "anywhere"; in fact it must be in a directory listed in `KDIRS`.
 
 ## Potential improvements
@@ -763,7 +808,7 @@ build/tools/mkfs --check /tmp/t.img
 9. **Optional exclusion of kernel tests** — A `KTESTS=0` make variable that drops `kernel/tests` from `KDIRS` (and `.ktests` stays empty). This gives a smaller production kernel and checks that nothing outside the tests depends on test code. Impact: low. Effort: small.
 10. **Make `KTEST(cmdline)` independent of how it was booted** — Check only properties that hold for any boot (e.g. `cmdline_has("ktest")` when run from `kinit`, unknown option NULL, no prefix match), or skip the `panic=shutdown` check when that option is absent. Then `ktest` from `make run` or the monitor passes cleanly. Impact: low. Effort: small.
 11. **File modes in mkfs specs** — Extend `/path=hostfile` with an optional `:mode[:uid[:gid]]` suffix like directories have, so pre-built files can have owners other than root and modes other than the host's 0755/0644 split. Permission tests could then cover pre-built files. Impact: low. Effort: small.
-12. **A home-disk stage in `make test`** — Attach a second, labelled scratch disk in one stage, write and read back a file under `/home`, and fsck both images afterwards. Covers label lookup, per-disk buffer-cache keys and a second log, none of which the tests touch today. Impact: medium. Effort: small.
+12. **An updated-image stage in `make test`** — Copy `build/fs.img`, add user files and edit a configuration file, run `eudisk install` with a changed program and `eudisk kernel install`, then boot it and check the files, the backup, `FILE.new` and `boot.old`. Impact: medium. Effort: small.
 13. **Self-contained host tests** — Let `test_fsck.py` generate its payload on the host instead of using `build/user/bin/hello`, and remove its temp directory. `make test-host` would then run without the RISC-V toolchain (useful for quick checks on another machine). Impact: low. Effort: small.
 14. **Sanitize stage log names** — Use the same sanitization for `.log` files as for `.pcap` files (no spaces, commas or `%`). They become easier to use from a shell and in scripts. Impact: low. Effort: small.
 15. **Let `APPEND` override stage options** — Make `cmdline_get()` return the last matching word (or have `run_tests.py` put `APPEND` before the stage options). Then `make test APPEND="ktest=fs_ lockdep=warn"` would narrow or relax runs as users expect. Today such values are ignored without any message. Impact: medium. Effort: small.

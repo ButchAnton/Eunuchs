@@ -92,7 +92,7 @@ struct buf *bread(u32 disk, u32 blockno)
     struct buf *b = bget(disk, blockno, (uintptr_t)__builtin_return_address(0));
     if (!b->valid) {
         if (blk_rw(disk, (u64)blockno * EFS_SECTORS_PER_BLOCK, b->data, EFS_BSIZE, false))
-            pr_err("bread: I/O error on disk%u block %u\n", disk, blockno);
+            pr_err("bread: I/O error on %s block %u\n", blk_name((int)disk), blockno);
         b->valid = true;
     }
     return b;

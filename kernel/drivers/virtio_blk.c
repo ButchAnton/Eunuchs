@@ -2,9 +2,16 @@
  * virtio block device. Requests are synchronous for the caller (it sleeps
  * until the interrupt reports completion) but many can be in flight.
  * Statistics: `blk` in the monitor, /proc/blk; trace events blk_submit/done.
+ *
+ * Above the disks are volumes, what the filesystems use: each partition of a
+ * GPT disk (gpt_format.h; the disk image has boot, boot.old, root, home), or
+ * a whole disk without a partition table. blk_rw and blk_capacity take a
+ * volume number; blk_disk_rw reaches a whole disk (/dev/disk0).
  */
 #define LOG_SUBSYS SUBSYS_BLK
 #include <debug.h>
+#include <fmt.h>
+#include <gpt_format.h>
 #include <irq.h>
 #include <kstring.h>
 #include <mm.h>
@@ -45,6 +52,16 @@ struct disk {
 
 static struct disk disks[MAX_DISKS];
 static int ndisks;
+
+/* Partitions (or whole disks), numbered disk by disk in table order. */
+struct volume {
+    int disk;
+    u64 first, sectors;
+    char name[12];              /* disk0p3, or disk1 for a whole disk */
+    char label[GPT_NAME_LEN + 1];   /* the GPT partition name; "" for a whole disk */
+};
+static struct volume volumes[MAX_VOLUMES];
+static int nvolumes;
 
 static void blk_irq(void *arg)
 {
@@ -93,23 +110,23 @@ int blk_init(void)
     return ndisks;
 }
 
-int blk_count(void) { return ndisks; }
-u64 blk_capacity(int disk) { return disk >= 0 && disk < ndisks ? disks[disk].capacity : 0; }
+int blk_disk_count(void) { return ndisks; }
+u64 blk_disk_capacity(int disk) { return disk >= 0 && disk < ndisks ? disks[disk].capacity : 0; }
 
-int blk_rw(int disk, u64 sector, void *buf, u32 len, bool write)
+int blk_disk_rw(int disk, u64 sector, void *buf, u32 len, bool write)
 {
     if (disk < 0 || disk >= ndisks)
         return -ENODEV;
     struct disk *d = &disks[disk];
     if (len % 512 || sector + len / 512 > d->capacity) {
-        pr_err("blk_rw: bad request disk%d sector %lu len %u (capacity %lu sectors)\n", disk,
+        pr_err("blk_disk_rw: bad request disk%d sector %lu len %u (capacity %lu sectors)\n", disk,
                (unsigned long)sector, len, (unsigned long)d->capacity);
         return -EINVAL;
     }
     if (write && d->readonly)
         return -EROFS;
     if (((uintptr_t)buf & (PAGE_SIZE - 1)) + len > PAGE_SIZE && (uintptr_t)buf >= KSTACK_AREA)
-        panic("blk_rw: buffer %p crosses a page outside the direct map", buf);
+        panic("blk_disk_rw: buffer %p crosses a page outside the direct map", buf);
 
     struct blk_req *r = kzalloc(sizeof(*r));
     if (!r)
@@ -148,6 +165,118 @@ int blk_rw(int disk, u64 sector, void *buf, u32 len, bool write)
     return err;
 }
 
+static void add_volume(int disk, u64 first, u64 sectors, const char *label, int partno)
+{
+    if (nvolumes == MAX_VOLUMES) {
+        pr_warn("disk%d: more than %d volumes; partition %d ignored\n", disk, MAX_VOLUMES, partno);
+        return;
+    }
+    struct volume *v = &volumes[nvolumes++];
+    v->disk = disk;
+    v->first = first;
+    v->sectors = sectors;
+    if (partno)
+        ksnprintf(v->name, sizeof(v->name), "disk%dp%d", disk, partno);
+    else
+        ksnprintf(v->name, sizeof(v->name), "disk%d", disk);
+    strlcpy(v->label, label, sizeof(v->label));
+}
+
+/* A disk's GPT (the primary table; the backup if that is damaged), as volumes.
+   false if the disk has no valid table. */
+static bool scan_gpt(int disk, u8 *page)
+{
+    u64 cap = disks[disk].capacity;
+    for (int copy = 0; copy < 2; copy++) {
+        u64 lba = copy ? cap - 1 : 1;
+        if (cap < 2 * GPT_FIRST_USABLE || blk_disk_rw(disk, lba, page, GPT_SECTOR, false))
+            return false;
+        struct gpt_header h;
+        memcpy(&h, page, sizeof(h));
+        u32 want = h.header_crc;
+        h.header_crc = 0;
+        if (h.signature != GPT_SIGNATURE || h.header_size < GPT_HEADER_SIZE ||
+            h.entry_size != GPT_ENTRY_SIZE || h.num_entries == 0 || h.num_entries > 1024 ||
+            gpt_crc32(&h, GPT_HEADER_SIZE) != want ||
+            h.entries_lba + (u64)h.num_entries * GPT_ENTRY_SIZE / GPT_SECTOR > cap)
+            continue;
+        /* the entries: check the CRC over all of them, then use them */
+        u64 bytes = (u64)h.num_entries * GPT_ENTRY_SIZE;
+        u32 crc = 0;
+        bool ok = true;
+        for (u64 off = 0; off < bytes && ok; off += PAGE_SIZE) {
+            u32 n = (u32)MIN((u64)PAGE_SIZE, bytes - off);
+            ok = blk_disk_rw(disk, h.entries_lba + off / GPT_SECTOR, page, ALIGN_UP(n, GPT_SECTOR), false) == 0;
+            crc = gpt_crc32_update(crc, page, n);
+        }
+        if (!ok || crc != h.entries_crc) {
+            pr_warn("disk%d: GPT %s table: bad entries\n", disk, copy ? "backup" : "primary");
+            continue;
+        }
+        if (copy)
+            pr_warn("disk%d: the primary GPT is damaged; using the backup\n", disk);
+        int partno = 0;
+        for (u64 off = 0; off < bytes; off += PAGE_SIZE) {
+            u32 n = (u32)MIN((u64)PAGE_SIZE, bytes - off);
+            if (blk_disk_rw(disk, h.entries_lba + off / GPT_SECTOR, page, ALIGN_UP(n, GPT_SECTOR), false))
+                break;
+            for (u32 i = 0; i < n / GPT_ENTRY_SIZE; i++) {
+                const struct gpt_entry *e = (const void *)(page + i * GPT_ENTRY_SIZE);
+                static const u8 unused[16];
+                partno++;
+                if (!memcmp(e->type, unused, 16))
+                    continue;
+                char name[GPT_NAME_LEN + 1];
+                gpt_name(e, name);
+                if (e->last_lba < e->first_lba || e->last_lba >= cap) {
+                    pr_warn("disk%d: partition %d (%s) is outside the disk; ignored\n", disk, partno, name);
+                    continue;
+                }
+                add_volume(disk, e->first_lba, e->last_lba - e->first_lba + 1, name, partno);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+void blk_scan_volumes(void)
+{
+    u8 *page = page_alloc();
+    if (!page)
+        panic("blk_scan_volumes: no memory");
+    nvolumes = 0;
+    for (int d = 0; d < ndisks; d++) {
+        int before = nvolumes;
+        if (!scan_gpt(d, page))
+            add_volume(d, 0, disks[d].capacity, "", 0);
+        for (int i = before; i < nvolumes; i++) {
+            struct volume *v = &volumes[i];
+            pr_info("%s: %lu MiB%s%s%s\n", v->name, (unsigned long)(v->sectors >> 11),
+                    v->label[0] ? " \"" : " (whole disk)", v->label, v->label[0] ? "\"" : "");
+        }
+    }
+    page_free(page);
+}
+
+int blk_count(void) { return nvolumes; }
+u64 blk_capacity(int vol) { return vol >= 0 && vol < nvolumes ? volumes[vol].sectors : 0; }
+const char *blk_name(int vol) { return vol >= 0 && vol < nvolumes ? volumes[vol].name : NULL; }
+const char *blk_label(int vol) { return vol >= 0 && vol < nvolumes ? volumes[vol].label : NULL; }
+
+int blk_rw(int vol, u64 sector, void *buf, u32 len, bool write)
+{
+    if (vol < 0 || vol >= nvolumes)
+        return -ENODEV;
+    struct volume *v = &volumes[vol];
+    if (len % 512 || sector + len / 512 > v->sectors) {
+        pr_err("blk_rw: bad request %s sector %lu len %u (%lu sectors)\n", v->name, (unsigned long)sector,
+               len, (unsigned long)v->sectors);
+        return -EINVAL;
+    }
+    return blk_disk_rw(v->disk, v->first + sector, buf, len, write);
+}
+
 void blk_print(print_fn print)
 {
     u64 tb = platform.timebase;
@@ -170,5 +299,11 @@ void blk_print(print_fn print)
               (unsigned long)(n ? d->total_latency * 1000000 / tb / n : 0),
               (unsigned long)(d->max_latency * 1000000 / tb));
         print("  in flight: %lu\n", (unsigned long)(d->vq.submitted - d->vq.completed));
+        for (int v = 0; v < nvolumes; v++)
+            if (volumes[v].disk == i)
+                print("  volume %d: %-8s %-9s sectors %lu-%lu (%lu MiB)\n", v, volumes[v].name,
+                      volumes[v].label[0] ? volumes[v].label : "-", (unsigned long)volumes[v].first,
+                      (unsigned long)(volumes[v].first + volumes[v].sectors - 1),
+                      (unsigned long)(volumes[v].sectors >> 11));
     }
 }

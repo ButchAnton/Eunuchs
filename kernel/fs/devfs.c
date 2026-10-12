@@ -1,6 +1,6 @@
 /*
  * devfs, mounted on /dev: console, null, zero, kmsg (kernel log snapshot),
- * disk0 (the raw disk, read-only).
+ * disk0, disk1 (whole disks) and disk0p1... (their partitions), read-only.
  */
 #define LOG_SUBSYS SUBSYS_VFS
 #include <console.h>
@@ -14,19 +14,44 @@
 #include <virtio.h>
 
 enum { DEV_ROOT = 1, DEV_CONSOLE, DEV_NULL, DEV_ZERO, DEV_KMSG, DEV_DISK0, DEV_TTY, DEV_TTY0,
-       DEV_DISK1, DEV_MAX };
+       DEV_DISK1, DEV_MAX, DEV_VOL = DEV_MAX, DEV_END = DEV_VOL + MAX_VOLUMES };
 
-/* disk0, disk1: which blk_rw disk, or -1 */
+/* disk0, disk1: which whole disk, or -1 */
 static int disk_of(u32 ino)
 {
     return ino == DEV_DISK0 ? 0 : ino == DEV_DISK1 ? 1 : -1;
 }
 
+/* a partition's node: which volume, or -1 (a whole-disk volume has none:
+   it is the disk's node) */
+static int vol_of(u32 ino)
+{
+    if (ino < DEV_VOL || ino >= DEV_END || (int)(ino - DEV_VOL) >= blk_count())
+        return -1;
+    int v = (int)(ino - DEV_VOL);
+    return strchr(blk_name(v), 'p') ? v : -1;
+}
+
+static bool is_disk(u32 ino) { return disk_of(ino) >= 0 || ino >= DEV_VOL; }
+
 /* Devices that exist (a disk device only if that disk is attached). */
 static bool dev_exists(u32 ino)
 {
+    if (ino >= DEV_VOL)
+        return vol_of(ino) >= 0;
     int d = disk_of(ino);
-    return d < 0 || d < blk_count();
+    return d < 0 || d < blk_disk_count();
+}
+
+static u64 disk_size(u32 ino)
+{
+    return (ino >= DEV_VOL ? blk_capacity(vol_of(ino)) : blk_disk_capacity(disk_of(ino))) * 512;
+}
+
+static int disk_read(u32 ino, u64 sector, void *buf, u32 len)
+{
+    return ino >= DEV_VOL ? blk_rw(vol_of(ino), sector, buf, len, false)
+                          : blk_disk_rw(disk_of(ino), sector, buf, len, false);
 }
 
 static long out(void *dst, const void *src, size_t n, bool user)
@@ -93,8 +118,8 @@ static void snapshot_close(struct file *f)
 
 static long disk_rd(struct file *f, void *buf, size_t n, bool user)
 {
-    int disk = disk_of(f->ip->ino);
-    u64 size = blk_capacity(disk) * 512;
+    u32 ino = f->ip->ino;
+    u64 size = disk_size(ino);
     if (f->off >= size)
         return 0;
     n = MIN(n, size - f->off);
@@ -104,7 +129,7 @@ static long disk_rd(struct file *f, void *buf, size_t n, bool user)
     size_t done = 0;
     while (done < n) {
         u64 pos = f->off + done, base = ALIGN_DOWN(pos, PAGE_SIZE);
-        if (blk_rw(disk, base / 512, page, MIN((u64)PAGE_SIZE, size - base), false))
+        if (disk_read(ino, base / 512, page, MIN((u64)PAGE_SIZE, size - base)))
             break;
         size_t c = MIN(n - done, (size_t)(base + PAGE_SIZE - pos));
         if (out((u8 *)buf + done, page + (pos - base), c, user))
@@ -140,6 +165,11 @@ static const struct {
     [DEV_DISK1]   = { "disk1", &disk_ops, 0440 },
 };
 
+static const char *dev_name(u32 ino)
+{
+    return ino >= DEV_VOL ? blk_name(vol_of(ino)) : devs[ino].name;
+}
+
 static int dev_read_inode(struct inode *ip)
 {
     if (ip->ino == DEV_ROOT) {
@@ -148,15 +178,15 @@ static int dev_read_inode(struct inode *ip)
         ip->mode = 0755;
         return 0;
     }
-    if (ip->ino >= DEV_MAX || !devs[ip->ino].name || !dev_exists(ip->ino))
+    if (ip->ino >= DEV_END || (ip->ino < DEV_MAX && !devs[ip->ino].name) || !dev_exists(ip->ino))
         return -ENOENT;
     ip->type = I_CHR;
     ip->nlink = 1;
-    ip->mode = devs[ip->ino].mode;
+    ip->mode = ip->ino >= DEV_VOL ? 0440 : devs[ip->ino].mode;
     ip->rdev = ip->ino;
-    ip->cops = devs[ip->ino].ops;
-    if (disk_of(ip->ino) >= 0)
-        ip->size = blk_capacity(disk_of(ip->ino)) * 512;
+    ip->cops = ip->ino >= DEV_VOL ? &disk_ops : devs[ip->ino].ops;
+    if (is_disk(ip->ino))
+        ip->size = disk_size(ip->ino);
     return 0;
 }
 
@@ -165,8 +195,8 @@ static u32 dev_lookup(struct inode *dir, const char *name)
     (void)dir;
     if (!strcmp(name, ".") || !strcmp(name, ".."))
         return DEV_ROOT;
-    for (u32 i = DEV_CONSOLE; i < DEV_MAX; i++)
-        if (!strcmp(name, devs[i].name) && dev_exists(i))
+    for (u32 i = DEV_CONSOLE; i < DEV_END; i++)
+        if (dev_exists(i) && (i >= DEV_VOL || devs[i].name) && !strcmp(name, dev_name(i)))
             return i;
     return 0;
 }
@@ -182,15 +212,15 @@ static int dev_readdir(struct inode *dir, u64 *off, struct kdirent *de)
         return 1;
     }
     u32 ino = DEV_CONSOLE + (u32)(i - 2);
-    while (ino < DEV_MAX && !dev_exists(ino)) {     /* skip missing disks */
+    while (ino < DEV_END && !dev_exists(ino)) {     /* skip missing disks */
         ino++;
         (*off)++;
     }
-    if (ino >= DEV_MAX)
+    if (ino >= DEV_END)
         return 0;
     de->ino = ino;
     de->type = DT_CHR;
-    strlcpy(de->name, devs[ino].name, sizeof(de->name));
+    strlcpy(de->name, dev_name(ino), sizeof(de->name));
     return 1;
 }
 

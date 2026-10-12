@@ -627,6 +627,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `emacs`, `em`, `edit` | `emacs [+N] [FILE...]` | The same program's emacs personality. |
 | `tcc` | `tcc [-c] [-o OUT] [-I DIR] [-D X] [-L DIR] [-l LIB] FILE...`, `tcc -run FILE.c [ARGS]` | TinyCC: compiles, assembles and links C for Eunuchs; see [13](13-toolchain.md). |
 | `db` | `db PROG [ARGS]`, `db --args PROG ARGS...`, `db -p PID [PROG]`, with `-ex CMD` and `-batch` | gdb-like source-level debugger on `ptrace`; see [14](14-debugger.md). |
+| `kinstall` | `kinstall`, `kinstall [-r] KERNEL`, `kinstall --rollback` | Root only. Shows the two kernel slots; installs `KERNEL` as `/boot/kernel.elf` after moving the current one to `/boot.old/kernel.elf` (each copy written as `.new`, `fsync`ed, renamed; nothing if it is already installed; `-r` reboots); or swaps the slots (`--rollback`; with an empty `/boot`, it moves the old kernel there). Refuses a file that is not a Eunuchs kernel. On a bare image the slots are `/boot/kernel.elf` and `/boot/kernel.old.elf`. See [01](01-boot-and-platform.md#0-the-boot-loader-bootebootc). |
 | `make` | `make [-f FILE] [-C DIR] [-nsikBpqd] [VAR=value] [TARGET...]` | POSIX-style make with GNU functions and built-in rules for tcc; see [13](13-toolchain.md#binmake-userbinmakec). |
 | `top` | `top` | Raw mode with `VMIN=0`; shows `/proc/uptime`, 10 lines of `/proc/cpus` and 20 of `/proc/threads` every second; `q` or `^C` quits. |
 | `ping` | `ping [-c N] [-i MS] [-s SIZE] [-W MS] HOST` | Raw ICMP, root only. |
@@ -679,11 +680,11 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `dbg` | `dbg break \| mark TEXT \| vm \| files \| ps \| fscrash POINT` | Front end for `SYS_debug`. |
 | `uname` | `uname` | Prints `Eunuchs 0.1 riscv64`. |
 | `clear` | `clear` | ANSI home + clear screen. |
-| `reboot`, `poweroff` | `reboot`, `poweroff` | `reboot(RB_AUTOBOOT)` (restart through the boot loader) or `reboot(RB_POWER_OFF)`; root only. The kernel syncs every filesystem first, so every write that has returned survives. To install a kernel: `cp NEW /boot/kernel.elf && reboot` (keep the old one as `/boot/kernel.old.elf`). |
+| `reboot`, `poweroff` | `reboot`, `poweroff` | `reboot(RB_AUTOBOOT)` (restart through the boot loader) or `reboot(RB_POWER_OFF)`; root only. The kernel syncs every filesystem first, so every write that has returned survives. To install a kernel: `kinstall -r NEW`. |
 
 ### Files in the disk image
 
-`FS_FILES` in the Makefile, processed in order by `build/tools/mkfs` (image size `FS_MB` = 64 MiB):
+`FS_FILES` in the Makefile, installed in order into the image's `root` partition by `build/tools/eudisk install` (partition size `FS_MB` = 64 MiB). The image is one GPT disk: `boot` and `boot.old` (16 MiB each, `kernel.elf` in each, mounted on `/boot` and `/boot.old`), `root` and `home` (64 MiB, `/guest` owned by 1000:1000):
 
 | Path | Source |
 |---|---|
@@ -698,13 +699,14 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `/usr/src/` | the sources of every program (`user/bin/`) and `user/usr-src/Makefile` |
 | `/usr/src/eunuchs/` | the whole source tree needed to rebuild the system (kernel, libc, programs, tcc, kld, build scripts): `cd /usr/src/eunuchs && sh tools/selfhost.sh` ([13](13-toolchain.md#the-source-tree-in-the-image-usrsrceunuchs)) |
 | `/bin/<applet>` for every `EUTILS_LINKS` name | hard link to `/bin/eutils` (`=@/bin/eutils`) |
-| `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` | `user/etc/` |
+| `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` | `user/etc/`; marked `+` (configuration: if you edit one in `disk.img`, an update leaves yours and writes the new version as `FILE.new`) |
 | `/dev/`, `/proc/` | empty mount points |
 | `/tmp/` | mode 0777 |
 | `/www/`, `/www/index.html` | `user/www/index.html` |
-| `/home/`, `/home/guest/` | `/home/guest` mode 0755, owned by 1000:1000 |
+| `/home/`, `/home/guest/` | mount point, and the directory used when no home partition is mounted |
+| `/boot/`, `/boot.old/` | mount points for the boot partitions |
 
-The image is rebuilt whenever any program changes, which discards files created at run time. Under `make run`, `/home` is a separate disk (`home.img`, holding `/guest` owned by 1000:1000) that is kept across rebuilds; it hides the image's own `/home/guest` ([06](06-filesystems.md#boot-and-mounting)).
+`build/fs.img` (the tests' image) is made afresh whenever anything in it changes. `disk.img` (what `make run` uses) is made once and then updated in place: unchanged system files are replaced (hard links survive), files you modified are backed up to `/var/backup/DATE-TIME/` first, edited configuration files stay, and a record of what was installed is kept in `/var/lib/eudisk/manifest` ([11](11-build-and-testing.md)). So what you create there survives `make`.
 
 `/etc/passwd` has the standard seven fields. `lookup_user` in `eutils` reads the first 1023 bytes (for `su`, `chown` and `id`); `esh` reads it for user names, home directories and `~user`:
 

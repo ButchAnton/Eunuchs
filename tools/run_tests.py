@@ -409,20 +409,26 @@ def main():
     # for tcc's assembler, with a C caller
     for name in ("asmtest.S", "asmtest.c"):
         shutil.copy(os.path.join(ROOT, "tests", "guest", name), share)
-    # The boot loader (boot/eboot.c): reboot is for root; without
-    # /boot/kernel.elf it boots /boot/kernel.old.elf; with neither it says so
-    # and powers off. On a disk of its own: this deletes the kernels.
+    # The boot loader (boot/eboot.c) and kinstall: reboot and kinstall are for
+    # root; without a kernel in the boot partition (/boot) eboot boots the one
+    # in boot.old (/boot.old); with neither it says so and powers off. On a
+    # disk of its own: this deletes the kernels.
     bootimg = os.path.join(build, "test-boot.img")
     shutil.copyfile(img, bootimg)
     interactive("boot loader, reboot", [
         ("su guest", None, False), (None, "guest@eunuchs:~% ", False),
         ("reboot", "Operation not permitted"),
+        ("kinstall --rollback", "Permission denied"),
         ("exit", None),
-        ("rm /boot/kernel.elf && reboot", "eboot: /boot/kernel.elf: not found", False),
-        (None, "eboot: loaded /boot/kernel.old.elf", False),
+        ("kinstall", "/boot.old/kernel.elf"),
+        ("kinstall /bin/hello", "not a Eunuchs kernel"),
+        ("kinstall /boot.old/kernel.elf", "in /boot/kernel.elf already"),
+        ("kinstall --rollback", "(was in /boot.old/kernel.elf)"),
+        ("rm /boot/kernel.elf && reboot", "eboot: boot:/kernel.elf: not found", False),
+        (None, "eboot: loaded boot.old:/kernel.elf", False),
         (None, "Eunuchs 0.1 (riscv64)", False),
         (None, "root@eunuchs:/# ", False),
-        ("rm /boot/kernel.old.elf && reboot", "eboot: no kernel to boot", False),
+        ("rm /boot.old/kernel.elf && reboot", "eboot: no kernel to boot", False),
         (None, "eboot: powering off", False),
     ], image=bootimg)
 

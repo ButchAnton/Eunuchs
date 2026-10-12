@@ -87,12 +87,20 @@ u8 virtio_config_read8(struct virtio_dev *dev, u32 off);
 uintptr_t dma_addr(const void *va);     /* physical address of a kernel buffer */
 void virtio_print(int (*print)(const char *fmt, ...));
 
-/* virtio_blk.c */
+/* virtio_blk.c: disks, and the volumes on them (GPT partitions, or whole
+   disks without a partition table) */
 #define MAX_DISKS 4
+#define MAX_VOLUMES 16
 int blk_init(void);                     /* finds every disk; returns how many */
-int blk_count(void);
-u64 blk_capacity(int disk);             /* in 512-byte sectors */
-int blk_rw(int disk, u64 sector, void *buf, u32 len, bool write);
+void blk_scan_volumes(void);            /* reads the partition tables (sleeps) */
+int blk_count(void);                    /* volumes */
+u64 blk_capacity(int vol);              /* in 512-byte sectors */
+const char *blk_name(int vol);          /* disk0p3, or disk1 for a whole disk */
+const char *blk_label(int vol);         /* the GPT partition name ("" for none) */
+int blk_rw(int vol, u64 sector, void *buf, u32 len, bool write);
+int blk_disk_count(void);
+u64 blk_disk_capacity(int disk);
+int blk_disk_rw(int disk, u64 sector, void *buf, u32 len, bool write);
 void blk_print(int (*print)(const char *fmt, ...));
 
 /* virtio-9p (virtio_9p.c): channels to 9P servers, used by kernel/fs/ninep.c */

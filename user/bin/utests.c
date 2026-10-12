@@ -579,14 +579,17 @@ static void t_link_rename(void)
     CHECK(mkdir("/tmp/ut_m1", 0755) == 0);
     CHECK(mkdir("/tmp/ut_m1/sub", 0755) == 0);
     CHECK(rename("/tmp/ut_m1", "/tmp/ut_m1/sub/x") == -1 && errno == EINVAL);
-    CHECK(mkdir("/home/ut_m2", 0755) == 0);
-    CHECK(rename("/tmp/ut_m1/sub", "/home/ut_m2/sub") == 0);   /* move a directory */
+    CHECK(mkdir("/ut_m2", 0755) == 0);
+    CHECK(rename("/tmp/ut_m1/sub", "/ut_m2/sub") == 0);   /* move a directory */
     char cwd[128];
-    CHECK(chdir("/home/ut_m2/sub/..") == 0);            /* ".." was updated */
-    CHECK(getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, "/home/ut_m2"));
+    CHECK(chdir("/ut_m2/sub/..") == 0);            /* ".." was updated */
+    CHECK(getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, "/ut_m2"));
     chdir("/");
     CHECK(link("/tmp/ut_m1", "/tmp/ut_m3") == -1 && errno == EPERM);   /* no dir hard links */
-    CHECK(rmdir("/home/ut_m2/sub") == 0 && rmdir("/home/ut_m2") == 0 && rmdir("/tmp/ut_m1") == 0);
+    CHECK(rmdir("/ut_m2/sub") == 0 && rmdir("/ut_m2") == 0 && rmdir("/tmp/ut_m1") == 0);
+    struct stat hst;                                    /* /home: another filesystem when it is mounted */
+    if (stat("/home", &hst) == 0 && stat("/", &st) == 0 && hst.st_dev != st.st_dev)
+        CHECK(rename("/tmp/ut_c", "/home/ut_c") == -1 && errno == EXDEV);
     CHECK(unlink("/tmp/ut_c") == 0);
 }
 
@@ -1596,11 +1599,11 @@ static int scenario(const char *mode)
     char buf[64];
     int ok;
     if (!strcmp(mode, "persist-check")) {
-        ok = read_file("/home/persist.txt", buf, sizeof(buf)) > 0 && !strcmp(buf, "survives reboots");
-        unlink("/home/persist.txt");
+        ok = read_file("/persist.txt", buf, sizeof(buf)) > 0 && !strcmp(buf, "survives reboots");
+        unlink("/persist.txt");
     } else if (!strcmp(mode, "crash-commit-write") || !strcmp(mode, "crash-log-write")) {
         int commit = mode[6] == 'c';
-        const char *p = commit ? "/home/crash1.txt" : "/home/crash2.txt";
+        const char *p = commit ? "/crash1.txt" : "/crash2.txt";
         write_file(p, "part1", O_TRUNC);
         printf("arming crash point and appending\n");
         dbg_fscrash(commit ? "after-commit" : "after-log");
@@ -1608,13 +1611,13 @@ static int scenario(const char *mode)
         printf("still running?!\n");
         return 1;
     } else if (!strcmp(mode, "crash-commit-check")) {
-        ok = read_file("/home/crash1.txt", buf, sizeof(buf)) > 0 && !strcmp(buf, "part1part2");
+        ok = read_file("/crash1.txt", buf, sizeof(buf)) > 0 && !strcmp(buf, "part1part2");
         printf("after recovery: \"%s\" (want \"part1part2\")\n", buf);
-        unlink("/home/crash1.txt");
+        unlink("/crash1.txt");
     } else if (!strcmp(mode, "crash-log-check")) {
-        ok = read_file("/home/crash2.txt", buf, sizeof(buf)) > 0 && !strcmp(buf, "part1");
+        ok = read_file("/crash2.txt", buf, sizeof(buf)) > 0 && !strcmp(buf, "part1");
         printf("after recovery: \"%s\" (want \"part1\")\n", buf);
-        unlink("/home/crash2.txt");
+        unlink("/crash2.txt");
     } else if (!strncmp(mode, "stress", 6)) {
         /* stress[:seconds]: the SMP stress test (see stress.c) */
         char *secs = mode[6] == ':' ? (char *)mode + 7 : "8";
@@ -1642,7 +1645,7 @@ int main(int argc, char **argv)
         printf("%s %s\n", test_failed ? "[  FAILED  ]" : "[       OK ]", tests[i].name);
         failures += test_failed;
     }
-    write_file("/home/persist.txt", "survives reboots", O_TRUNC);
+    write_file("/persist.txt", "survives reboots", O_TRUNC);
     printf("%d tests, %d passed, %d failed\n", n, n - failures, failures);
     printf("UTEST RESULT: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

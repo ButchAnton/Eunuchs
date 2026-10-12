@@ -2,3 +2,5 @@ build/
 *.img
 *.pcap
 trace*.json
+*.img.new
+*.img.tmp*

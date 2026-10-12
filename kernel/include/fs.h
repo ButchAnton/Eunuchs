@@ -28,7 +28,7 @@
 
 struct buf {
     u32 blockno;
-    u32 disk;                   /* which disk (blk_rw numbering) */
+    u32 disk;                   /* which volume (blk_rw numbering) */
     bool valid;                 /* data read from disk */
     int refcnt;
     u32 pins;                   /* held by the log until installed */

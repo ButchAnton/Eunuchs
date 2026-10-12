@@ -32,12 +32,12 @@ Each document has the same structure:
 | 3 | [Traps, interrupts and system calls](subsystems/03-traps-interrupts-syscalls.md) | Trap entry/exit, interrupts, timer, PLIC, the system call table | `arch/riscv/trapentry.S`, `trap.c`, `proc/syscall.c` |
 | 4 | [Threads, scheduling and SMP](subsystems/04-threads-scheduling-smp.md) | Threads, scheduler, locks and wait queues, IPIs, TLB shootdown, lockdep, watchdogs | `core/sched.c`, `core/sync.c`, `arch/riscv/smp.c` |
 | 5 | [Processes and signals](subsystems/05-processes-and-signals.md) | fork/exec/exit/wait, signals, credentials, process groups and job control | `kernel/proc/` |
-| 6 | [Filesystems](subsystems/06-filesystems.md) | VFS, efs and its journal, buffer cache, pipes, poll, devfs, procfs, mkfs/fsck | `kernel/fs/`, `tools/mkfs/` |
+| 6 | [Filesystems](subsystems/06-filesystems.md) | VFS, efs and its journal, buffer cache, pipes, poll, devfs, procfs, 9pfs, mkfs/fsck | `kernel/fs/`, `tools/mkfs/` |
 | 7 | [Devices and the terminal](subsystems/07-devices-and-tty.md) | virtio transport, block and network drivers, UART, TTY line discipline, RTC | `kernel/drivers/` |
 | 8 | [Networking](subsystems/08-networking.md) | Netbufs, interfaces, ARP, IPv4/ICMP, UDP, TCP, sockets | `kernel/net/` |
 | 9 | [Debugging internals](subsystems/09-debugging-internals.md) | How the monitor, trace, profiler, backtraces, ktest and GDB helpers are built and extended | `kernel/debug/`, `tools/` |
 | 10 | [User space](subsystems/10-user-space.md) | libc, program startup, every command | `user/` |
-| 11 | [Build and testing](subsystems/11-build-and-testing.md) | Toolchain, Makefile, disk image, QEMU setups, test suites, CI | `Makefile`, `tools/`, `tests/` |
+| 11 | [Build and testing](subsystems/11-build-and-testing.md) | Toolchain, Makefile, the disk images and eudisk, QEMU setups, test suites, CI | `Makefile`, `tools/`, `tests/` |
 | 12 | [The shell](subsystems/12-shell.md) | esh: the zsh-like language, job control, the line editor (manual and internals) | `user/bin/esh/` |
 | 13 | [The native toolchain](subsystems/13-toolchain.md) | TinyCC on Eunuchs, the sysroot, `tcc -run`, `make`, `/usr/src` | `third_party/tinycc/`, `ports/tcc/`, `user/bin/make.c` |
 | 14 | [The debugger](subsystems/14-debugger.md) | `ptrace` in the kernel and `db`, the gdb-like debugger | `kernel/proc/ptrace.c`, `user/bin/db/` |

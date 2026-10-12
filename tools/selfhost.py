@@ -9,8 +9,9 @@ at all: user/build.mk and kernel/build.mk, twice:
   stage 2  with stage 1's tcc
 
 Then it copies stage1/, stage2/ and the logs over the share (mounted on
-/mnt/host) into build/selfhost, installs stage 2's kernel as /boot/kernel.elf
-and reboots: the boot loader must bring up that kernel (its banner says tcc).
+/mnt/host) into build/selfhost, installs stage 2's kernel in the boot
+partition with kinstall (the old one goes to boot.old) and reboots: the boot
+loader must bring up that kernel (its banner says tcc).
 
 Each stage builds the C library and tcc's runtime into a sysroot, then every
 program (tcc and kld, the kernel's linker, included), then the kernel. The
@@ -103,8 +104,8 @@ def main():
             if status == 0:
                 # and run it: install the kernel it built, reboot through the
                 # boot loader, and see that one come up
-                con.line("cp /tmp/selfhost/stage2/kernel/kernel.elf /boot/kernel.elf && reboot")
-                con.expect("eboot: loaded /boot/kernel.elf", 60)
+                con.line("kinstall -r /tmp/selfhost/stage2/kernel/kernel.elf")
+                con.expect("eboot: loaded boot:/kernel.elf", 60)
                 con.expect("by tcc", 30)
                 con.expect("root@eunuchs:/# ", 60)
                 rebooted = True

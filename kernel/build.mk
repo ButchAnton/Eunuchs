@@ -7,7 +7,8 @@
 #   cd /mnt/host && make -f kernel/build.mk [OUT=dir] [TCC=compiler] [KLD=linker]
 #
 # OUT/kernel/kernel.elf   the kernel (with its symbol table: kld --ksyms)
-# OUT/kernel/eboot.elf    the boot loader (boot/), which loads /boot/kernel.elf
+# OUT/kernel/eboot.elf    the boot loader (boot/), which loads kernel.elf from the
+#                         boot partition (kinstall puts one there)
 
 TCC     = tcc
 OUT     = build/selfhost

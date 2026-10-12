@@ -12,11 +12,11 @@ This document covers the hardware-facing half of Eunuchs: the PLIC interrupt rou
 - Split console input between the debug monitor (`Ctrl-]`) and the TTY (`console_rx_char`).
 - Implement the console line discipline, termios ioctls and terminal job control (`kernel/drivers/tty.c`).
 - Implement the virtio-mmio modern transport, device-status handshake and split virtqueues (`kernel/drivers/virtio.c`).
-- Provide a block I/O primitive, `blk_rw(disk, ...)`, for up to four virtio disks, used by the buffer cache and `/dev/disk0`/`disk1` (`kernel/drivers/virtio_blk.c`).
+- Provide block I/O for up to four virtio disks, and the volumes on them: `blk_scan_volumes` reads each disk's GUID partition table, and `blk_rw(volume, ...)` reads and writes a partition (or a whole disk without a table), used by the buffer cache and `/dev`; `blk_disk_rw` reaches whole disks (`kernel/drivers/virtio_blk.c`).
 - Provide a request/reply channel to 9P servers, `p9_transact`, for up to four virtio-9p devices (host directories shared by QEMU), used by the 9P filesystem (`kernel/drivers/virtio_9p.c`).
 - Provide the `eth0` network interface's transmit function and receive path into `netif_rx` (`kernel/drivers/virtio_net.c`).
 - Provide wall-clock time, `rtc_time_ns` (`kernel/drivers/goldfish_rtc.c`).
-- Expose `/dev/console`, `/dev/tty`, `/dev/tty0`, `/dev/null`, `/dev/zero`, `/dev/kmsg`, `/dev/disk0`, `/dev/disk1` (`kernel/fs/devfs.c`).
+- Expose `/dev/console`, `/dev/tty`, `/dev/tty0`, `/dev/null`, `/dev/zero`, `/dev/kmsg`, `/dev/disk0`, `/dev/disk1` (whole disks) and `/dev/disk0p1`… (partitions) (`kernel/fs/devfs.c`).
 
 **It does not:**
 
@@ -39,12 +39,13 @@ This document covers the hardware-facing half of Eunuchs: the PLIC interrupt rou
 | `lib/include/uapi/termios.h` | 71 | `struct termios` (Linux layout), flag bits, `c_cc` indexes, ioctl numbers, `struct winsize` |
 | `kernel/include/virtio.h` | 94 | Virtqueue/ring structures, `struct virtio_dev`, transport and block API |
 | `kernel/drivers/virtio.c` | 254 | virtio-mmio transport, feature negotiation, `virtq_*`, `dma_addr`, `/proc/virtio` |
-| `kernel/drivers/virtio_blk.c` | 154 | virtio-blk: `blk_init`, `blk_rw`, completion IRQ, statistics |
+| `kernel/drivers/virtio_blk.c` | — | virtio-blk: `blk_init`, `blk_disk_rw`, completion IRQ, statistics; the GPT scan and volumes (`blk_scan_volumes`, `blk_rw`, `blk_name`, `blk_label`) |
+| `kernel/include/gpt_format.h` | — | The GPT layout and CRC32, shared with the boot loader and the host tools |
 | `kernel/drivers/virtio_9p.c` | 124 | virtio-9p: `p9_init`, mount tags, `p9_transact`, completion IRQ, `/proc/9p` |
 | `kernel/drivers/virtio_net.c` | 123 | virtio-net as `eth0`: RX buffer posting, TX, IRQ |
 | `kernel/drivers/goldfish_rtc.c` | 21 | `rtc_time_ns` |
 | `kernel/mm/vmm.c: ioremap` | — | Map an MMIO range into the direct map |
-| `kernel/fs/devfs.c` | 210 | `/dev` filesystem: device table, `/dev/tty` redirection, `kmsg`, `disk0`, `disk1` |
+| `kernel/fs/devfs.c` | — | `/dev` filesystem: device table, `/dev/tty` redirection, `kmsg`, whole disks and partitions |
 | `kernel/core/fdt.c` (match code) | — | Fills `platform.uart`, `.plic`, `.rtc`, `.virtio[]` from `compatible` strings |
 | `user/lib/libc.c` | — | `tcgetattr`, `tcsetattr`, `cfmakeraw`, `tcgetpgrp`/`tcsetpgrp`, `isatty` (user-side termios) |
 
@@ -395,12 +396,12 @@ The driver then calls `virtq_init` for each queue, `irq_register`, and finally `
 
 `blk_init` loops until `MAX_DISKS` disks are found or `virtio_find_from(slot, VIRTIO_DEV_BLOCK, VIRTIO_BLK_F_RO)` fails. For each device: read `capacity` from config bytes 0–7, `virtq_init(…, 0, 64)` (on failure, log it and skip the device), initialize its `done_wq`, register `blk_irq` with the `struct disk` as its argument, `DRIVER_OK`, log `"disk%d: %lu MiB (%lu sectors)%s, queue of %u descriptors"`. It returns the number of disks; with none it logs `no virtio block device`.
 
-Disk numbers follow the order of the virtio-mmio slots in the device tree, which need not match the order of the `-drive` options on the QEMU command line. That is why the filesystem finds the root and `/home` disks by their efs volume label rather than by number ([06](06-filesystems.md#boot-and-mounting)).
+Disk numbers follow the order of the virtio-mmio slots in the device tree, which need not match the order of the `-drive` options on the QEMU command line. That is one reason the filesystem finds its volumes by GPT partition name or efs label rather than by number ([06](06-filesystems.md#boot-and-mounting)).
 
-`blk_rw(disk, sector, buf, len, write)`, called in thread context (it sleeps), works on `d = &disks[disk]`; every queue, wait queue and counter below is that disk's:
+`blk_disk_rw(disk, sector, buf, len, write)`, called in thread context (it sleeps), works on `d = &disks[disk]`; every queue, wait queue and counter below is that disk's:
 
 ```
-blk_rw (any CPU, thread)                         blk_irq (cpu0, interrupt)
+blk_disk_rw (any CPU, thread)                    blk_irq (cpu0, interrupt)
 -----------------------------------------------  ---------------------------------
 check disk < ndisks (-ENODEV), len % 512 and range
   (-EINVAL), write to read-only disk (-EROFS),
@@ -438,6 +439,16 @@ QEMU's `-device virtio-9p-device,fsdev=ID,mount_tag=TAG` (device type `VIRTIO_DE
 - **The mount tag** is in config space: a little-endian 16-bit length, then the bytes (cut to `P9_TAG_MAX` = 31). It is read one byte at a time with the new `virtio_config_read8`, because QEMU fails wider reads that run past the end of a short config space (the tag's config is only `2 + len` bytes).
 - **`p9_transact(dev, tx, txlen, rx, rxcap)`** sends one request: a two-descriptor chain, the T-message (device reads) and the reply buffer (device writes). Both must be physically contiguous kernel memory (`kmalloc`). It waits for descriptors on `free_wq` if needed, kicks, and sleeps uninterruptibly on the device's `done_wq` (`wait_what = "9P reply"`) until `p9_irq` marks the request done with the reply length. Many requests can be in flight (up to 32 with a 64-descriptor queue); 9P tags, chosen by the filesystem, are only for the server's bookkeeping. Returns the reply length or `-ENODEV`/`-ENOMEM`.
 - **Statistics**: requests, bytes out and in per device, printed by `p9_print` (`/proc/9p`, and the monitor's `blk` command).
+
+### Volumes: GPT partitions
+
+The disk image is one GPT disk (`kernel/include/gpt_format.h`: protective MBR, header at LBA 1, 128 entries of 128 bytes, partitions 1 MiB-aligned, a backup copy of the entries and header at the end; both carry CRC32s, and macOS's `diskutil`/`hdiutil` read it). `vfs_init` calls `blk_scan_volumes`, which for each disk:
+
+- reads the primary header at LBA 1 and checks its signature, sizes, header CRC and that the entries fit the disk; then reads the entries a page at a time and checks their CRC. If the primary fails, it tries the backup header in the last sector (`disk0: the primary GPT is damaged; using the backup`);
+- turns each used entry into a volume (`disk0p3`: the partition's index in the table, so unused entries leave gaps), named by the entry's UTF-16 name (`blk_label`); an entry outside the disk is ignored with a warning. Beyond `MAX_VOLUMES` = 16, partitions are ignored with a warning;
+- with no valid table, makes the whole disk one volume (`disk1`), as a bare efs image needs.
+
+It logs each volume (`disk0p1: 16 MiB "boot"`, or `(whole disk)`). `blk_rw(vol, sector, …)` checks the request against the volume's size and adds its first sector before calling `blk_disk_rw`. The kernel never writes a partition table.
 
 ### Network RX and TX
 
@@ -479,15 +490,16 @@ One interrupt line serves both queues; the handler always checks both.
 | `null` | 3 | `null_ops` | 0666 | Reads return 0; writes succeed |
 | `zero` | 4 | `zero_ops` | 0666 | Reads fill zeros (256-byte chunks); writes succeed |
 | `kmsg` | 5 | `kmsg_ops` | 0444 | `open` snapshots the log ring (`log_ring_copy`) into a `LOG_BUF_SIZE` buffer; reads walk the snapshot |
-| `disk0` | 6 | `disk_ops` | 0440 | Read-only raw disk 0; size = `blk_capacity(0) * 512` |
+| `disk0` | 6 | `disk_ops` | 0440 | Read-only whole disk 0; size = `blk_disk_capacity(0) * 512` |
 | `tty` | 7 | `ctty_ops` | 0666 | The caller's controlling terminal |
 | `tty0` | 8 | `tty_ops` | 0620 | Same console TTY |
-| `disk1` | 9 | `disk_ops` | 0440 | Read-only raw disk 1; present only when `blk_count() > 1` |
+| `disk1` | 9 | `disk_ops` | 0440 | Read-only whole disk 1; present only when `blk_disk_count() > 1` |
+| `disk0p1`, … | 10 + volume | `disk_ops` | 0440 | Read-only partition (`blk_name`); only volumes that are partitions |
 
 `dev_read_inode` marks entries `I_CHR` and sets `ip->cops`; `vfs_open` copies `cops` into the file and calls `cops->open` if present (`kernel/fs/vfs.c`). `read`, `write`, `ioctl`, `poll` and `close` on a file go through `f->cops` (`kernel/fs/file.c`, `do_ioctl`).
 
 - `/dev/tty`: `ctty_open` returns `-ENXIO` if the caller's process has no controlling terminal; otherwise it replaces `f->cops` with `tty_ops`. Its placeholder `read`/`write` exist only so `vfs_open`'s access checks pass. Kernel threads (no process) can open it.
-- `/dev/disk0`, `/dev/disk1`: `disk_of(ino)` gives the disk number; `disk_rd` reads one page at a time through `blk_rw` into a temporary page, copying out the requested part. An error before any byte is transferred returns `-EIO` (also for a copy-out fault).
+- `/dev/disk0`, `/dev/disk1`, `/dev/disk0p1`…: `disk_of(ino)` gives a whole disk's number and `vol_of(ino)` a partition's volume; `disk_rd` reads one page at a time through `blk_disk_rw` or `blk_rw` into a temporary page, copying out the requested part. An error before any byte is transferred returns `-EIO` (also for a copy-out fault).
 - `dev_readdir` lists `.`, `..` and then inodes 2 … `DEV_MAX - 1` in order, skipping disk nodes whose disk is not attached (`dev_exists`; `dev_lookup` and `dev_read_inode` use the same test), so the enum must stay dense and every entry must have a name.
 
 ### Adding a new device driver
@@ -548,8 +560,9 @@ Lock order observed in this code: `tty` → `log_lock` (echo and erase output ha
 | `int virtq_init(dev, q, index, num)`, `void virtio_ready(dev)` | `drivers/virtio.c` | virtio drivers |
 | `int virtq_add(q, bufs, n, cookie)`, `void virtq_kick(dev, q)`, `void *virtq_get(q, &len)` | `drivers/virtio.c` | virtio drivers |
 | `u32 virtio_ack_irq(dev)`, `u32 virtio_config_read32(dev, off)`, `u8 virtio_config_read8(dev, off)` | `drivers/virtio.c` | virtio drivers |
-| `int blk_init(void)` (returns the number of disks), `int blk_count(void)`, `u64 blk_capacity(int disk)` (sectors; 0 for a bad number) | `drivers/virtio_blk.c` | `kinit`, `vfs_init`, devfs |
-| `int blk_rw(int disk, u64 sector, void *buf, u32 len, bool write)` | `drivers/virtio_blk.c` | `fs/bcache.c`, devfs |
+| `int blk_init(void)` (returns the number of disks), `int blk_disk_count(void)`, `u64 blk_disk_capacity(int disk)`, `int blk_disk_rw(int disk, u64 sector, void *buf, u32 len, bool write)` | `drivers/virtio_blk.c` | `kinit`, devfs |
+| `void blk_scan_volumes(void)` (sleeps), `int blk_count(void)` (volumes), `u64 blk_capacity(int vol)` (sectors; 0 for a bad number), `const char *blk_name(int vol)`, `const char *blk_label(int vol)` | `drivers/virtio_blk.c` | `vfs_init`, devfs, bcache messages |
+| `int blk_rw(int vol, u64 sector, void *buf, u32 len, bool write)` | `drivers/virtio_blk.c` | `fs/bcache.c`, devfs |
 | `int p9_init(void)`, `int p9_count(void)`, `const char *p9_tag(int i)`, `long p9_transact(int i, const void *tx, u32 txlen, void *rx, u32 rxcap)`, `p9_print` | `drivers/virtio_9p.c` | `kinit`, `vfs_init`, `fs/ninep.c`, procfs, monitor |
 | `int virtio_find_from(int from, u32 id, u64 want, struct virtio_dev *dev)` | `drivers/virtio.c` | `blk_init` (`virtio_find` is the `from = 0` form) |
 | `int virtio_net_init(void)` | `drivers/virtio_net.c` | `net/net.c: net_init` |
@@ -570,7 +583,7 @@ No device-specific system calls. Devices are reached through `open`/`read`/`writ
 | File | Generator | Contents |
 |---|---|---|
 | `/proc/interrupts` | `irq_print` | per-CPU timer/IPI/external counts; per-PLIC-source count, time (µs), handler symbol; spurious claims |
-| `/proc/blk` | `blk_print` | one block per disk (`diskN: virtio-blk ...`): capacity, queue size and free descriptors, IRQ, reads/writes (count and KiB), errors, average and max latency, in-flight count |
+| `/proc/blk` | `blk_print` | one block per disk (`diskN: virtio-blk ...`), with its volumes (`volume N: disk0p3 root sectors A-B (M MiB)`): capacity, queue size and free descriptors, IRQ, reads/writes (count and KiB), errors, average and max latency, in-flight count |
 | `/proc/9p` | `p9_print` | per 9P device: tag, requests, bytes out and in |
 | `/proc/virtio` | `virtio_print` | every virtio slot: base, IRQ, device type, version, status register |
 | `/proc/tty` | `tty_print` | session, foreground group, size, termios flags, line being edited, queued entries and complete lines, in/out/dropped/signals |
@@ -589,7 +602,7 @@ No device-specific system calls. Devices are reached through `open`/`read`/`writ
 ### Boot options and build settings
 
 - No driver-specific boot options. `log=drv:<level>` controls messages from `virtio.c`, `virtio_net.c`, `tty.c` and `plic.c` (`SUBSYS_DRV`); `log=blk:<level>` controls `virtio_blk.c`. `trace=blk` and `trace=irq` select the related trace groups. `ip=` (network stack) overrides `eth0`'s address. `break` enters the monitor before interrupts are set up.
-- QEMU must run with `-global virtio-mmio.force-legacy=false` (the Makefile's `DISKOPTS` sets it); each disk is a `-drive ... -device virtio-blk-device` pair (`make run` attaches `build/fs.img` and `home.img`; `HOMEOPTS`) and the NIC `-device virtio-net-device` (`Makefile`).
+- QEMU must run with `-global virtio-mmio.force-legacy=false` (the Makefile's `DISKOPTS` sets it); each disk is a `-drive ... -device virtio-blk-device` pair (`make run` attaches `disk.img`, the tests `build/fs.img`: one GPT disk each) and the NIC `-device virtio-net-device` (`Makefile`).
 
 ## Debugging and observability
 
@@ -620,8 +633,8 @@ View with `trace show` in the monitor, `eu-trace` in GDB, or a Perfetto export (
 | `diskN: M MiB (S sectors), queue of Q descriptors` | One line per disk found, numbered in discovery order |
 | `virtio-blk: cannot set up the request queue` / `virtio-net: cannot set up the queues` | `virtq_init` failed (queue already ready, max 0, or no memory) |
 | `no virtio network device (make run attaches one)` | Informational; networking runs on `lo` only |
-| `blk_rw: bad request diskN sector ... len ...` | Caller passed a length not a multiple of 512 or beyond the disk |
-| panic `blk_rw: buffer %p crosses a page outside the direct map` | A kernel-stack buffer was used for disk I/O and crosses a page |
+| `blk_rw: bad request disk0p3 sector ... len ...` / `blk_disk_rw: bad request diskN ...` | Caller passed a length not a multiple of 512 or beyond the disk |
+| panic `blk_disk_rw: buffer %p crosses a page outside the direct map` | A kernel-stack buffer was used for disk I/O and crosses a page |
 | panic `dma_addr: %p is not mapped` | A DMA buffer address is not mapped in the kernel page table |
 | `diskD read/write error at sector N (status S)` | Device returned a non-OK status (`IOERR` 1, `UNSUPP` 2), or `0xff` meaning it never wrote it |
 | `virtqueue %u: completion for descriptor %u with no request` | Ring corruption or a double completion |
@@ -699,7 +712,7 @@ View with `trace show` in the monitor, `eu-trace` in GDB, or a Perfetto export (
 9. **Unit tests for the line discipline** — `KTEST`s that feed `tty_input` character sequences (erase, kill, word erase, `^D` placement, mode switches, queue overflow) and check `tty_read` results. The line accounting bug fixed earlier (H5 in IMPROVEMENTS.md) is the kind of thing they would catch. Impact: medium. Effort: small.
 10. **Notification suppression and TX batching** — Negotiate `VIRTIO_F_EVENT_IDX` or honor `used->flags`, and avoid a kick per packet; reap TX completions without an interrupt per frame. Fewer VM exits under load. Impact: low. Effort: medium.
 11. **Scatter-gather and indirect descriptors for block requests** — Allow multi-segment buffers (respecting `seg_max`/`size_max`) so larger I/O and non-contiguous buffers (kernel stacks, user pages) work without the page-crossing panic. Impact: low. Effort: medium.
-12. **`/dev` nodes for every disk** — Generate `diskN` entries from `blk_count()` instead of the two fixed enum values, so disks 2 and 3 (which the driver already supports) can be read. Impact: low. Effort: small.
+12. **`/dev` nodes for every disk** — Generate whole-disk `diskN` entries from `blk_disk_count()` instead of the two fixed enum values, so disks 2 and 3 (which the driver already supports) can be read; partitions already get nodes. Impact: low. Effort: small.
 13. **A small driver registry** — A table of `{ virtio device id or DT compatible, init function }` walked at boot, plus a common place to register `/proc` and monitor printers, instead of hard-coded calls in `kinit`/`net_init`. Makes adding drivers a one-file change. Impact: low. Effort: medium.
 14. **Implement `IXON`, `_POSIX_VDISABLE` and `IEXTEN` gating** — Treat a `c_cc` value of 0 as disabled, gate `^W` on `IEXTEN`, and implement `^S`/`^Q` or clear `IXON` from the defaults so `stty`-style output is truthful. Impact: low. Effort: small.
 15. **Thread-safe `ioremap` and eager RTC mapping** — Take `kpt_lock` around the region table in `ioremap` and map the RTC at boot, so no MMIO mapping happens lazily on a hot path. Impact: low. Effort: small.

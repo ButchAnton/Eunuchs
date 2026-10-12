@@ -71,26 +71,38 @@ UMULTI  := $(notdir $(patsubst %/,%,$(dir $(wildcard user/bin/*/*.c))))
 UMULTI  := $(sort $(UMULTI))
 UPROGS  += $(addprefix $(BUILD)/user/bin/,$(UMULTI))
 UMULTI_OBJS := $(patsubst user/bin/%.c,$(BUILD)/user/multi/%.o,$(wildcard user/bin/*/*.c))
-# --- Disk image: user programs and a few directories, built by the host mkfs ---
+# --- Disk image: a GPT disk with an efs filesystem in each partition, made by
+# eudisk (tools/eudisk): boot and boot.old (a kernel each, mounted on /boot
+# and /boot.old), root (user programs, sources, a few directories) and home.
+# build/fs.img is made afresh for the tests; disk.img, which make run uses, is
+# made once and then updated in place (your files stay: see eudisk install).
 MKFS    := $(BUILD)/tools/mkfs
+EUDISK  := $(BUILD)/tools/eudisk
+EFS_LIB := tools/efs/efs.c tools/efs/image.c
+EFS_HDRS := tools/efs/efs.h tools/efs/image.h kernel/include/efs_format.h kernel/include/gpt_format.h
 # the kernel linker, for tcc's kernel (tools/kld)
 KLD     := $(BUILD)/tools/kld
 FSIMG   := $(BUILD)/fs.img
+DISK_IMG ?= disk.img
+BOOT_MB ?= 16
 FS_MB   ?= 64
+HOME_MB ?= 64
+DISK_LAYOUT = boot:$(BOOT_MB) boot.old:$(BOOT_MB) root:$(FS_MB) home:$(HOME_MB)
+HOME_FILES  = /guest/:0755:1000:1000
 EUTILS_LINKS = echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile \
                true false yes kill date dmesg free sleep strace su dbg uname clear \
                reboot poweroff
 FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(notdir $(p))) \
            $(foreach l,$(EUTILS_LINKS),/bin/$(l)=@/bin/eutils) /bin/sh=@/bin/esh /bin/less=@/bin/more \
            /bin/vi=@/bin/edit /bin/view=@/bin/edit /bin/emacs=@/bin/edit /bin/em=@/bin/edit \
-           /etc/motd=user/etc/motd /etc/passwd=user/etc/passwd /etc/group=user/etc/group /etc/hostname=user/etc/hostname \
-           /etc/eshrc=user/etc/eshrc /dev/ /proc/ /tmp/:0777 \
+           +/etc/motd=user/etc/motd +/etc/passwd=user/etc/passwd +/etc/group=user/etc/group \
+           +/etc/hostname=user/etc/hostname +/etc/eshrc=user/etc/eshrc /dev/ /proc/ /tmp/:0777 \
            /www/ /www/index.html=user/www/index.html \
            /home/ /home/guest/:0755:1000:1000 /mnt/ /mnt/host/ \
            $(foreach f,$(SYS_FILES),$(patsubst $(SYSROOT)%,%,$(f))=$(f)) \
            $(foreach f,$(filter user/bin/%,$(USR_SRC)),/usr/src/$(patsubst user/bin/%,%,$(f))=$(f)) \
            /usr/src/Makefile=user/usr-src/Makefile \
-           /boot/kernel.elf=$(BUILD)/kernel.boot /boot/kernel.old.elf=$(BUILD)/kernel.boot \
+           /boot/ /boot.old/ \
            $(foreach f,$(EU_SRC),/usr/src/eunuchs/$(f)=$(f))
 DISKOPTS = -global virtio-mmio.force-legacy=false \
            -drive file=$(1),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
@@ -119,8 +131,6 @@ NETOPTS  = -netdev user,id=net0$(if $(HOSTFWD),$(comma)$(HOSTFWD)) \
            -device virtio-net-device,netdev=net0 \
            -object filter-dump,id=pcap0,netdev=net0,file=$(BUILD)/net.pcap
 comma := ,
-# make run/debug also attach the /home disk (the test scenarios don't).
-HOMEOPTS = -drive file=$(HOME_IMG),if=none,format=raw,id=hd1 -device virtio-blk-device,drive=hd1
 # make run/debug also share a Mac directory (the project, unless HOSTDIR=...;
 # HOSTDIR= shares nothing) through virtio-9p; the kernel mounts it on
 # /mnt/host. It is the real directory: what the guest writes there changes
@@ -128,9 +138,9 @@ HOMEOPTS = -drive file=$(HOME_IMG),if=none,format=raw,id=hd1 -device virtio-blk-
 HOSTDIR  ?= $(CURDIR)
 SHAREOPTS = $(if $(HOSTDIR),-fsdev local$(comma)id=hostfs$(comma)path=$(HOSTDIR)$(comma)security_model=none \
             -device virtio-9p-device$(comma)fsdev=hostfs$(comma)mount_tag=host)
-QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(SHAREOPTS) $(NETOPTS)
+QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(DISK_IMG)) $(SHAREOPTS) $(NETOPTS)
 
-.PHONY: all user fsck clean-home run debug gdb test selfhost tcc-kernel stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean sysroot
+.PHONY: all user fsck gui run debug gdb test selfhost tcc-kernel stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean sysroot
 
 # Written on Apple Silicon. A different host (Intel Mac) or Homebrew GCC
 # can change RISC-V ELF ABI tags; .S files have no header deps, so they
@@ -141,7 +151,7 @@ QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(SHAREOPTS) $(NETO
 CC_ID := $(BUILD)/.cc-id
 $(shell mkdir -p $(BUILD) && printf '%s\n' "$(shell uname -m)" "$(CC)" "$(CFLAGS)" "$(UCFLAGS)" "$(shell $(CC) --version 2>/dev/null | head -1)" "$(shell $(HOSTCC) --version 2>/dev/null | head -1)" > $(CC_ID).tmp && { cmp -s $(CC_ID) $(CC_ID).tmp || mv $(CC_ID).tmp $(CC_ID); } && rm -f $(CC_ID).tmp)
 
-all: $(KERNEL) $(FSIMG) $(KLD) $(EBOOT)
+all: $(KERNEL) $(FSIMG) $(KLD) $(EBOOT) $(EUDISK)
 
 # --- The boot loader (boot/): QEMU's -kernel, which loads /boot/kernel.elf ---
 EBOOT_OBJS := $(BUILD)/boot/start.o $(BUILD)/boot/eboot.o
@@ -312,29 +322,68 @@ $(BUILD)/user/stripped/%: $(BUILD)/user/bin/%
 	@mkdir -p $(dir $@)
 	$(Q)$(CROSS)objcopy --strip-debug $< $@
 
-$(MKFS): tools/mkfs/mkfs.c kernel/include/efs_format.h
+# mkfs (a bare efs filesystem; fsck) and eudisk, on the host efs library
+$(MKFS): tools/mkfs/mkfs.c $(EFS_LIB) $(EFS_HDRS)
 	@mkdir -p $(dir $@)
 	$(call msg,HOSTCC,$@)
-	$(Q)$(HOSTCC) -O1 -g -Wall -Wextra -Werror -Ikernel/include -o $@ $<
+	$(Q)$(HOSTCC) -O1 -g -Wall -Wextra -Werror -Ikernel/include -Itools/efs -o $@ $< $(EFS_LIB)
 
-# Rebuilt whenever a program changes, which discards files created at run time.
-$(FSIMG): $(MKFS) $(BUILD)/kernel.boot $(patsubst $(BUILD)/user/bin/%,$(BUILD)/user/stripped/%,$(UPROGS)) user/etc/* user/www/* $(SYS_FILES) $(USR_SRC) $(EU_SRC)
-	$(call msg,MKFS,$@)
-	$(Q)$(MKFS) --label root $@ $(FS_MB) $(FS_FILES) > /dev/null
+$(EUDISK): tools/eudisk/eudisk.c $(EFS_LIB) $(EFS_HDRS)
+	@mkdir -p $(dir $@)
+	$(call msg,HOSTCC,$@)
+	$(Q)$(HOSTCC) -O1 -g -Wall -Wextra -Werror -Ikernel/include -Itools/efs -o $@ $< $(EFS_LIB)
 
-# /home lives on its own disk, made once and never rebuilt, so what you
-# create there survives `make` and `make clean` (`make clean-home` resets it).
-HOME_IMG ?= home.img
-HOME_MB  ?= 64
-$(HOME_IMG): | $(MKFS)
-	$(call msg,MKFS,$@)
-	$(Q)$(MKFS) --label home $@ $(HOME_MB) /guest/:0755:1000:1000 > /dev/null
+# $(call mkdisk,IMAGE,KERNEL,ROOT_FILES): a new disk image, built beside
+# IMAGE and renamed over it when complete.
+mkdisk = rm -f $(1).new && $(EUDISK) create $(1).new $(DISK_LAYOUT) > /dev/null && \
+	$(EUDISK) install $(1).new root $(3) > /dev/null && \
+	$(EUDISK) install $(1).new home $(HOME_FILES) > /dev/null && \
+	$(EUDISK) kernel install --to boot $(1).new $(2) > /dev/null && \
+	$(EUDISK) kernel install --to boot.old $(1).new $(2) > /dev/null && \
+	mv -f $(1).new $(1)
 
-clean-home:
-	rm -f $(HOME_IMG)
+DISK_DEPS = $(EUDISK) $(BUILD)/kernel.boot $(patsubst $(BUILD)/user/bin/%,$(BUILD)/user/stripped/%,$(UPROGS)) \
+            user/etc/* user/www/* $(SYS_FILES) $(USR_SRC) $(EU_SRC)
+
+# The tests' image: made afresh whenever anything in it changes.
+$(FSIMG): $(DISK_DEPS)
+	$(call msg,DISK,$@)
+	$(Q)$(call mkdisk,$@,$(BUILD)/kernel.boot,$(FS_FILES))
+
+# Yours: made once (with what was in home.img, the old /home disk, if it is
+# there), then brought up to date in place. Programs and sources that changed
+# are replaced (copies of any you edited go to /var/backup), configuration
+# files you edited stay (the new ones arrive as FILE.new), and a new kernel
+# goes to boot with the one it replaces in boot.old. `make clean` leaves it;
+# rm disk.img for a fresh one.
+$(DISK_IMG): $(DISK_DEPS)
+	@if [ ! -f $@ ]; then \
+		echo "  DISK    $@ (new)"; \
+		$(call mkdisk,$@,$(BUILD)/kernel.boot,$(FS_FILES)) || exit 1; \
+		if [ -f home.img ]; then \
+			if $(EUDISK) copy home.img:/ $@:home:/; then \
+				echo "  (home.img's files are in $@'s home partition: home.img can go)"; \
+			else echo "  (some of home.img was not copied: see above; eudisk copy home.img:/ $@:home:/ retries)"; fi; \
+		fi; \
+	else \
+		echo "  DISK    $@ (update)"; \
+		$(EUDISK) install $@ root $(FS_FILES) && \
+		$(EUDISK) install $@ home $(HOME_FILES) > /dev/null && \
+		$(EUDISK) kernel install $@ $(BUILD)/kernel.boot || exit 1; \
+	fi
+	@touch $@
+
+# Eudisk, the Mac app (tools/eudisk-gui, SwiftUI over eudisk), on disk.img
+# (or IMAGE=...). It only reads while QEMU has the image open.
+IMAGE ?= $(DISK_IMG)
+gui: $(EUDISK)
+	$(call msg,SWIFT,$(BUILD)/gui/release/Eudisk)
+	@cd tools/eudisk-gui && swift build -q -c release --scratch-path $(CURDIR)/$(BUILD)/gui
+	@EUDISK=$(CURDIR)/$(EUDISK) $(BUILD)/gui/release/Eudisk $(abspath $(IMAGE)) > /dev/null 2>&1 &
 
 fsck: $(MKFS)
 	$(MKFS) --check $(FSIMG)
+	@if [ -f $(DISK_IMG) ]; then $(MKFS) --check $(DISK_IMG); fi
 
 user: $(UPROGS)
 
@@ -364,11 +413,11 @@ define check_tty
 	fi
 endef
 
-run: $(KERNEL) $(EBOOT) $(FSIMG) $(HOME_IMG)
+run: $(KERNEL) $(EBOOT) $(DISK_IMG)
 	$(check_tty)
 	$(QEMU) $(QEMUOPTS) -append "$(APPEND)"
 
-debug: $(KERNEL) $(EBOOT) $(FSIMG) $(HOME_IMG)
+debug: $(KERNEL) $(EBOOT) $(DISK_IMG)
 	$(check_tty)
 	@echo "QEMU halted; run 'make gdb' in another terminal."
 	$(QEMU) $(QEMUOPTS) -append "$(APPEND)" -s -S
@@ -442,7 +491,7 @@ replay-check: $(KERNEL) $(FSIMG)
 		echo "replay-check: replay identical to the recording ($$(wc -l < $(RRDIR)/record.log | tr -d ' ') lines, $$(du -h $(RRDIR)/replay.bin | cut -f1) of events)" || \
 		{ echo "replay-check: replay DIVERGED from the recording:"; diff $(RRDIR)/record.log $(RRDIR)/replay.log | head -20; exit 1; }
 
-qemu-log: $(KERNEL) $(FSIMG) $(HOME_IMG)
+qemu-log: $(KERNEL) $(DISK_IMG)
 	$(check_tty)
 	$(QEMU) $(QEMUOPTS) -append "$(APPEND)" -d int,guest_errors,unimp -D $(BUILD)/qemu.log
 
@@ -468,16 +517,15 @@ SH_KERNEL := $(SH_OUT)/kernel/kernel.elf
 SH_EBOOT := $(SH_OUT)/kernel/eboot.elf
 SH_LIBS  := crt1.o crti.o crtn.o libc.a tcc/libtcc1.a tcc/runmain.o
 sh_file   = $(if $(findstring =$(BUILD)/user/stripped/,$(1)),$(subst =$(BUILD)/user/stripped/,=$(SH_OUT)/bin/,$(1)),$(if $(filter $(addprefix %/,$(SH_LIBS)),$(1)),$(subst =$(SYSROOT)/usr/lib/,=$(SH_OUT)/sysroot/usr/lib/,$(1)),$(1)))
-SH_FILES  = $(filter-out /boot/kernel.elf=%,$(foreach f,$(FS_FILES),$(call sh_file,$(f)))) \
-            /bin/kld=$(SH_OUT)/bin/kld /boot/kernel.elf=$(SH_KERNEL)
+SH_FILES  = $(foreach f,$(FS_FILES),$(call sh_file,$(f))) /bin/kld=$(SH_OUT)/bin/kld
 # per-stage test timeout: tcc's kernel is about half as fast
 SH_TIMEOUT ?= 120
 
-selfhost: $(KERNEL) $(EBOOT) $(FSIMG) $(MKFS)
+selfhost: $(KERNEL) $(EBOOT) $(FSIMG) $(MKFS) $(EUDISK)
 	@$(PYTHON) tools/selfhost.py --qemu "$(QEMU) $(QEMUBASE)" --image $(FSIMG)
 	@if echo "$(SH_FILES)" | tr ' ' '\n' | grep -E '=$(BUILD)/user/stripped/|=$(SYSROOT)/usr/lib/(crt[1in]|libc|tcc/libtcc1|tcc/runmain)\.'; then \
 		echo "selfhost: the files above would still be the gcc-built ones"; exit 1; fi
-	$(Q)$(MKFS) --label root $(BUILD)/selfhost/fs.img $(FS_MB) $(SH_FILES) > /dev/null
+	$(Q)$(call mkdisk,$(BUILD)/selfhost/fs.img,$(SH_KERNEL),$(SH_FILES))
 	@echo "selfhost: $(SH_KERNEL) and build/selfhost/fs.img: built on Eunuchs, by tcc"
 	@$(PYTHON) tools/run_tests.py --qemu "$(QEMU) $(subst -kernel $(BOOT_IMAGE),-kernel $(SH_EBOOT),$(QEMUBASE))" \
 		--image $(BUILD)/selfhost/fs.img --mkfs $(MKFS) --timeout $(SH_TIMEOUT) --append "$(APPEND)" \
@@ -540,12 +588,14 @@ $(BUILD)/host/%: tests/host/%.c
 $(KOBJS) $(ULIB) $(UMULTI_OBJS) $(BUILD)/tcc/tcc.o \
   $(BUILD)/ksyms0.o $(BUILD)/ksyms.o \
   $(patsubst user/bin/%.c,$(BUILD)/user/bin/%.o,$(wildcard user/bin/*.c)) \
-  $(XTCC) $(MKFS) $(KLD) $(HOST_TESTS): $(CC_ID)
+  $(XTCC) $(MKFS) $(EUDISK) $(KLD) $(HOST_TESTS): $(CC_ID)
 
-test-host: $(HOST_TESTS) $(MKFS) $(BUILD)/user/bin/hello $(XTCC)
+test-host: $(HOST_TESTS) $(MKFS) $(EUDISK) $(BUILD)/kernel.boot $(BUILD)/user/bin/hello $(XTCC)
 	@for t in $(HOST_TESTS); do echo "== $$t"; $$t || exit 1; done
 	@echo "== tests/host/test_fsck.py"
 	@$(PYTHON) tests/host/test_fsck.py $(MKFS) $(BUILD)/user/bin/hello
+	@echo "== tests/host/test_eudisk.py"
+	@$(PYTHON) tests/host/test_eudisk.py $(EUDISK) $(BUILD)/kernel.boot
 	@echo "== tests/host/test_tcc_asm.py"
 	@$(PYTHON) tests/host/test_tcc_asm.py $(XTCC) $(TCC_SRC) $(CROSS)
 

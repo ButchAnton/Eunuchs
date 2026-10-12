@@ -246,7 +246,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Ordered-mode journaling so file data isn't logged (H/L).
 - An inode cache with hashing (M/M).
 - Validate geometry at mount and in fsck; let fsck replay a committed log (M/S).
-- A mount table (`/etc/fstab` or a `mount` call) instead of the two fixed labels and the fixed `/mnt/<tag>` 9P mounts and `/dev` nodes for every disk (M/M).
+- A mount table (`/etc/fstab` or a `mount` call) instead of the fixed partition names and the fixed `/mnt/<tag>` 9P mounts and `/dev` nodes for every disk (M/M).
 - 9pfs: reclaim nodes and fids (never freed today); attribute or dentry caching; map host uids; symbolic links; names longer than 59 bytes; `Tfsync` for `fsync` (M/M).
 - Pipe `O_NONBLOCK` and atomic writes (M/S).
 - Smaller items: `getdents64` names; harden `vfs_getcwd`; root-only `DBG_FSCRASH`; `eu-files` for pipes.
@@ -323,6 +323,8 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Do `ptrace` memory copies without holding `proc_lock` with interrupts off (M/S).
 
 ### [Build and testing](subsystems/11-build-and-testing.md#potential-improvements)
+- eudisk: keep hard links whose first name `copy` skipped; repair a damaged primary GPT from the backup; a stricter in-use check than matching QEMU's `file=` argument; save only on success in `put`; manifest paths with spaces; valid JSON for non-UTF-8 names; one place for the kernel banner key (M/S).
+- The kernel and eboot: honour more than the four fixed partition names (a mount table), and let eboot use the backup GPT too (L/S).
 - Stage selection (H/M).
 - Hangs become failures (H/S).
 - A per-test `utest` filter (M/S).
@@ -341,7 +343,8 @@ Bigger projects that would each change what the system can do. They are listed r
 **Done since the review:**
 - **Floating point for user programs.** User code is built for `rv64gc`/`lp64d`. The kernel enables FP per thread on its first FP instruction, saves and restores the registers at context switches of threads that use them, copies them at `fork`, resets them at `exec`, and carries them in signal frames ([03](subsystems/03-traps-interrupts-syscalls.md#lazy-floating-point-for-user-programs)).
 - **A real C library.** Buffered `FILE` stdio, `printf` with floating point, `scanf`, `strto*`, `qsort`, `getopt`, `math.h`, `strftime`, `setjmp`/`sigsetjmp`, and POSIX regular expressions (BRE and ERE) ([10](subsystems/10-user-space.md#stdio-streams)).
-- **Several disks and a persistent `/home`.** Up to four virtio disks, a buffer cache keyed by disk, a log per filesystem, volume labels, and `home.img`, which survives rebuilds ([06](subsystems/06-filesystems.md#boot-and-mounting)).
+- **One partitioned disk, managed from the Mac.** The image is a GPT disk with `boot`, `boot.old`, `root` and `home` efs partitions; the kernel and eboot read the partition table, `/boot` holds the current kernel and `/boot.old` the previous one (`kinstall` in the guest, `eudisk kernel install` on the Mac). `disk.img` is updated in place by `eudisk install`, which keeps the user's files and edits; `eudisk` and the Eudisk app read and write images from the Mac ([11](subsystems/11-build-and-testing.md#disk-image-contents-fs_files-in-the-makefile)).
+- **Several disks and a persistent `/home`.** Up to four virtio disks, a buffer cache keyed by disk, a log per filesystem, volume labels, and `home.img`, which survived rebuilds (since replaced by the partitioned `disk.img`, above) ([06](subsystems/06-filesystems.md#boot-and-mounting)).
 - **A native C toolchain.** TinyCC runs on Eunuchs (`/bin/tcc`, with `tcc -run` through the new `mprotect`), with a sysroot in `/usr`, a POSIX `make`, and the sources of every program in `/usr/src`, rebuilt in about 6 seconds in the guest ([13](subsystems/13-toolchain.md)).
 - **tcc's assembler fixed and completed** (self-hosting step 1): macros, `.irp`, section types, gas-compatible `la`/`li`/`call`, every S- and M-mode CSR, the missing instructions, rewritten compressed instructions, and a dozen silent mis-encodings fixed; checked byte for byte against GNU as by a host test ([13](subsystems/13-toolchain.md#the-assembler)).
 - **A boot loader.** `eboot` (`boot/`) is QEMU's `-kernel`: it finds the root disk, loads `/boot/kernel.elf` (falling back to `/boot/kernel.old.elf`) with its own read-only efs reader that honours a committed log, checks the ELF, and jumps. With `reboot(2)` (`reboot`, `poweroff`), Eunuchs installs and boots a kernel it built itself, and `make selfhost` does exactly that ([01](subsystems/01-boot-and-platform.md#0-the-boot-loader-bootebootc)).
