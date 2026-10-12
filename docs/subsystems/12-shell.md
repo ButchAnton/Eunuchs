@@ -751,7 +751,7 @@ esh is single-threaded. The asynchronous parts are signal handlers, and they onl
 ## Potential improvements
 
 1. **`SIGWINCH` from the console.** Have the kernel's TTY layer turn a terminal size report into `SIGWINCH`, or poll in the editor, so resizes redraw immediately. Impact: low. Effort: small.
-2. **Regular expressions for `[[ =~ ]]`.** A small backtracking matcher (`^ $ . [] * + ? () |`), with `$match` set from the groups. Impact: medium. Effort: medium.
+2. **Regular expressions for `[[ =~ ]]`.** The libc now has POSIX `regcomp`/`regexec` (extended syntax with `REG_EXTENDED`, [10](10-user-space.md#regular-expressions-regexh)), so this is mostly wiring: compile the right-hand side, and set `$MATCH`/`$match` (zsh) from `pmatch`. Impact: medium. Effort: small.
 3. **Extended globbing and qualifiers.**
    - Patterns: `^pat`, `pat~exclude`, `(a|b)`, `#`/`##`.
    - Qualifiers: `*(/)`, `*(.)`, `*(om[1,3])`.

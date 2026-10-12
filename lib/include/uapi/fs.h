@@ -89,7 +89,9 @@ struct timeval {
 #define CLOCK_REALTIME  0
 #define CLOCK_MONOTONIC 1
 
+#ifndef PATH_MAX
 #define PATH_MAX 256
 #define NAME_MAX 59
+#endif
 
 #endif

@@ -1,22 +1,22 @@
 # Files and filesystems
 
-This subsystem turns a virtio disk into a Unix file tree. Three filesystem types sit under a small VFS: efs, an on-disk filesystem with a write-ahead log in the xv6 style; devfs, mounted on `/dev`; and procfs, a read-only view of kernel state on `/proc`. It also provides the file objects and per-process descriptor tables behind every `read`/`write`, plus pipes and `ppoll`. A host tool (`tools/mkfs/mkfs.c`) builds efs images and checks them (fsck).
+This subsystem turns one or more virtio disks into a Unix file tree. Three filesystem types sit under a small VFS: efs, an on-disk filesystem with a write-ahead log in the xv6 style; devfs, mounted on `/dev`; and procfs, a read-only view of kernel state on `/proc`. It also provides the file objects and per-process descriptor tables behind every `read`/`write`, plus pipes and `ppoll`. A host tool (`tools/mkfs/mkfs.c`) builds efs images and checks them (fsck).
 
 ## Responsibilities and scope
 
 **In scope:**
 
-- **Buffer cache** (`bcache.c`): 128 cached 4 KiB disk blocks.
+- **Buffer cache** (`bcache.c`): 128 cached 4 KiB disk blocks, keyed by (disk, block).
 - **Write-ahead log** (`log.c`): makes every efs change atomic across power failures, with crash-point injection for testing.
 - **efs** (`efs.c`): block and inode allocation, the block map (direct, indirect and double-indirect blocks), file read/write/truncate, and directories.
-- **VFS** (`vfs.c`): the inode table, mounts, path lookup, permission checks, and the namespace operations (create, mkdir, unlink, link, rename, getcwd).
+- **VFS** (`vfs.c`): the inode table, mounts (choosing the root and `/home` disks by volume label), path lookup, permission checks, and the namespace operations (create, mkdir, unlink, link, rename, getcwd).
 - **Files and descriptors** (`file.c`): `struct file`, 32-slot descriptor tables, and the file system calls.
 - **Pipes** (`pipe.c`), **`ppoll`** (`poll.c`), **devfs** (`devfs.c`) and **procfs** (`procfs.c`).
 - **Host tools**: `mkfs`/`fsck` (`tools/mkfs/mkfs.c`) and their host test (`tests/host/test_fsck.py`).
 
 **Out of scope (owned by other subsystems):**
 
-- The block driver. `blk_rw`, `blk_capacity` and `blk_print` are in `kernel/drivers/virtio_blk.c`. The filesystem calls `blk_rw` synchronously: the caller sleeps until the request completes.
+- The block driver. `blk_rw`, `blk_count`, `blk_capacity` and `blk_print` are in `kernel/drivers/virtio_blk.c`; disks are numbered 0..`blk_count()-1` in the order the driver finds them. The filesystem calls `blk_rw` synchronously: the caller sleeps until the request completes.
 - The TTY line discipline (`tty_ops`, `kernel/drivers/tty.c`). devfs only exposes it as `/dev/console`, `/dev/tty0` and `/dev/tty`.
 - Sockets (`kernel/net/socket.c`). They are `struct file`s with their own `chr_ops`, and they plug into `ppoll` through `chr_ops.poll`.
 - Credentials and the `chmod`/`chown`/`access` system calls. These live in `kernel/proc/cred.c`, but they use `vfs_permission`, `namei` and `write_inode` from this subsystem.
@@ -32,15 +32,15 @@ This subsystem turns a virtio disk into a Unix file tree. Three filesystem types
 | `lib/include/uapi/fs.h` | ABI: `O_*`, `F_*`, `S_*`, `struct stat`, `struct dirent`, `R_OK..`, `PATH_MAX` (256), `NAME_MAX` (59). |
 | `kernel/fs/bcache.c` | Buffer cache: `bread`, `bwrite`, `brelse`, `bpin`/`bunpin`, LRU, statistics. |
 | `kernel/fs/log.c` | Write-ahead log: `log_begin`/`log_end`/`log_write`, `commit`, `install`, recovery in `log_create`, crash points. |
-| `kernel/fs/efs.c` | efs `fs_ops`: `balloc`/`bfree`, inode read/write/alloc/free, `bmap`, `efs_truncate`, `efs_read`/`efs_write`, directories, `efs_mount`. |
-| `kernel/fs/vfs.c` | Inode cache (`iget`/`iput`/`ilock`), `vfs_mount`, `vfs_permission`, `walk`/`namei`/`nameiparent`, `vfs_open`, `vfs_mkdir`, `vfs_unlink`, `vfs_link`, `vfs_rename`, `vfs_getcwd`, `vfs_read_all`, `vfs_init`, `fs_error`. |
+| `kernel/fs/efs.c` | efs `fs_ops`: `balloc`/`bfree`, inode read/write/alloc/free, `bmap`, `efs_truncate`, `efs_read`/`efs_write`, directories, `efs_mount`, `efs_label`. |
+| `kernel/fs/vfs.c` | Inode cache (`iget`/`iput`/`ilock`), `vfs_mount`/`vfs_mount_disk`, `disk_labeled`, `vfs_permission`, `walk`/`namei`/`nameiparent`, `vfs_open`, `vfs_mkdir`, `vfs_unlink`, `vfs_link`, `vfs_rename`, `vfs_getcwd`, `vfs_read_all`, `vfs_init`, `fs_error`. |
 | `kernel/fs/file.c` | `file_read`/`file_write`/`file_close`, descriptor tables (`fd_install`, `files_fork`, `files_exec`, `files_close_all`), file system calls `do_*`. |
 | `kernel/fs/pipe.c` | 4 KiB ring pipes, `pipe_create`, `/proc/pipes`. |
 | `kernel/fs/poll.c` | `poll_wait`, `file_poll`, `do_ppoll`. |
-| `kernel/fs/devfs.c` | `/dev`: `console`, `null`, `zero`, `kmsg`, `disk0`, `tty`, `tty0`. |
+| `kernel/fs/devfs.c` | `/dev`: `console`, `null`, `zero`, `kmsg`, `disk0`, `disk1`, `tty`, `tty0`. |
 | `kernel/fs/procfs.c` | `/proc`: global files, `/proc/net/*`, `/proc/<pid>/*`, `/proc/self`, `seq_print`. |
 | `kernel/proc/cred.c` | `do_fchmod`, `do_fchmodat`, `do_fchownat`, `do_faccessat` (FS-adjacent). |
-| `tools/mkfs/mkfs.c` | Host `mkfs IMAGE SIZE_MB specs...` and `mkfs --check IMAGE` (fsck). |
+| `tools/mkfs/mkfs.c` | Host `mkfs [--label NAME] IMAGE SIZE_MB specs...` and `mkfs --check IMAGE` (fsck). |
 | `tests/host/test_fsck.py` | Injects seven kinds of corruption into an image and checks that fsck reports each (plus a clean fresh image). |
 | `kernel/tests/test_fs.c` | KTESTs: leak checks, sparse files and truncate, path walk, error and free-count consistency. |
 | `tools/run_tests.py`, `user/bin/utests.c: scenario` | Multi-boot persistence and power-failure scenarios. |
@@ -65,7 +65,7 @@ All sizes come from `efs_format.h`. A block is `EFS_BSIZE` = 4096 bytes, which i
 
 `nlog` = `EFS_LOGSIZE + 1` = 65 (header included). mkfs always uses `ninodes` = 1024. One bitmap block covers 32768 blocks (128 MiB). The bitmap has one bit per block of the whole disk, so mkfs marks metadata blocks 0..`datastart-1` as used.
 
-**`struct efs_super`** (48 bytes, in block 1): `magic` = `EFS_MAGIC` 0x53465545 ("EUFS"), `version` = 1, `bsize`, `size` (total blocks), `ninodes`, `nlog`, `logstart`, `inodestart`, `bmapstart`, `datastart`, and `mkfs_time` (ns since the epoch).
+**`struct efs_super`** (64 bytes, in block 1): `magic` = `EFS_MAGIC` 0x53465545 ("EUFS"), `version` = 1, `bsize`, `size` (total blocks), `ninodes`, `nlog`, `logstart`, `inodestart`, `bmapstart`, `datastart`, `mkfs_time` (ns since the epoch), and `label[16]`, the volume label (`root`, `home`; NUL-padded, not necessarily NUL-terminated when all 16 bytes are used). Images made before the label existed have zeros there, which reads as an empty label; the version was not bumped.
 
 **`struct efs_dinode`** (128 bytes, `_Static_assert`ed; `EFS_IPB` = 32 per block). Inode `i` is at block `inodestart + i/32`, slot `i%32`.
 
@@ -103,7 +103,7 @@ file block bn            where
 
 | Field | Meaning |
 |---|---|
-| `blockno` | disk block (4 KiB) cached here |
+| `disk`, `blockno` | which disk (`blk_rw` numbering) and which 4 KiB block on it is cached here |
 | `valid` | `data` holds the block's contents |
 | `refcnt` | holders (protected by `bc_lock`) |
 | `pins` | held by the log until installed; a pinned buffer is never recycled |
@@ -112,7 +112,7 @@ file block bn            where
 | `data` | one zeroed page from `page_alloc_zeroed` |
 | `get_site`, `last_used` | debugging: return address of the last `bread`, `rdtime` of the last release |
 
-`NBUF` = 128, so the cache holds 512 KiB. Every efs read and write goes through it, including the log's own blocks.
+`NBUF` = 128, so the cache holds 512 KiB, shared by every disk. Every efs read and write goes through it, including the log's own blocks.
 
 ### The log (`struct efs_log`, private to `log.c`)
 
@@ -120,6 +120,7 @@ file block bn            where
 |---|---|
 | `lock` | spinlock over the fields below |
 | `wq` | `"log-space"` wait queue for `log_begin` |
+| `disk` | the disk of the filesystem this log belongs to (`sb->disk`) |
 | `start` | header block number (`esb->logstart`) |
 | `outstanding` | operations between `log_begin` and `log_end` (outermost level only) |
 | `committing` | a commit is in progress; no new operation may start |
@@ -194,9 +195,10 @@ file block bn            where
 | 3 | `null` | read: EOF, write: sink | 0666 |
 | 4 | `zero` | read: zeros, write: sink | 0666 |
 | 5 | `kmsg` | snapshot of the log ring | 0444 |
-| 6 | `disk0` | raw disk, read-only | 0440 |
+| 6 | `disk0` | raw disk 0, read-only | 0440 |
 | 7 | `tty` | controlling terminal (`ctty_open` swaps in `tty_ops`) | 0666 |
 | 8 | `tty0` | `tty_ops` | 0620 |
+| 9 | `disk1` | raw disk 1, read-only; exists only if a second disk is attached | 0440 |
 
 All devfs inodes have uid and gid 0 (they are `kzalloc`ed and never set). `rdev` equals the inode number.
 
@@ -204,34 +206,38 @@ All devfs inodes have uid and gid 0 (they are `kzalloc`ed and never set). `rdev`
 
 ### Boot and mounting
 
-`kinit` calls `vfs_init` (`kernel/fs/vfs.c`):
+`kinit` calls `blk_init`, which finds every virtio disk (up to `MAX_DISKS` = 4; with none, `kinit` panics), then `vfs_init` (`kernel/fs/vfs.c`):
 
 1. `bcache_init` allocates 128 zeroed pages, links them on the LRU, and logs `buffer cache: 128 buffers of 4096 bytes`.
-2. `vfs_mount(&efs_type, "/")` calls `efs_mount`:
-   - It reads block 1 and checks `magic`, `bsize` and `version`; on a mismatch it fails with `-EINVAL`, and `vfs_init` panics with "cannot mount the root filesystem".
+2. It chooses the root disk: `disk_labeled("root")` reads the superblock of each disk in turn (`efs_label`, through the buffer cache) and returns the first whose efs volume label is `root`. If none is, the root is disk 0, so an unlabelled image attached alone still boots.
+3. `vfs_mount_disk(&efs_type, "/", root)` records the disk in `sb->disk` and calls `efs_mount`:
+   - It reads block 1 of that disk and checks `magic`, `bsize` and `version`; on a mismatch it fails with `-EINVAL`, and `vfs_init` panics with "cannot mount the root filesystem".
    - It sets `bhint = datastart`.
    - It calls `log_create`, which **replays a committed log** (see Recovery).
    - It calls `iget(sb, 1)` for the root.
    - It counts free blocks by scanning the bitmap (`efs_free_blocks`) and free inodes by scanning the inode table.
-3. `vfs_mount(&devfs_type, "/dev")` and `vfs_mount(&procfs_type, "/proc")` mount the synthetic filesystems.
+4. If some other disk is labelled `home`, it is mounted on `/home` the same way. A failure only warns (`/home (disk1) not mounted: ...`), and the root filesystem's own `/home` directory shows through. The boot log names the disk: `mounted efs (disk1) on /home`.
+5. `vfs_mount(&devfs_type, "/dev")` and `vfs_mount(&procfs_type, "/proc")` mount the synthetic filesystems (`vfs_mount` is `vfs_mount_disk` with disk 0, which they ignore).
    - `vfs_mount` resolves the mount point with `namei`, requires a directory that has nothing mounted on it, and keeps that reference in `sb->covered`.
    - It sets `covered->mounted = sb`.
    - If the directory is missing from the image, it only warns (`/dev not mounted (...); create /dev in the image`).
+
+Every block access in `efs.c` goes to its own superblock's disk (the `BREAD(bno)` macro is `bread(sb->disk, bno)`), and each mounted efs has its own `struct efs_log` on its own disk, with its own log area, transactions and recovery. The two filesystems' transactions are independent: an operation never spans them, since `rename` and `link` across mounts fail with `EXDEV`.
 
 The `/` mount sets the global `root_inode`. Mounts are added to the `mounts` list and are never removed: there is no unmount and no mount system call.
 
 ### Buffer cache
 
-`bread(blockno)` calls `bget`:
+`bread(disk, blockno)` calls `bget`:
 
-1. Under `bc_lock` (a spinlock, IRQs off), it scans the LRU list for a buffer with this `blockno` that is `valid` or referenced. It bumps `refcnt`, drops the spinlock, and sleeps on the buffer's mutex. This waits out another thread that is still reading the block in.
-2. Otherwise it walks the LRU from the tail (least recently used) and takes the first buffer with `refcnt == 0 && pins == 0`. It sets `valid = false` and `refcnt = 1`, then locks the buffer.
+1. Under `bc_lock` (a spinlock, IRQs off), it scans the LRU list for a buffer with this `disk` and `blockno` that is `valid` or referenced. It bumps `refcnt`, drops the spinlock, and sleeps on the buffer's mutex. This waits out another thread that is still reading the block in.
+2. Otherwise it walks the LRU from the tail (least recently used) and takes the first buffer with `refcnt == 0 && pins == 0`. It sets `disk`, `blockno`, `valid = false` and `refcnt = 1`, then locks the buffer.
 3. If no such buffer exists, it prints every held buffer with the code that took it (`dump_held`) and panics with "bcache: no free buffers (a missing brelse?)". This is deliberate: it turns a hang into a diagnosis.
-4. Back in `bread`, if the buffer is not valid, `blk_rw` reads 8 sectors and the buffer is marked valid. On an I/O error it prints `bread: I/O error on block N` and **still marks the buffer valid**.
+4. Back in `bread`, if the buffer is not valid, `blk_rw` reads 8 sectors and the buffer is marked valid. On an I/O error it prints `bread: I/O error on diskD block N` and **still marks the buffer valid**.
 
 The other calls:
 
-- `bwrite` writes the block through to the disk. It panics unless the caller holds the buffer's mutex.
+- `bwrite` writes the block through to its disk (`b->disk`). It panics unless the caller holds the buffer's mutex.
 - `brelse` checks ownership, records `last_used`, unlocks, and when `refcnt` drops to 0 moves the buffer to the head of the LRU.
 - `bpin` and `bunpin` adjust `pins` under `bc_lock`.
 
@@ -284,7 +290,7 @@ The header is one block, and the transaction counts as committed exactly when th
 
 Every block is written twice, once to the log and once home. **Data blocks are journaled as well as metadata**: `efs_write` calls `log_write` on file data blocks.
 
-A crash point is armed by the `fs.crash=after-log|after-commit|mid-install` boot option (read in `log_create`), or at run time by `efs_arm_crash` through the `SYS_debug` call `DBG_FSCRASH` (`dbg fscrash POINT` in `eutils`). When armed, `crash_point` logs `fs.crash=<point>: simulating a power failure during commit N` and calls `platform_exit(3)`, which stops QEMU with exit status 3. `efs_arm_crash` affects only the first efs log created (`the_log`, the root filesystem).
+A crash point is armed by the `fs.crash=after-log|after-commit|mid-install` boot option (read in `log_create`), or at run time by `efs_arm_crash` through the `SYS_debug` call `DBG_FSCRASH` (`dbg fscrash POINT` in `eutils`). When armed, `crash_point` logs `fs.crash=<point>: simulating a power failure during commit N` and calls `platform_exit(3)`, which stops QEMU with exit status 3. Crash points apply only to the first efs log created (`the_log`, the root filesystem): `log_create` reads `fs.crash=` only for that one, and `efs_arm_crash` arms only it, so `/home` never simulates a power failure.
 
 ### Recovery
 
@@ -524,10 +530,10 @@ Because the thread is marked sleeping before any check, a wakeup between a check
 
 ### devfs
 
-`dev_lookup` matches names in the `devs[]` table, and `dev_readdir` lists `.`, `..` and then inodes 2..8 in order. Files and their `chr_ops`:
+`dev_lookup` matches names in the `devs[]` table, and `dev_readdir` lists `.`, `..` and then inodes 2..9 in order, skipping missing disks. Files and their `chr_ops`:
 
 - **`/dev/kmsg`**: `kmsg_open` copies the log ring (`log_ring_copy`, up to `LOG_BUF_SIZE`) into `f->priv`. Reads come from that snapshot.
-- **`/dev/disk0`**: `disk_rd` reads a page at a time with `blk_rw` from `f->off`, up to `blk_capacity() × 512` bytes. There is no write.
+- **`/dev/disk0`, `/dev/disk1`**: `disk_rd` reads a page at a time with `blk_rw` from `f->off`, up to `blk_capacity(disk) × 512` bytes. There is no write. `disk1` (inode 9) exists only when `blk_count() > 1`: `dev_lookup`, `dev_read_inode` and `dev_readdir` skip a disk node whose disk is missing. Disks 2 and 3 have no device node.
 - **`/dev/tty`**: `ctty_open` fails with `-ENXIO` if the process has no controlling terminal. Otherwise it replaces `f->cops` with `tty_ops`. Its placeholder `read`/`write` exist only so `vfs_open`'s capability checks pass.
 
 ### procfs
@@ -563,9 +569,9 @@ A pid directory's `read_inode` fails with `-ENOENT` once the process is gone.
 
 ### Host mkfs and fsck (`tools/mkfs/mkfs.c`)
 
-**`mkfs IMAGE SIZE_MB specs...`** builds the image in memory (`calloc`):
+**`mkfs [--label NAME] IMAGE SIZE_MB specs...`** builds the image in memory (`calloc`):
 
-- It lays out the regions as above and marks the metadata blocks used. It writes the log header magic with `n = 0`.
+- It lays out the regions as above and marks the metadata blocks used. It writes the log header magic with `n = 0`, and copies `--label` into the superblock (`strncpy`, so up to 16 bytes; empty by default).
 - It creates the root directory with `.` and `..`.
 - Then it processes each spec:
   - `/path=hostfile`: a regular file, mode 0755 if the host file is executable, 0644 otherwise.
@@ -573,11 +579,13 @@ A pid directory's `read_inode` fails with `-ENOENT` once the process is gone.
   - `/dir/[:mode[:uid[:gid]]]`: a directory, created with any missing parents.
 - Blocks and inodes are allocated sequentially (`next_block`, `next_ino`).
 
-The Makefile builds `build/fs.img` with `FS_MB ?= 32` from the user programs (`/bin/*`; the `eutils` names are hard links), `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc`, `/dev/`, `/proc/`, `/tmp/:0777`, `/www/`, `/home/` and `/home/guest/:0755:1000:1000`. The image is rebuilt whenever a program changes, which discards run-time files.
+The Makefile builds `build/fs.img` with `FS_MB ?= 32` from the user programs (`/bin/*`; the `eutils` names are hard links), `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc`, `/dev/`, `/proc/`, `/tmp/:0777`, `/www/`, `/home/` and `/home/guest/:0755:1000:1000`. The image is rebuilt whenever a program changes, which discards run-time files. It gets `--label root`.
+
+The persistent `/home` disk, `home.img` (`HOME_IMG ?= home.img` in the top directory, `HOME_MB ?= 64`), is made once with `--label home` and the single spec `/guest/:0755:1000:1000`, so it holds `/guest` owned by uid and gid 1000 (`guest` in `/etc/passwd`, home `/home/guest`). The Makefile never rebuilds it, so what is created there survives `make` and `make clean`; `make clean-home` deletes it. `make run`, `debug` and `qemu-log` attach it as a second virtio disk; the test scenarios do not. The root image keeps its own `/home/guest`, which is what you see when no home disk is attached.
 
 **`mkfs --check IMAGE`** (`do_check`) exits with 0 if clean, 1 if it found errors, 2 for usage or I/O errors. It checks, in order:
 
-1. The superblock: magic (fatal), `bsize`, `size ≤` file size, `logstart == 2`, `inodestart == logstart + nlog`, and that the regions are ordered and `datastart < size`.
+1. The superblock: magic (fatal; the label, if any, is printed as `label NAME`), `bsize`, `size ≤` file size, `logstart == 2`, `inodestart == logstart + nlog`, and that the regions are ordered and `datastart < size`.
 2. The log header: magic, `n ≤ 64`. A committed transaction only produces a *note* ("the kernel replays it at mount"); fsck does not replay it.
 3. That every metadata block is marked used in the bitmap.
 4. Root is a directory. A recursive `check_dir` (depth ≤ 64) checks:
@@ -620,7 +628,7 @@ The `mid-install` point is not part of the scenario. Use it by hand.
 | log space (`log->outstanding`/`committing`) | wait queue, not a lock | admission to a transaction; commit excludes all operations |
 | `inode->lock` | mutex | an inode's fields and contents (data blocks, directory entries) |
 | `buf->lock` | mutex | a buffer's `data` while held |
-| `bc_lock` | spinlock | LRU list, `refcnt`, `pins`, `blockno`/`valid` during lookup, statistics |
+| `bc_lock` | spinlock | LRU list, `refcnt`, `pins`, `disk`/`blockno`/`valid` during lookup, statistics |
 | `icache_lock` | spinlock | the inode list and `refcnt` |
 | `log->lock` | spinlock | log fields |
 | `file_lock` | spinlock | `file.refcnt`; lets other CPUs read descriptor tables (`files_print_fds`) |
@@ -676,6 +684,7 @@ ns_lock  ->  fs_begin_op (log space)  ->  inode lock(s) (dir, then entry)  ->  b
 | Function | Used by |
 |---|---|
 | `vfs_init` | `kinit` |
+| `vfs_mount_disk(type, path, disk)`, `efs_label(disk, out)` | `vfs_init` (`vfs_mount` is the disk-0 form, used for devfs and procfs) |
 | `namei`, `nameiparent`, `iget`, `idup`, `ilock`, `iunlock`, `iput`, `iunlockput` | `exec`, `cred.c`, procfs, tests |
 | `vfs_open`, `file_read`, `file_write`, `file_dup`, `file_close`, `fd_install`, `fd_get` | sockets, exec, ktests |
 | `vfs_read_all(path, &size, &err)` | `exec`: whole file into `kmalloc` memory, max 16 MiB, regular files only |
@@ -715,7 +724,7 @@ Numbers are Linux RISC-V (`lib/include/uapi/syscall.h`).
 
 ### Files
 
-- **`/dev`**: `console`, `tty`, `tty0`, `null`, `zero`, `kmsg`, `disk0`.
+- **`/dev`**: `console`, `tty`, `tty0`, `null`, `zero`, `kmsg`, `disk0`, and `disk1` when a second disk is attached.
 - **`/proc`**: `meminfo`, `slabinfo`, `interrupts`, `threads`, `sched`, `procs`, `mounts`, `bcache`, `blk`, `icache`, `trace`, `virtio`, `uptime`, `pipes`, `tty`, `cpus`, `lockdep`, `profile`.
 - **`/proc/net`**: `dev`, `arp`, `tcp`, `udp`, `stats`.
 - **Per process**: `/proc/<pid>/{status,maps,fds,stack,ustack,cmdline}` and `/proc/self`.
@@ -737,7 +746,8 @@ Numbers are Linux RISC-V (`lib/include/uapi/syscall.h`).
 ### User tools
 
 - `dbg fscrash POINT` and `dbg files` (`eutils`).
-- `make fsck`, which runs `build/tools/mkfs --check build/fs.img`.
+- `make fsck`, which runs `build/tools/mkfs --check build/fs.img`. For the home disk, run `build/tools/mkfs --check home.img` while QEMU is not running.
+- `make clean-home`, which deletes `home.img` (it is recreated, empty except for `/guest`, by the next `make run`).
 
 ## Debugging and observability
 
@@ -782,7 +792,9 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 | panic `log_end without log_begin` | unbalanced `fs_end_op` |
 | panic `ilock of NULL/unreferenced inode`, `iput of inode N with refcnt R (double iput?)` | reference-count bugs |
 | panic `file_close of 'path' with refcnt R (double close?)` | file reference bug |
-| `bread: I/O error on block N` | a disk read failed; the buffer is cached anyway (see Limitations) |
+| `bread: I/O error on diskD block N` | a disk read failed; the buffer is cached anyway (see Limitations) |
+| `mounted efs (diskN) on /home` | the boot found a disk labelled `home` and mounted it |
+| `/home (diskN) not mounted: E` | a disk is labelled `home` but `efs_mount` failed; `/home` is the root filesystem's directory |
 | `efs: out of disk blocks` / `efs: out of inodes` | `ENOSPC` follows |
 | `recovering: replaying committed transaction S (N blocks)` | a crash happened after a commit point; normal after crash tests |
 | `log header has bad magic ...; not replaying` / `log header claims N blocks; not replaying` | a damaged log header; mounting continues without replay |
@@ -816,14 +828,16 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 **Missing features:**
 - No symlinks, no `ftruncate`/`truncate`, no `*at` system calls relative to a directory fd, no mount or unmount system call, no atime.
 - `ctime` is set only when the inode is allocated: `chmod`, `chown` and `link` do not update it.
-- `st_dev` is always 0, so inode numbers from efs, devfs and procfs collide in `stat`.
+- `st_dev` is always 0, so inode numbers from efs, devfs and procfs collide in `stat`, and so do those of the root and `/home` filesystems (both start at inode 1). Tools that detect hard links or loops by (`st_dev`, `st_ino`) can be fooled across the mount.
 - Ids are 16 bits; there are no supplementary groups and no sticky bit.
 - `faccessat` checks the effective ids, where POSIX uses the real ids.
 - `chdir` does not require search (`X`) permission on the target directory itself.
 
 **Limits:**
 - 32 descriptors per process. `PATH_MAX` 256. Names up to 59 bytes, but `struct dirent.d_name` is 59 bytes including the NUL, so `getdents64` truncates a 59-byte name to 58 bytes (`do_getdents64` uses `strlcpy`).
-- 1024 inodes, fixed by mkfs. One disk. A 64-block log.
+- 1024 inodes, fixed by mkfs. A 64-block log per filesystem.
+- Up to four disks (`MAX_DISKS`), but only two are ever mounted: the one labelled `root` (or disk 0) on `/` and the one labelled `home` on `/home`. There is no way to mount another disk or another path, and only disks 0 and 1 have `/dev` nodes. If two disks carry the same label, the lower-numbered one wins silently.
+- All disks share the 128 buffers of the cache.
 - Directories never shrink.
 
 **Pipes:**
@@ -850,7 +864,7 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 - It accepts any `nlog` and `ninodes` without checking that they fit their regions.
 - Its `dir_find` (mkfs side) handles only direct and single-indirect directory blocks.
 
-**Mount-time validation:** `efs_mount` checks only magic, block size and version. A damaged superblock with bad region boundaries is trusted.
+**Mount-time validation:** `efs_mount` checks only magic, block size and version. A damaged superblock with bad region boundaries is trusted. This now matters more, since `home.img` persists across kernel changes.
 
 **Bugs found while reading:**
 - `vfs_read_all` reads `ip->type` after `iunlockput(ip)` on its error path, a use after free when that was the last reference.
@@ -905,7 +919,8 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 12. **Fix the `getdents64` name truncation**: widen `struct dirent.d_name` to 60 bytes, or reject 59-byte names in `efs_link`, so that every name that can be created can also be listed intact. This is an ABI change (`lib/include/uapi/fs.h`, `user/` libc). Impact: low. Effort: small.
 13. **Harden `vfs_getcwd`**: return `-ENAMETOOLONG` when the depth limit is hit instead of returning a partial path, and do not touch `de` unless an entry was found. Impact: low. Effort: small.
 14. **Restrict the crash-injection hook**: require `euid == 0` for `DBG_FSCRASH` in `kernel/proc/syscall.c`, so unprivileged users (e.g. `guest`) cannot stop the machine. Impact: low. Effort: small.
-15. **Better observability for the log**:
+15. **A mount table instead of two fixed labels**: read `/etc/fstab` (label → path) from the root filesystem in `vfs_init`, or add a `mount` system call taking a disk number or label; give every disk a `/dev/diskN` node; and report a distinct `st_dev` per superblock so `(st_dev, st_ino)` identifies a file. Impact: medium. Effort: medium.
+16. **Better observability for the log**:
     - Expose the per-transaction block high-water mark per operation type, and the time threads spend in `"log space"`.
     - Add a trace event for `log_begin` waits.
     - Have `eu-files` in `tools/gdb/eunuchs.py` handle `f->ip == NULL` (pipes and sockets) instead of dereferencing it.

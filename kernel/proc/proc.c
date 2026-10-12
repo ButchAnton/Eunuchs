@@ -291,9 +291,10 @@ static long do_exec(struct proc *p, const char *path, char *const argv[], char *
     tf->regs[10] = argc;
     tf->regs[11] = sp + 8;
     tf->regs[12] = sp + 8 + (argc + 1) * 8;     /* envp */
-    /* User mode, interrupts on after sret, no SUM, FPU off (user code is integer-only). */
-    tf->sstatus = (csr_read(sstatus) & ~(SSTATUS_SPP | SSTATUS_SIE | SSTATUS_SUM | (3UL << 13)))
+    /* User mode, interrupts on after sret, no SUM, FP off until the program uses it. */
+    tf->sstatus = (csr_read(sstatus) & ~(SSTATUS_SPP | SSTATUS_SIE | SSTATUS_SUM | SSTATUS_FS))
                   | SSTATUS_SPIE;
+    current->fp_used = false;
 
     u64 n[2] = { 0, 0 };
     memcpy(n, p->name, sizeof(n));
@@ -470,6 +471,15 @@ long sys_fork(void)
     struct trap_frame *tf = thread_user_tf(t);
     memcpy(tf, thread_user_tf(current), sizeof(*tf));
     tf->regs[10] = 0;                   /* fork() returns 0 in the child */
+    if (current->fp_used) {             /* the child gets a copy of our FP registers */
+        unsigned long fl = csr_read(sstatus) & SSTATUS_SIE;
+        intr_off();
+        fp_save_regs(&current->fp);
+        if (fl)
+            intr_on();
+        t->fp = current->fp;
+        t->fp_used = true;
+    }
     t->proc = child;
     child->thread = t;
     kthread_detach(t);

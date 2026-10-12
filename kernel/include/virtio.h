@@ -72,6 +72,7 @@ struct virtio_buf {
 /* Find and initialize the first device of `device_id`; negotiates `want`
  * features (VIRTIO_F_VERSION_1 is always required). */
 int virtio_find(u32 device_id, u64 want, struct virtio_dev *dev);
+int virtio_find_from(int from, u32 device_id, u64 want, struct virtio_dev *dev);
 int virtq_init(struct virtio_dev *dev, struct virtqueue *q, u16 index, u16 num);
 void virtio_ready(struct virtio_dev *dev);
 /* Queue a chain; returns 0, or -1 if not enough free descriptors. */
@@ -85,10 +86,11 @@ uintptr_t dma_addr(const void *va);     /* physical address of a kernel buffer *
 void virtio_print(int (*print)(const char *fmt, ...));
 
 /* virtio_blk.c */
-int blk_init(void);
-bool blk_present(void);
-u64 blk_capacity(void);                 /* in 512-byte sectors */
-int blk_rw(u64 sector, void *buf, u32 len, bool write);
+#define MAX_DISKS 4
+int blk_init(void);                     /* finds every disk; returns how many */
+int blk_count(void);
+u64 blk_capacity(int disk);             /* in 512-byte sectors */
+int blk_rw(int disk, u64 sector, void *buf, u32 len, bool write);
 void blk_print(int (*print)(const char *fmt, ...));
 
 #endif

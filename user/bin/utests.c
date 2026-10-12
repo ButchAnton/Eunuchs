@@ -3,6 +3,9 @@
  * argument checking. Ends with "UTEST RESULT: PASS|FAIL"; exit status 0/1.
  */
 #include <dirent.h>
+#include <regex.h>
+#include <math.h>
+#include <setjmp.h>
 #include <errno.h>
 #include <eunuchs.h>
 #include <fcntl.h>
@@ -1002,10 +1005,275 @@ static void t_poll_and_select(void)
     close(q[1]);
 }
 
+/* ---- floating point (the kernel switches FP registers lazily) ---- */
+
+static double series(int n)
+{
+    volatile double sum = 0;
+    for (int k = 1; k <= n; k++) {
+        sum += 1.0 / ((double)k * k);
+        if (k % 5000 == 0)
+            sched_yield();              /* let the other process run in between */
+    }
+    return sum;
+}
+
+static void fp_clobber_handler(int sig)
+{
+    (void)sig;
+    /* use the FP registers the interrupted code was using */
+    asm volatile("fmv.d.x ft0, zero\n\tfmv.d.x fs1, zero" ::: "ft0", "fs1");
+}
+
+static void t_float(void)
+{
+    volatile double a = 1.5, b = 2.25;
+    CHECK(a * b == 3.375);
+    CHECK((int)(a / b * 1000) == 666);
+    volatile float f = 0.1f;
+    CHECK((double)f > 0.0999 && (double)f < 0.1001);
+    double want = series(40000);
+    CHECK(want > 1.6449 && want < 1.645);
+
+    /* libm corner cases */
+    volatile double almost_half = 0.49999999999999994, big = 1e16, nan = NAN;
+    CHECK(round(almost_half) == 0 && round(-2.5) == -3 && round(2.5) == 3);
+    CHECK(fabs(sin(big)) <= 1 && fabs(cos(big)) <= 1 && sin(big) != 0);
+    CHECK(fabs(sin(big) * sin(big) + cos(big) * cos(big) - 1) < 1e-12);
+    CHECK(isnan(sinh(nan)) && isnan(cosh(nan)) && isnan(tanh(nan)) && isnan(expm1(nan)));
+
+    /* two processes computing at once must not see each other's registers */
+    pid_t kids[2];
+    for (int i = 0; i < 2; i++) {
+        kids[i] = fork();
+        if (kids[i] == 0)
+            _exit(series(40000) == want ? 0 : 1);
+    }
+    for (int i = 0; i < 2; i++) {
+        int st;
+        CHECK(waitpid(kids[i], &st, 0) == kids[i] && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+
+    /* a forked child starts with the parent's FP registers */
+    double inherited;
+    asm volatile("fld fs2, %0" :: "m"(want) : "fs2");
+    pid_t pid = fork();
+    if (pid == 0) {
+        asm volatile("fsd fs2, %0" : "=m"(inherited));
+        _exit(inherited == want ? 0 : 1);
+    }
+    int st;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    /* a signal handler that uses FP must not change the interrupted code's registers */
+    struct sigaction sa = { .sa_handler = fp_clobber_handler };
+    sigaction(SIGUSR1, &sa, 0);
+    double before = 42.5, after0 = 0, after1 = 0;
+    register long a0 asm("a0") = getpid();
+    register long a1 asm("a1") = SIGUSR1;
+    register long a7 asm("a7") = SYS_kill;
+    asm volatile("fld ft0, %3\n\t"
+                 "fld fs1, %3\n\t"
+                 "ecall\n\t"                /* kill(getpid(), SIGUSR1): the handler runs on return */
+                 "fsd ft0, %0\n\t"
+                 "fsd fs1, %1"
+                 : "=m"(after0), "=m"(after1), "+r"(a0)
+                 : "m"(before), "r"(a1), "r"(a7)
+                 : "ft0", "fs1", "memory");
+    CHECK(after0 == 42.5 && after1 == 42.5);
+    signal(SIGUSR1, SIG_DFL);
+}
+
+/* ---- the C library ---- */
+
+static int str_is(const char *got, const char *want)
+{
+    if (!strcmp(got, want))
+        return 1;
+    printf("      got \"%s\", want \"%s\"\n", got, want);
+    return 0;
+}
+
+static int near(double a, double b)
+{
+    double d = a - b;
+    if (d < 0)
+        d = -d;
+    double m = b < 0 ? -b : b;
+    return d <= 1e-14 * (m > 1 ? m : 1);
+}
+
+static int cmp_int(const void *a, const void *b)
+{
+    return *(const int *)a - *(const int *)b;
+}
+
+static jmp_buf jb;
+static volatile int jump_depth;
+static void jump_deep(void);
+static void (*volatile jump_again)(void) = jump_deep;   /* (hides the recursion from -Winfinite-recursion) */
+static void jump_deep(void)
+{
+    if (jump_depth-- <= 0)
+        longjmp(jb, 42);
+    jump_again();
+}
+
+static void t_libc(void)
+{
+    char b[128];
+    snprintf(b, sizeof(b), "%.3f|%e|%g|%g|%g|%8.2f|%-6.1f|%+.0f", 3.14159, 12345.678, 0.0001,
+             1e20, 100.0, -2.5, 1.25, 2.5);
+    CHECK(str_is(b, "3.142|1.234568e+04|0.0001|1e+20|100|   -2.50|1.2   |+2"));
+    snprintf(b, sizeof(b), "%.17g|%a|%.0e|%f|%g", 0.1, 1.0, 9.5, 1e-7, 123456789.0);
+    CHECK(str_is(b, "0.10000000000000001|0x1p+0|1e+01|0.000000|1.23457e+08"));
+    snprintf(b, sizeof(b), "%f %F %g", 1.0 / 0.0, -1.0 / 0.0, 0.0 / 0.0);
+    CHECK(str_is(b, "inf -INF nan") || str_is(b, "inf -INF -nan"));
+    CHECK(strtod("1e-3", 0) == 0.001 && strtod("0x1.8p1", 0) == 3.0 && strtod("-.5", 0) == -0.5);
+    CHECK(strtod("2.2250738585072014e-308", 0) == 2.2250738585072014e-308);
+    char *end;
+    CHECK(strtol("  -0x1f!", &end, 0) == -31 && *end == '!');
+    CHECK(strtoul("777", 0, 8) == 511 && strtoull("18446744073709551615", 0, 10) == ~0ULL);
+
+    int i, n;
+    double d;
+    char w[16];
+    CHECK(sscanf("12 3.5 word 0x10", "%d %lf %15s %i%n", &i, &d, w, &n, &n) == 4 && i == 12 &&
+          d == 3.5 && !strcmp(w, "word") && n == 16);
+    CHECK(sscanf("abc:def", "%[a-z]:%s", w, b) == 2 && !strcmp(w, "abc") && !strcmp(b, "def"));
+    /* fscanf reads ahead ("12abc" looks like hex digits) and must give the rest back */
+    FILE *sf = fopen("/tmp/.utest-scanf", "w+");
+    CHECK(sf != 0);
+    if (sf) {
+        fputs("12abc 7\n", sf);
+        rewind(sf);
+        CHECK(fscanf(sf, "%d%s%n", &i, w, &n) == 2 && i == 12 && !strcmp(w, "abc") && n == 5);
+        CHECK(fscanf(sf, "%d", &i) == 1 && i == 7);
+        fclose(sf);
+        unlink("/tmp/.utest-scanf");
+    }
+
+    int v[] = { 5, 3, 9, 1, 7, 2, 8, 6, 4, 0, 11, 15, 13, 12, 14, 10 };
+    qsort(v, 16, sizeof(int), cmp_int);
+    int sorted = 1;
+    for (int k = 0; k < 16; k++)
+        sorted &= v[k] == k;
+    CHECK(sorted);
+    int key = 13;
+    CHECK(bsearch(&key, v, 16, sizeof(int), cmp_int) == &v[13]);
+
+    volatile int stage = 0;
+    int r = setjmp(jb);
+    if (r == 0) {
+        stage = 1;
+        jump_depth = 10;
+        jump_deep();
+    }
+    CHECK(r == 42 && stage == 1);
+
+    FILE *f = fopen("/tmp/ut_stdio", "w+");
+    CHECK(f != 0);
+    if (f) {
+        fprintf(f, "line one\nline %d\n", 2);
+        CHECK(ftell(f) == 16);
+        rewind(f);
+        CHECK(fgets(b, sizeof(b), f) && !strcmp(b, "line one\n"));
+        CHECK(fgetc(f) == 'l' && ungetc('L', f) == 'L' && fgetc(f) == 'L');
+        fseek(f, -2, SEEK_END);
+        CHECK(fgetc(f) == '2' && fgetc(f) == '\n' && fgetc(f) == EOF && feof(f));
+        fclose(f);
+        unlink("/tmp/ut_stdio");
+    }
+
+    time_t t = 86400 * 365 + 3661;      /* 1971-01-01 01:01:01 */
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S %a %j", &tm);
+    CHECK(str_is(b, "1971-01-01 01:01:01 Fri 001"));
+    CHECK(timegm(&tm) == t);
+
+    CHECK(near(sin(M_PI / 6), 0.5) && near(cos(M_PI / 3), 0.5) && near(tan(M_PI / 4), 1));
+    CHECK(near(exp(1), M_E) && near(log(M_E), 1) && near(log10(1000), 3) && near(pow(2, 0.5), M_SQRT2));
+    CHECK(near(atan2(1, 1), M_PI / 4) && near(asin(1), M_PI_2) && near(sqrt(2), M_SQRT2));
+    CHECK(floor(-1.5) == -2 && ceil(-1.5) == -1 && round(2.5) == 3 && fmod(10, 3) == 1);
+    CHECK(near(cbrt(27), 3) && near(hypot(3, 4), 5) && pow(2, 10) == 1024);
+
+    char *argv[] = { "prog", "-a", "-b", "val", "-cfoo", "rest", 0 };
+    optind = 1;
+    opterr = 0;
+    int a = 0, c;
+    char seen[32] = "";
+    while ((c = getopt(6, argv, "ab:c:")) != -1) {
+        a++;
+        snprintf(seen + strlen(seen), sizeof(seen) - strlen(seen), "%c%s", c, optarg && c != 'a' ? optarg : "");
+    }
+    CHECK(a == 3 && str_is(seen, "abvalcfoo") && optind == 5);
+    CHECK(realpath("/tmp/../bin/./ls", b) && str_is(b, "/bin/ls"));
+
+    char text[] = "a,b,,c";
+    char *save, *tok = strtok_r(text, ",", &save);
+    CHECK(tok && !strcmp(tok, "a") && !strcmp(strtok_r(0, ",", &save), "b") &&
+          !strcmp(strtok_r(0, ",", &save), "c") && !strtok_r(0, ",", &save));
+    CHECK(strcasecmp("HeLLo", "hello") == 0 && strpbrk("hello", "lo") && !strncmp(strdup("dup"), "dup", 3));
+    char *s2;
+    CHECK(asprintf(&s2, "%d-%s", 7, "x") == 3 && !strcmp(s2, "7-x"));
+}
+
+static int rx(const char *pat, int flags, const char *s, int so, int eo, int g1so, int g1eo)
+{
+    regex_t re;
+    regmatch_t m[3];
+    int r = regcomp(&re, pat, flags);
+    if (r) {
+        char e[64];
+        regerror(r, &re, e, sizeof(e));
+        printf("      regcomp(\"%s\"): %s\n", pat, e);
+        return 0;
+    }
+    r = regexec(&re, s, 3, m, 0);
+    regfree(&re);
+    if (so < 0)
+        return r == REG_NOMATCH;
+    int ok = r == 0 && m[0].rm_so == so && m[0].rm_eo == eo &&
+             (g1so == -2 || (m[1].rm_so == g1so && m[1].rm_eo == g1eo));
+    if (!ok)
+        printf("      \"%s\" on \"%s\": r=%d [%ld,%ld) g1 [%ld,%ld)\n", pat, s, r, (long)m[0].rm_so,
+               (long)m[0].rm_eo, (long)m[1].rm_so, (long)m[1].rm_eo);
+    return ok;
+}
+
+static void t_regex(void)
+{
+    int E = REG_EXTENDED;
+    CHECK(rx("a.c", 0, "xxabcx", 2, 5, -2, 0));
+    CHECK(rx("^ab*$", 0, "abbb", 0, 4, -2, 0));
+    CHECK(rx("^ab*$", 0, "abbc", -1, 0, 0, 0));
+    CHECK(rx("\\(ab\\)*c", 0, "xababc", 1, 6, 3, 5));
+    CHECK(rx("(ab)+c", E, "xababc", 1, 6, 3, 5));
+    CHECK(rx("colou?r", E, "my color", 3, 8, -2, 0));
+    CHECK(rx("cat|dog", E, "hotdog", 3, 6, -2, 0));
+    CHECK(rx("x\\{2,3\\}", 0, "axxxxb", 1, 4, -2, 0));
+    CHECK(rx("[[:digit:]]+", E, "ab123c", 2, 5, -2, 0));
+    CHECK(rx("[^a-c]", 0, "abcd", 3, 4, -2, 0));
+    CHECK(rx("\\<word\\>", 0, "swords word", 7, 11, -2, 0));
+    CHECK(rx("(a)\\1", E, "xaay", 1, 3, 1, 2));
+    CHECK(rx("HELLO", REG_ICASE, "say hello", 4, 9, -2, 0));
+    CHECK(rx("a*", 0, "bbb", 0, 0, -2, 0));
+    CHECK(rx("(a|ab)(c|bcd)", E, "abcd", 0, 4, 0, 1));
+    regex_t re;
+    CHECK(regcomp(&re, "a\\(b", 0) == REG_EPAREN);
+    CHECK(regcomp(&re, "[ab", 0) == REG_EBRACK);
+    CHECK(regcomp(&re, "[[:al:]]", 0) == REG_ECTYPE);      /* class names are exact */
+    CHECK(rx("[[:alpha:]]+", E, "12ab3", 2, 4, -2, 0));
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
 } tests[] = {
+    { "regex", t_regex },
+    { "libc", t_libc },
+    { "float", t_float },
     { "tcp_loopback_echo", t_tcp_loopback_echo },
     { "tcp_errors", t_tcp_errors },
     { "nonblocking_sockets", t_nonblocking_sockets },

@@ -12,7 +12,7 @@ This subsystem:
 - dispatches interrupts: the supervisor timer (`timer.c`), external interrupts through the PLIC (`plic.c`), and software interrupts (IPIs, handled in `smp.c`);
 - programs the periodic tick through SBI, keeps `jiffies`, and runs the hard-lockup watchdog;
 - dispatches `ecall` system calls through a table generated from `lib/include/uapi/syscall.h`, and implements strace;
-- handles user exceptions (demand paging, copy-on-write, fatal faults that become signals) and kernel exceptions (lazy kernel page-table sync, exception-table fixups, breakpoints, otherwise panic);
+- handles user exceptions (demand paging, copy-on-write, enabling floating point on a thread's first FP instruction, fatal faults that become signals) and kernel exceptions (lazy kernel page-table sync, exception-table fixups, breakpoints, otherwise panic);
 - runs the "return to user" checks: preemption, signal delivery, system call restart;
 - provides `cpu_wait_ticks` (a `wfi`-based sleep for code that polls with interrupts off) and semihosting calls (host file I/O for trace and profile dumps).
 
@@ -47,6 +47,7 @@ It does **not** own:
 | `user/lib/crt0.S` | User `_start`: sets `gp`, ends the frame chain, calls `__libc_start`. |
 | `kernel/proc/signal.c` | `signal_deliver`, `syscall_restart_check`, `do_rt_sigreturn` (only the trap-return interaction is covered here). |
 | `kernel/arch/riscv/boot.S` | Defines `boot_stack` and `overflow_stack` in guard-padded slots (section `.stacks`). |
+| `kernel/arch/riscv/fp.S` | `fp_save_regs` / `fp_load_regs`: copy the user FP registers (`f0`–`f31`, `fcsr`) between the hardware and a `struct fpstate`. The only kernel code with FP instructions (it enables the D extension for itself). |
 
 ## Concepts and data structures
 
@@ -145,7 +146,7 @@ For GDB, `kernel_trap_entry` carries DWARF CFI: `.cfi_signal_frame` (so GDB show
 |---|---|---|
 | `EXC_INSN_MISALIGNED` | 0 | SIGBUS / panic |
 | `EXC_INSN_ACCESS` | 1 | SIGSEGV / panic |
-| `EXC_ILLEGAL_INSN` | 2 | SIGILL (with a floating-point hint) / panic |
+| `EXC_ILLEGAL_INSN` | 2 | first FP instruction: enable FP for the thread; otherwise SIGILL / panic |
 | `EXC_BREAKPOINT` | 3 | debug monitor / semihosting fallback, `trap_breakpoint_hook`, or monitor |
 | `EXC_LOAD_MISALIGNED`, `EXC_STORE_MISALIGNED` | 4, 6 | SIGBUS / exception-table fixup or panic |
 | `EXC_LOAD_ACCESS`, `EXC_STORE_ACCESS` | 5, 7 | SIGSEGV / exception-table fixup or panic |
@@ -321,6 +322,16 @@ Handlers that need the full user register state use `thread_user_tf(current)`: `
 
 `kernel/proc/proc.c: user_fault` either queues the signal (if the program has a handler and has not blocked it — delivered on the way out) or prints a diagnosis (NULL dereference, kernel address, user stack overflow, VMA permissions), a symbolized user backtrace and the memory map, and kills the process with the signal and core flag.
 
+### Lazy floating point for user programs
+
+The kernel is built without floating point (`-march=rv64imac_zicsr_zifencei -mabi=lp64`), so the FP registers only ever hold user state. User programs are built for `rv64gc`/`lp64d` (see [build and testing](11-build-and-testing.md)). FP state is per thread and enabled on first use:
+
+1. `do_exec` starts every program with `sstatus.FS` = Off in its trap frame and `current->fp_used = false`.
+2. The program's first FP instruction traps as an illegal instruction. `user_exception` sees `FS` off and `fp_used` false, zeroes `current->fp` (so the thread never sees another process's registers), sets `fp_used`, loads the zeroed state with `fp_load_regs`, sets `FS` = Initial (`SSTATUS_FS_INITIAL`) in the trap frame, and returns. `sret` retries the instruction, which now runs.
+3. From then on the hardware moves `FS` to Dirty as the program writes FP registers. The scheduler saves and restores the registers around every context switch of an `fp_used` thread ([04](04-threads-scheduling-smp.md)); `fork` copies them and signal frames carry them ([05](05-processes-and-signals.md)).
+
+`fp_save_regs` and `fp_load_regs` (`fp.S`) set `sstatus.FS` to Initial in the *kernel's* `sstatus` before touching the registers (FP instructions trap when `FS` is Off, in S-mode too). The user's `FS` lives in `tf->sstatus` and takes effect at `sret`. `struct fpstate` is `{u64 f[32]; u64 fcsr;}` (`kernel/include/sched.h`); `fsd`/`fld` store the full 64 bits of each register.
+
 ### Kernel exceptions
 
 1. **Lazy kernel page-table sync.** A page fault on an address ≥ `KERNEL_BASE` calls `vm_kernel_fault_fixup`, which copies a top-level entry that another CPU added to the kernel page table after this process's page table copied the kernel half. Returns true if it fixed something; the instruction is retried.
@@ -375,6 +386,7 @@ Because the checks run at every return from user-mode traps, a signal sent to a 
 - **PLIC.** Only cpu0 has `SEIE`, so `plic_handle` and every device handler run on cpu0 only. `irqs[]` is written by `irq_register` at boot (no lock; the enable-bit read-modify-write is unlocked too) and read by `plic_handle` and `irq_print`. Device handlers synchronize with process-context code through their own spinlocks.
 - **Timer.** `interval` and `per_tick` are written by `timer_set_profile_hz` with atomic stores and read with plain loads in `timer_interrupt` (aligned 64-/32-bit loads, so not torn). `lockup_reported` is claimed by CAS so only one CPU reports a given lockup.
 - **System call state** (`syscall_restart`, `restart_a0`, `nanosleep_*`, `strace_buf`) belongs to the process's only thread and is touched only by it. `sig_pending` is changed under `proc_lock` by senders and by `signal_deliver`'s dequeue.
+- **FP registers.** The live FP registers belong to the thread running on the CPU. The first-use path in `user_exception` runs with interrupts off; once `fp_used` is set, a preemption before `sret` saves and restores them like any other switch.
 - **SMP and traps.** A thread preempted inside a kernel trap may resume on another CPU; its trap frame stays on its own kernel stack, and `kstack_top` is updated at every switch so the next user trap lands on the right stack.
 
 ## Interfaces
@@ -531,7 +543,6 @@ Strings are cut at 40 bytes, buffers at 32, argv at 6 elements of 24 bytes; `brk
 | `unexpected <cause> (scause=...); masked` | An interrupt code other than timer, external or software arrived; it is now disabled on that CPU. |
 | `[pid name] unknown system call N` | `a7` outside the table. The call returns `ENOSYS`. |
 | `pid N (name) killed by SIGSEGV: <cause>: no mapping at 0x... -- NULL pointer dereference` | From `user_fault`; followed by the user backtrace and memory map. |
-| `floating point is not supported in user mode yet` | User code executed an FP load with `FS` off. Build user code integer-only. |
 | `fault at ... (addr ...) fixed up -> ...` | (`log=trap:trace`) an exception-table fixup happened, e.g. `EFAULT` from a bad user pointer. |
 | `irq_register(N, name) failed` | No PLIC, IRQ 0 or ≥ 64, or already registered. |
 
@@ -539,8 +550,9 @@ Strings are cut at 40 bytes, buffers at 32, argv at 6 elements of 24 bytes; `brk
 
 ## Limitations and known issues
 
-- **No floating point in user mode.** `sstatus.FS` is 0 for user processes (`do_exec`); any FP instruction is SIGILL. The friendly message only recognizes the uncompressed LOAD-FP opcode (`0x07`); stores, arithmetic and compressed FP instructions get the generic "illegal instruction".
+- **FP state is saved eagerly once used.** `FS` is never checked for Dirty: every switch away from an `fp_used` thread saves all 32 registers and `fcsr`, and every switch back loads them, even if the thread has not touched FP since. A thread that used FP once pays this until it execs.
 - **User `ebreak` stops the whole machine** in the monitor instead of delivering SIGTRAP. There is no ptrace-style user debugging.
+- **A genuinely illegal instruction costs two traps** in a program that has not used FP: the first is taken as "first FP use" (the opcode is not inspected) and enables FP; the retry then faults with `FS` on and gets SIGILL.
 - **`SYS_debug` has no permission checks.** Any process can stop the machine (`DBG_BREAK`), arm a simulated filesystem crash (`DBG_FSCRASH`), and start the profiler and write its output to a host path of its choice through semihosting (`DBG_PROFILE` op 3).
 - **After a kernel stack overflow, the CPU cannot take another trap.** `overflow_sp` is never cleared and `stack_overflow` halts on the second call, so a faulting `safe_read` during the overflow report or later in the monitor (e.g. `mem` at a bad address) exits QEMU with the misleading "overflow while handling an overflow" message.
 - **Overflow margin is a heuristic.** Entry needs 560 bytes (`FRAME_SIZE + 256`) below `sp`. A trap that arrives with less is reported as an overflow even if the thread would not have overflowed; a handler that needs more than 256 bytes past the frame on a nearly full stack overflows inside the handler (still caught, by the guard page).
@@ -575,6 +587,6 @@ Strings are cut at 40 bytes, buffers at 32, argv at 6 elements of 24 bytes; `brk
 10. **Linux-compatible `nanosleep` interruption** — Return a distinct internal code (like `ERESTART_RESTARTBLOCK`) so a handler always yields `EINTR` with the remaining time, and only handler-less interruptions restart. Impact: low. Effort: small.
 11. **`__restore_rt` safety net** — Follow its `ecall` with an `unimp` (or a call to `_exit`), so a failed `rt_sigreturn` cannot fall through into unrelated code. Impact: low. Effort: small.
 12. **Show `missed_ticks` and per-CPU exceptions** — Add missed ticks to `/proc/interrupts`/`cpus`, count ticks lost in `cpu_wait_ticks`, and add per-syscall counts (and optionally latency) to a `/proc/syscalls` file. Cheap observability for timer and syscall behavior. Impact: low. Effort: small.
-13. **Better FP diagnosis, then FP support** — Recognize all FP opcodes (including compressed ones) in the SIGILL message now; later enable `FS` lazily for user processes and save FP state on context switch. Impact: medium. Effort: large (for FP support).
+13. **Save FP state only when dirty** — Check `sstatus.FS` (or `tf->sstatus`) for Dirty before `fp_save_regs` and set it back to Clean afterwards, and turn `FS` off again for a thread that has not used FP for a while, so FP-using threads that are mostly integer stop paying 33 loads and stores per switch. Impact: low. Effort: small.
 14. **Resolve kernel uaccess faults with interrupts on when allowed** — In `trap_handler`, enable interrupts around `uvm_fault` if the frame's `SPIE` was set, matching the user-fault path and cutting interrupt latency during COW copies. Impact: low. Effort: small.
 15. **Sorted exception table** — Sort `__ex_table` at build or boot and binary-search it in `extable_lookup` (called twice per kernel memory fault). Small today, but grows with every new uaccess/safe accessor. Impact: low. Effort: small.

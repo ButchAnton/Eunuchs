@@ -53,7 +53,7 @@ Out of scope: the efs on-disk format and the fsck rules (see the filesystem docu
 | Python | `PYTHON` | `python3` | `gen_ksyms.py`, `run_tests.py`, `ci.py`, `timeout.py`, trace/profile tools, `test_fsck.py` |
 | Host compiler | `HOSTCC` | `clang` | `mkfs` and the host tests |
 
-Install with `brew install qemu riscv64-elf-gcc riscv64-elf-gdb` (README). The Homebrew GCC must have multilib `libgcc` for both `rv64gc/lp64d` (kernel) and `rv64imac/lp64` (user), because both links pass `-lgcc`. The Makefile is written for GNU Make 3.81, the version macOS ships: user build rules are placed before the generic kernel pattern rules because 3.81 picks the first matching pattern rule, not the most specific one (comment "rules before the generic kernel ones" in `Makefile`).
+Install with `brew install qemu riscv64-elf-gcc riscv64-elf-gdb` (README). The Homebrew GCC must have multilib `libgcc` for both `rv64imac/lp64` (kernel) and `rv64gc/lp64d` (user), because both links pass `-lgcc`. The Makefile is written for GNU Make 3.81, the version macOS ships: user build rules are placed before the generic kernel pattern rules because 3.81 picks the first matching pattern rule, not the most specific one (comment "rules before the generic kernel ones" in `Makefile`).
 
 ### Compiler flags and why
 
@@ -61,7 +61,7 @@ Install with `brew install qemu riscv64-elf-gcc riscv64-elf-gdb` (README). The H
 
 | Flag | Why |
 |---|---|
-| `-march=rv64gc -mabi=lp64d` | The QEMU `virt` harts are RV64GC |
+| `-march=rv64imac_zicsr_zifencei -mabi=lp64` | No floating point in the kernel. The FP registers belong to user threads and are saved only at context switches of threads that use them, so kernel code must never touch them; with no F/D extension the compiler cannot emit an FP instruction. `kernel/arch/riscv/fp.S`, the save/restore code, turns D on for itself with `.option arch, +d`. `zicsr` and `zifencei` are spelled out because newer GCCs no longer imply them in `rv64imac` |
 | `-mcmodel=medany` | PC-relative addressing for globals. The kernel is linked at `0xffffffc080200000` (far from address 0, which `medlow` requires) and its first instructions in `boot.S` run at the physical load address before paging is on; PC-relative code works at both |
 | `-ffreestanding -fno-builtin -nostdlib` | No host libc; the kernel has its own `memcpy`, `printf` etc. |
 | `-fno-tree-loop-distribute-patterns` | Stops GCC from turning loops into calls to `memset`/`memcpy` (which would recurse inside those functions, or call a function that does not exist) |
@@ -81,11 +81,12 @@ Same as the kernel except:
 
 | Flag | Why |
 |---|---|
-| `-march=rv64imac -mabi=lp64` | Integer only. The kernel does not save FP state for user threads and starts every process with `sstatus.FS` = Off (`kernel/proc/proc.c`, exec path); an FP instruction kills the process with a message (`kernel/arch/riscv/trap.c`) |
+| `-march=rv64gc -mabi=lp64d` | Full RV64GC with hardware floating point and the hard-float ABI. Every program starts with `sstatus.FS` = Off; its first FP instruction traps and the kernel gives the thread zeroed FP registers, then saves and restores them at context switches ([03](03-traps-interrupts-syscalls.md#lazy-floating-point-for-user-programs)) |
 | `-nostdinc -isystem $(GCC_INC)` | Only Eunuchs's own headers (`user/include`, `lib/include`) plus GCC's freestanding headers (`stdarg.h` etc.) from `$(CC) -print-file-name=include` |
 | `-Iuser/include -Ilib/include` | The user libc headers and the shared `uapi/` headers (system call numbers, errno, signals) |
+| `-DFMT_FLOAT` | Compiles the floating-point conversions (`%f %e %g %a`) into the user copy of `lib/printf.c`; the kernel copy is built without them |
 
-User link: `$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ prog.o $(ULIB) -lgcc`, where `ULIB` is `crt0.o syscall.o libc.o printf.o string.o net.o` from `build/user/lib/`. `lib/printf.c` and `lib/string.c` are compiled twice: into the kernel with `CFLAGS` and into `build/user/lib/` with `UCFLAGS` (explicit rules in the Makefile).
+User link: `$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ prog.o $(ULIB) -lgcc`, where `ULIB` is `crt0.o` first, then an object for every other `user/lib/*.c` and `user/lib/*.S` (found with `wildcard`, so a new libc file needs no Makefile change), then `printf.o` and `string.o`, all from `build/user/lib/`. `lib/printf.c` and `lib/string.c` are compiled twice: into the kernel with `CFLAGS` and into `build/user/lib/` with `UCFLAGS` (explicit rules in the Makefile).
 
 **Host tools and tests**
 
@@ -151,7 +152,7 @@ The kernel's `ksym_lookup`/`ksym_find`/`ksym_format` (`kernel/debug/ksyms.c`) se
 
 ### Disk image contents (`FS_FILES` in the Makefile)
 
-`$(MKFS) build/fs.img $(FS_MB) $(FS_FILES)` with `FS_MB ?= 32`. Spec syntax (from `do_mkfs` in `tools/mkfs/mkfs.c`):
+`$(MKFS) --label root build/fs.img $(FS_MB) $(FS_FILES)` with `FS_MB ?= 32`. The label is how the kernel recognizes the root disk when several are attached. Spec syntax (from `do_mkfs` in `tools/mkfs/mkfs.c`):
 
 | Spec | Meaning |
 |---|---|
@@ -163,8 +164,11 @@ What goes in:
 
 - every `user/bin/*.c` program as `/bin/<name>` (stripped copy);
 - hard links to `/bin/eutils` for `echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile true false yes kill date dmesg free sleep strace su dbg uname clear` (`EUTILS_LINKS`);
-- `/etc/motd`, `/etc/passwd` from `user/etc/`, `/www/index.html` from `user/www/`;
+- hard links `/bin/sh` → `esh` and `/bin/less` → `more`;
+- `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` from `user/etc/`, `/www/index.html` from `user/www/`;
 - empty `/dev/`, `/proc/`, `/tmp/` (mode 0777), `/www/`, `/home/`, and `/home/guest/` (0755, uid 1000, gid 1000).
+
+**The home disk.** `home.img` (`HOME_IMG ?= home.img`, in the top directory, not `build/`) is a separate image made by `$(MKFS) --label home home.img $(HOME_MB) /guest/:0755:1000:1000` with `HOME_MB ?= 64`. Its rule has only an order-only dependency on mkfs, so it is created once and never rebuilt: files saved under `/home` survive `make`, `make clean` and kernel changes. `make clean-home` deletes it. `*.img` is in `.gitignore`.
 
 The mkfs layout: block 1 superblock, the log from block 2 (`EFS_LOGSIZE + 1` blocks), inode blocks for 1024 inodes, the bitmap, then data. Exit codes: 0 clean, 1 errors found, 2 usage or I/O error.
 
@@ -210,7 +214,7 @@ All boots share one scratch image, `build/test-fs.img`, copied from `build/fs.im
 ### User programs and the disk image
 
 1. `build/user/lib/*.o` from `user/lib/*.{c,S}` and `lib/{printf,string}.c`.
-2. Each `user/bin/X.c` becomes `build/user/bin/X.o`, then links to `build/user/bin/X` (`user: $(UPROGS)`). Each directory `user/bin/X/` (`UMULTI`; today only `esh`) is compiled into `build/user/multi/X/*.o` and linked into one program `build/user/bin/X` by a rule generated from `MULTI_RULE`.
+2. Each `user/bin/X.c` becomes `build/user/bin/X.o`, then links to `build/user/bin/X` (`user: $(UPROGS)`). Each directory `user/bin/X/` (`UMULTI`; today `esh` and `edit`) is compiled into `build/user/multi/X/*.o` and linked into one program `build/user/bin/X` by a rule generated from `MULTI_RULE`.
 3. `objcopy --strip-debug` produces `build/user/stripped/X`.
 4. `build/tools/mkfs` is built from `tools/mkfs/mkfs.c` (it depends on `kernel/include/efs_format.h`).
 5. `build/fs.img` is rebuilt from scratch whenever mkfs, any stripped program, or anything in `user/etc/` or `user/www/` changes. **This discards files created at run time** (Makefile comment on the `$(FSIMG)` rule).
@@ -235,6 +239,12 @@ Disk (`DISKOPTS`, a function of the image path):
     -device virtio-blk-device,drive=hd0
 ```
 
+Home disk (`HOMEOPTS`, part of `QEMUOPTS`, so used by `run`, `debug` and `qemu-log` only; the test scenarios, `stress` and record/replay boot with the root disk alone):
+
+```
+-drive file=home.img,if=none,format=raw,id=hd1 -device virtio-blk-device,drive=hd1
+```
+
 Network (`NETOPTS`, used by `run`, `debug`, `qemu-log`):
 
 ```
@@ -245,7 +255,7 @@ Network (`NETOPTS`, used by `run`, `debug`, `qemu-log`):
 
 | Target | Command |
 |---|---|
-| `run` | `QEMUBASE + DISKOPTS(build/fs.img) + NETOPTS -append "$(APPEND)"` |
+| `run` | `QEMUBASE + DISKOPTS(build/fs.img) + HOMEOPTS + NETOPTS -append "$(APPEND)"` |
 | `debug` | as `run` plus `-s -S` (GDB stub on TCP 1234, CPUs halted) |
 | `gdb` | `riscv64-elf-gdb -q -x tools/gdb/init.gdb build/kernel.elf` (connects to `localhost:1234`, loads `tools/gdb/eunuchs.py`) |
 | `qemu-log` | as `run` plus `-d int,guest_errors,unimp -D build/qemu.log` |
@@ -305,7 +315,7 @@ KTEST RESULT: PASS|FAIL
 
 ### The user test run (`utest`)
 
-With `utest` (no value) `kinit` spawns `/bin/init -1 /bin/utests`, which runs `utests` once and exits with its status. `utests` runs all 40 entries of its `tests[]` table in order. Each prints `[ RUN      ]`, calls `dbg_mark(name)` (a trace marker), and prints `[       OK ]` or `[  FAILED  ]`. `CHECK(cond)` prints the file and line and marks the test failed. At the end it writes `/home/persist.txt` ("survives reboots") for the next stage and prints `UTEST RESULT:`.
+With `utest` (no value) `kinit` spawns `/bin/init -1 /bin/utests`, which runs `utests` once and exits with its status. `utests` runs all 43 entries of its `tests[]` table in order. Each prints `[ RUN      ]`, calls `dbg_mark(name)` (a trace marker), and prints `[       OK ]` or `[  FAILED  ]`. `CHECK(cond)` prints the file and line and marks the test failed. At the end it writes `/home/persist.txt` ("survives reboots") for the next stage and prints `UTEST RESULT:`.
 
 With `utest=<mode>`, `kinit` passes the mode as `argv[1]` and `utests` runs `scenario(mode)` instead of the suite. After `ktest` and/or `utest`, if `tracedump=<path>` is set, `kinit` writes the trace buffer to that host path through semihosting, then calls `platform_exit(failed ? 1 : 0)`.
 
@@ -404,10 +414,10 @@ Workers report a `struct result` through a pipe. The parent prints totals, the f
 | `all` (default) | kernel, image | Build `build/kernel.elf` and `build/fs.img` (and so all user programs and mkfs) |
 | `user` | | Build all user programs |
 | `fsck` | mkfs | `build/tools/mkfs --check build/fs.img` |
-| `run` | kernel, image | Boot interactively with disk and NIC |
-| `debug` | kernel, image | As `run`, halted, GDB stub on :1234 |
+| `run` | kernel, image, `home.img` | Boot interactively with the root and home disks and a NIC |
+| `debug` | kernel, image, `home.img` | As `run`, halted, GDB stub on :1234 |
 | `gdb` | kernel | Attach GDB with `tools/gdb/init.gdb` |
-| `qemu-log` | kernel, image | As `run`, with QEMU tracing of interrupts, guest errors and unimplemented features to `build/qemu.log` |
+| `qemu-log` | kernel, image, `home.img` | As `run`, with QEMU tracing of interrupts, guest errors and unimplemented features to `build/qemu.log` |
 | `disasm` | kernel | `objdump -dS` to `build/kernel.asm` |
 | `test` | kernel, image, mkfs | The 16-stage scenario |
 | `stress` | kernel, image, mkfs | SMP soak for `STRESS_SECS`, then fsck |
@@ -438,6 +448,8 @@ Internal file targets you may name directly: `build/kernel.elf`, `build/kernel.p
 | `TEST_TIMEOUT` | `60` | Seconds per boot/fsck stage in `make test` |
 | `STRESS_SECS` | `120` | Duration of `make stress` (`ci.py` uses 60 unless overridden) |
 | `FS_MB` | `32` | Disk image size |
+| `HOME_IMG` | `home.img` | The persistent `/home` disk image |
+| `HOME_MB` | `64` | Its size when it is created (an existing image is not resized) |
 | `HTTP_PORT` | `8080` | Host port → guest TCP 80 |
 | `SHELL_PORT` | `2323` | Host port → guest TCP 23 (`rshd`) |
 | `UDP_PORT` | `5555` | Host port → guest UDP 7 (`echod`) |
@@ -455,7 +467,7 @@ Boot options most used with these targets (the full list is printed by the `help
 | `tools/ci.py` | `--quick`, `--keep-going`, `--stress-secs N` (default `$STRESS_SECS` or 60); honours `$MAKE` |
 | `tools/timeout.py` | `timeout.py SECONDS CMD...`: exit status of CMD, or 124 after killing it |
 | `tools/gen_ksyms.py` | stdin: `nm -n` output; stdout: assembly |
-| `build/tools/mkfs` | `mkfs IMAGE SIZE_MB [/path=hostfile | /path=@/existing | /dir/[:mode[:uid[:gid]]]]...`; `mkfs --check IMAGE` |
+| `build/tools/mkfs` | `mkfs [--label NAME] IMAGE SIZE_MB [/path=hostfile | /path=@/existing | /dir/[:mode[:uid[:gid]]]]...`; `mkfs --check IMAGE` (prints the label) |
 | `/bin/stress` (guest) | `stress [-j workers] [-t seconds] [-n iterations] [-v]` |
 | `/bin/utests` (guest) | no argument: the suite; one argument: a scenario |
 | `build/host/test_tcp` | `[-v|-vv]`, or `-v LOSS [SEED DUP STALL]` for one transfer |
@@ -566,10 +578,13 @@ Boot options most used with these targets (the full list is printed by the `help
 | `lockdep_catches_inversions_before_they_deadlock` | AB/BA inversion, a 3-lock cycle and a mutex under a spinlock each produce one report (skipped if `lockdep=off`) |
 | `hung_thread_detector_reports_long_mutex_waits` | With a 50 ms threshold a waiter blocked on a mutex is reported |
 
-### User test catalog (`user/bin/utests.c`, 40 tests, in run order)
+### User test catalog (`user/bin/utests.c`, 43 tests, in run order)
 
 | Test | Checks |
 |---|---|
+| `regex` | `regcomp`/`regexec`: BRE and ERE (`.`, anchors, `*`, `\(\)`/`()` groups with submatch offsets, `?`, `+`, `|`, `\{2,3\}`, `[[:digit:]]`, negated brackets, `\<word\>`, the back-reference `\1`, `REG_ICASE`, an empty match), POSIX leftmost-longest submatches (`(a|ab)(c|bcd)` on `abcd`), the `REG_EPAREN`/`REG_EBRACK` errors, and `REG_ECTYPE` for an inexact class name (`[[:al:]]`) |
+| `libc` | Regression checks for fixed bugs (`fscanf` read-ahead on `12abc`, `round(0.49999999999999994)`, NaN in `sinh`/`cosh`/`tanh`/`expm1`, large trigonometric arguments) and: `printf` floats (`%f %e %g %a`, widths, flags, `%.17g`, inf/nan), `strtod` (exponents, hex floats, a subnormal boundary), `strtol`/`strtoul`/`strtoull`, `sscanf` (`%d %lf %s %i %n %[...]`), `qsort`, `bsearch`, `setjmp`/`longjmp` out of a recursion, `FILE` stdio on `/tmp` (`fprintf`, `ftell`, `rewind`, `fgets`, `ungetc`, `fseek` from the end, `feof`), `gmtime_r`/`strftime`/`timegm`, `math.h` functions to 1e-14, `getopt`, `realpath`, `strtok_r`, `strcasecmp`, `strpbrk`, `strdup`, `asprintf` |
+| `float` | FP arithmetic; two forked children computing a series at once get the parent's exact result (no register leaks between processes); a forked child sees the parent's FP register `fs2`; a SIGUSR1 handler that zeroes `ft0` and `fs1` does not change them for the interrupted code |
 | `tcp_loopback_echo` | 200 KB through a forked echo server on 127.0.0.1, `poll`-driven, half-close, exit status |
 | `tcp_errors` | `ECONNREFUSED`, `EADDRINUSE`, `ENOTCONN`, reset → `ECONNRESET` then `EPIPE`, `EPROTONOSUPPORT`, `EBADF`, `ENOTSOCK` |
 | `nonblocking_sockets` | Non-blocking accept `EAGAIN`, connect `EINPROGRESS` + `POLLOUT` + `SO_ERROR`, recv `EAGAIN` |
@@ -678,21 +693,21 @@ build/tools/mkfs --check /tmp/t.img
 - **Running `ktest` from the monitor** runs every test in the monitor's context. Tests that create threads, sleep or wait for other CPUs depend on a running scheduler and on the other CPUs, which the monitor normally stops. Expect only self-contained tests (for example `ktest printf_`, `ktest ksyms`) to be reliable there. (This is inferred from the code, not verified.)
 - **Kernel tests are always linked into the kernel.** `kernel/tests` is in `KDIRS`; there is no build option to leave them out.
 - **Incomplete rebuild dependencies.** Objects do not depend on the Makefile or on `CFLAGS`/`UCFLAGS`, so changing flags needs `make clean`. `build/fs.img` does not depend on the Makefile, so changing `FS_FILES`, `EUTILS_LINKS` or `FS_MB` does not rebuild the image (touch a user program or `rm build/fs.img`). User `.S` files are compiled without `-MMD` (they include no headers today).
-- **Rebuilding the image discards guest data.** Any user-program change rebuilds `build/fs.img` from scratch.
+- **Rebuilding the image discards guest data.** Any user-program change rebuilds `build/fs.img` from scratch. Only `/home`, on the separate `home.img` under `make run`, is kept.
 - **Shared scratch paths.** Two `make test` (or two `make stress`, or record/replay-check) runs in one checkout collide on fixed paths, and the timeout path's `pkill -f build/test-fs.img` kills the other run's QEMU.
 - **`free_port()` is racy.** The port is released before QEMU binds it.
 - **`tracedump=build/ktest-trace.bin` is relative to QEMU's working directory.** `make test` runs from the repository root, so it works; running `run_tests.py` from another directory writes the trace elsewhere, and the runner then silently skips the Perfetto conversion.
 - **Exit status 3 has two meanings**: a simulated power failure and a recursive panic both call `platform_exit(3)`. The crash stages also require the `simulating a power failure` text, so this is only a diagnostic ambiguity.
 - **Host tests need the cross toolchain**, because `test_fsck.py` uses `build/user/bin/hello` as payload. `test_fsck.py` never deletes its temporary directory.
-- **mkfs takes file modes from the host** (0755 if executable, else 0644); there is no spec syntax for other modes or owners of files. `SIZE_MB` is parsed with `atoi` without validation.
+- **mkfs takes file modes from the host** (0755 if executable, else 0644); there is no spec syntax for other modes or owners of files. `SIZE_MB` is parsed with `atoi` without validation, and a `--label` longer than 16 bytes is silently cut.
 - **The pass-1/pass-2 check compares only text symbols** (`grep -i ' t '`), not data or rodata addresses. This is enough as long as `.ksyms` stays last in `kernel.ld`.
 - **Record/replay is one CPU only**, with no semihosting and no host port forwarding (`RROPTS`). `rr_prepare` writes the options with `echo '$(1)'`, so an `APPEND` containing a single quote breaks it.
-- **The kernel is compiled for `rv64gc/lp64d`.** Nothing in the build stops the compiler from emitting FP instructions in kernel code, and the kernel saves no FP state. Kernel code uses no floating point today; this is a latent hazard, not a current bug.
+- **The home disk is never checked or tested.** `make test` and `make ci` boot without `home.img`, so mounting a second disk is exercised only interactively, and `make fsck` checks `build/fs.img` only. An image made by an older mkfs (no label) is not mounted on `/home`; `make clean-home` recreates it.
 - **Documentation drift:** `docs/DEBUGGING.md` lists the networking stage before the interactive shell; `run_tests.py` runs the shell first. It also says a kernel test can be added "anywhere"; in fact it must be in a directory listed in `KDIRS`.
 
 ## Potential improvements
 
-1. **Stage selection in run_tests.py** — Add `--only NAME[,NAME]` / `--from NAME` and `--list`, and declare each stage's prerequisites (e.g. `persistence` needs `kernel+user tests`) so the runner can run the minimal chain. This would make investigating a failure much faster than a full 16-stage run. Impact: high. Effort: medium.
+1. **Stage selection in run_tests.py** — Add `--only NAME[,NAME]` / `--from NAME` and `--list`, and declare each stage's prerequisites (e.g. `persistence` needs `kernel+user tests`) so the runner can run the minimal chain. This would make investigating a failure much faster than a full 17-stage run. Impact: high. Effort: medium.
 2. **Per-test filter for utests** — Accept `utest=only:<prefix>` (or treat a mode that matches a test name prefix as a filter) and have `run_tests.py` pass it through. This mirrors `ktest=prefix` and avoids editing `tests[]`. Impact: medium. Effort: small.
 3. **Turn hangs into failures** — Bound the loops that can spin forever: break out of `t_tcp_loopback_echo` when `poll` times out, use a timed `poll` before `accept` in `stress.c` `tcp_round`, and add a per-test watchdog in `ktest_run` that logs the running test's name when it exceeds N seconds. Then a timeout names the culprit. Impact: high. Effort: small.
 4. **Overall deadline for interactive/network stages** — Wrap `interactive()`/`network()` in the same `--timeout` budget as `boot()` and log `*** TIMEOUT` consistently. After `Console.close()`, run an fsck stage so unclean shutdowns are checked too. Impact: medium. Effort: small.
@@ -702,8 +717,8 @@ build/tools/mkfs --check /tmp/t.img
 8. **Machine-readable test results** — Have `run_tests.py` and `ci.py` also write a JSON/JUnit summary (stage, verdict, duration, failing lines), and parse `[  FAILED  ]` names out of the logs into it. Useful for any future hosted CI and for tracking flaky stages. Impact: medium. Effort: small.
 9. **Optional exclusion of kernel tests** — A `KTESTS=0` make variable that drops `kernel/tests` from `KDIRS` (and `.ktests` stays empty). This gives a smaller production kernel and checks that nothing outside the tests depends on test code. Impact: low. Effort: small.
 10. **Make `KTEST(cmdline)` independent of how it was booted** — Check only properties that hold for any boot (e.g. `cmdline_has("ktest")` when run from `kinit`, unknown option NULL, no prefix match), or skip the `panic=shutdown` check when that option is absent. Then `ktest` from `make run` or the monitor passes cleanly. Impact: low. Effort: small.
-11. **File modes in mkfs specs** — Extend `/path=hostfile` with an optional `:mode[:uid[:gid]]` suffix like directories have, and default non-executables to 0644. Images would then match Unix expectations, and permission tests could cover pre-built files. Impact: low. Effort: small.
-12. **Kernel compiled without FP** — Build the kernel with `-march=rv64imac_zicsr_zifencei -mabi=lp64` (and a matching libgcc multilib), or clear `sstatus.FS` in the kernel, so any accidental floating-point use fails at compile time or traps immediately instead of silently corrupting user-invisible state. Impact: low. Effort: medium.
+11. **File modes in mkfs specs** — Extend `/path=hostfile` with an optional `:mode[:uid[:gid]]` suffix like directories have, so pre-built files can have owners other than root and modes other than the host's 0755/0644 split. Permission tests could then cover pre-built files. Impact: low. Effort: small.
+12. **A home-disk stage in `make test`** — Attach a second, labelled scratch disk in one stage, write and read back a file under `/home`, and fsck both images afterwards. Covers label lookup, per-disk buffer-cache keys and a second log, none of which the tests touch today. Impact: medium. Effort: small.
 13. **Self-contained host tests** — Let `test_fsck.py` generate its payload on the host instead of using `build/user/bin/hello`, and remove its temp directory. `make test-host` would then run without the RISC-V toolchain (useful for quick checks on another machine). Impact: low. Effort: small.
 14. **Sanitize stage log names** — Use the same sanitization for `.log` files as for `.pcap` files (no spaces, commas or `%`). They become easier to use from a shell and in scripts. Impact: low. Effort: small.
 15. **Let `APPEND` override stage options** — Make `cmdline_get()` return the last matching word (or have `run_tests.py` put `APPEND` before the stage options). Then `make test APPEND="ktest=fs_ lockdep=warn"` would narrow or relax runs as users expect. Today such values are ignored without any message. Impact: medium. Effort: small.

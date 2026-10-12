@@ -34,7 +34,8 @@ Q := @
 msg = @printf '  %-7s %s\n' $(1) $(2)
 endif
 
-CFLAGS  := -march=rv64gc -mabi=lp64d -mcmodel=medany \
+# The kernel uses no floating point (the FP registers belong to user threads).
+CFLAGS  := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany \
            -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -nostdlib -fno-pic -fno-stack-protector \
            -fno-omit-frame-pointer -g -O1 -Wall -Wextra -Werror -std=gnu11 \
            -Ikernel/include -Ilib/include
@@ -51,15 +52,19 @@ KOBJS   := $(patsubst %.S,$(BUILD)/%.o,$(KSRCS_S)) $(patsubst %.c,$(BUILD)/%.o,$
 KERNEL  := $(BUILD)/kernel.elf
 PASS1   := $(BUILD)/kernel.pass1.elf
 
-# --- User space: integer-only RV64 (no FPU state yet), our own headers only ---
+# --- User space: RV64GC with hardware floating point (lp64d), our own headers only ---
 GCC_INC := $(shell $(CC) -print-file-name=include)
-UCFLAGS := -march=rv64imac -mabi=lp64 -mcmodel=medany \
+UCFLAGS := -march=rv64gc -mabi=lp64d -mcmodel=medany \
            -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -nostdlib \
            -nostdinc -isystem $(GCC_INC) -fno-pic -fno-stack-protector \
            -fno-omit-frame-pointer -g -O1 -Wall -Wextra -Werror -std=gnu11 \
-           -Iuser/include -Ilib/include
-ULIB    := $(BUILD)/user/lib/crt0.o $(BUILD)/user/lib/syscall.o $(BUILD)/user/lib/libc.o \
-           $(BUILD)/user/lib/printf.o $(BUILD)/user/lib/string.o $(BUILD)/user/lib/net.o
+           -Iuser/include -Ilib/include -DFMT_FLOAT
+# libc: crt0 first, then every other user/lib source, and the printf and
+# string code shared with the kernel.
+ULIB    := $(BUILD)/user/lib/crt0.o \
+           $(patsubst user/lib/%.c,$(BUILD)/user/lib/%.o,$(wildcard user/lib/*.c)) \
+           $(patsubst user/lib/%.S,$(BUILD)/user/lib/%.o,$(filter-out user/lib/crt0.S,$(wildcard user/lib/*.S))) \
+           $(BUILD)/user/lib/printf.o $(BUILD)/user/lib/string.o
 UPROGS  := $(patsubst user/bin/%.c,$(BUILD)/user/bin/%,$(wildcard user/bin/*.c))
 # Programs spread over several files: user/bin/NAME/*.c -> /bin/NAME
 UMULTI  := $(notdir $(patsubst %/,%,$(dir $(wildcard user/bin/*/*.c))))
@@ -96,9 +101,11 @@ NETOPTS  = -netdev user,id=net0$(if $(HOSTFWD),$(comma)$(HOSTFWD)) \
            -device virtio-net-device,netdev=net0 \
            -object filter-dump,id=pcap0,netdev=net0,file=$(BUILD)/net.pcap
 comma := ,
-QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(NETOPTS)
+# make run/debug also attach the /home disk (the test scenarios don't).
+HOMEOPTS = -drive file=$(HOME_IMG),if=none,format=raw,id=hd1 -device virtio-blk-device,drive=hd1
+QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(NETOPTS)
 
-.PHONY: all user fsck run debug gdb test stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean
+.PHONY: all user fsck clean-home run debug gdb test stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean
 
 all: $(KERNEL) $(FSIMG)
 
@@ -181,7 +188,18 @@ $(MKFS): tools/mkfs/mkfs.c kernel/include/efs_format.h
 # Rebuilt whenever a program changes, which discards files created at run time.
 $(FSIMG): $(MKFS) $(patsubst $(BUILD)/user/bin/%,$(BUILD)/user/stripped/%,$(UPROGS)) user/etc/* user/www/*
 	$(call msg,MKFS,$@)
-	$(Q)$(MKFS) $@ $(FS_MB) $(FS_FILES) > /dev/null
+	$(Q)$(MKFS) --label root $@ $(FS_MB) $(FS_FILES) > /dev/null
+
+# /home lives on its own disk, made once and never rebuilt, so what you
+# create there survives `make` and `make clean` (`make clean-home` resets it).
+HOME_IMG ?= home.img
+HOME_MB  ?= 64
+$(HOME_IMG): | $(MKFS)
+	$(call msg,MKFS,$@)
+	$(Q)$(MKFS) --label home $@ $(HOME_MB) /guest/:0755:1000:1000 > /dev/null
+
+clean-home:
+	rm -f $(HOME_IMG)
 
 fsck: $(MKFS)
 	$(MKFS) --check $(FSIMG)
@@ -214,11 +232,11 @@ define check_tty
 	fi
 endef
 
-run: $(KERNEL) $(FSIMG)
+run: $(KERNEL) $(FSIMG) $(HOME_IMG)
 	$(check_tty)
 	$(QEMU) $(QEMUOPTS) -append "$(APPEND)"
 
-debug: $(KERNEL) $(FSIMG)
+debug: $(KERNEL) $(FSIMG) $(HOME_IMG)
 	$(check_tty)
 	@echo "QEMU halted; run 'make gdb' in another terminal."
 	$(QEMU) $(QEMUOPTS) -append "$(APPEND)" -s -S
@@ -292,7 +310,7 @@ replay-check: $(KERNEL) $(FSIMG)
 		echo "replay-check: replay identical to the recording ($$(wc -l < $(RRDIR)/record.log | tr -d ' ') lines, $$(du -h $(RRDIR)/replay.bin | cut -f1) of events)" || \
 		{ echo "replay-check: replay DIVERGED from the recording:"; diff $(RRDIR)/record.log $(RRDIR)/replay.log | head -20; exit 1; }
 
-qemu-log: $(KERNEL) $(FSIMG)
+qemu-log: $(KERNEL) $(FSIMG) $(HOME_IMG)
 	$(check_tty)
 	$(QEMU) $(QEMUOPTS) -append "$(APPEND)" -d int,guest_errors,unimp -D $(BUILD)/qemu.log
 

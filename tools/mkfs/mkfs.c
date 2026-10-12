@@ -182,6 +182,8 @@ static uint32_t walk_create(const char *path, bool include_last, char *last_out)
     return dir;
 }
 
+static const char *volume_label = "";
+
 static int do_mkfs(const char *path, int size_mb, int nspecs, char **specs)
 {
     nblocks = (uint32_t)size_mb * (1024 * 1024 / EFS_BSIZE);
@@ -202,6 +204,7 @@ static int do_mkfs(const char *path, int size_mb, int nspecs, char **specs)
     sb->bmapstart = sb->inodestart + (uint32_t)((sb->ninodes + EFS_IPB - 1) / EFS_IPB);
     sb->datastart = sb->bmapstart + (nblocks + EFS_BSIZE * 8 - 1) / (EFS_BSIZE * 8);
     sb->mkfs_time = now_ns;
+    strncpy(sb->label, volume_label, sizeof(sb->label));
     for (uint32_t b = 0; b < sb->datastart; b++)
         bit_set(b);
     next_block = sb->datastart;
@@ -421,6 +424,8 @@ static int do_check(const char *path)
     printf("fsck %s:\n", path);
     if (sb->magic != EFS_MAGIC)
         die("not an efs image (magic %#x)", sb->magic);
+    if (sb->label[0])
+        printf("  label %.16s\n", sb->label);
     if (sb->bsize != EFS_BSIZE || sb->size > nblocks || sb->logstart != 2 ||
         sb->inodestart != sb->logstart + sb->nlog || sb->bmapstart <= sb->inodestart ||
         sb->datastart <= sb->bmapstart || sb->datastart >= sb->size) {
@@ -490,9 +495,14 @@ int main(int argc, char **argv)
 {
     if (argc == 3 && !strcmp(argv[1], "--check"))
         return do_check(argv[2]);
+    if (argc >= 3 && !strcmp(argv[1], "--label")) {
+        volume_label = argv[2];
+        argc -= 2;
+        argv += 2;
+    }
     if (argc >= 3)
         return do_mkfs(argv[1], atoi(argv[2]), argc - 3, argv + 3);
-    fprintf(stderr, "usage: mkfs IMAGE SIZE_MB [/path=hostfile | /path=@/existing | /dir/]...\n"
+    fprintf(stderr, "usage: mkfs [--label NAME] IMAGE SIZE_MB [/path=hostfile | /path=@/existing | /dir/]...\n"
                     "       mkfs --check IMAGE\n");
     return 2;
 }

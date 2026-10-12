@@ -34,6 +34,7 @@
 struct efs_log {
     spinlock_t lock;
     struct waitqueue wq;
+    u32 disk;
     u32 start;                  /* header block; data blocks follow */
     int outstanding;            /* operations in progress */
     bool committing;
@@ -47,14 +48,14 @@ struct efs_log {
 
 static void read_head(struct efs_log *log, struct efs_logheader *out)
 {
-    struct buf *b = bread(log->start);
+    struct buf *b = bread(log->disk, log->start);
     memcpy(out, b->data, sizeof(*out));
     brelse(b);
 }
 
 static void write_head(struct efs_log *log, u32 n)
 {
-    struct buf *b = bread(log->start);
+    struct buf *b = bread(log->disk, log->start);
     struct efs_logheader *lh = (struct efs_logheader *)b->data;
     lh->magic = EFS_LOG_MAGIC;
     lh->n = n;
@@ -77,8 +78,8 @@ static void crash_point(struct efs_log *log, const char *where)
 static void install(struct efs_log *log, u32 n, const u32 *blocks, bool recovering)
 {
     for (u32 i = 0; i < n; i++) {
-        struct buf *from = bread(log->start + 1 + i);
-        struct buf *to = bread(blocks[i]);
+        struct buf *from = bread(log->disk, log->start + 1 + i);
+        struct buf *to = bread(log->disk, blocks[i]);
         memcpy(to->data, from->data, EFS_BSIZE);
         bwrite(to);
         if (!recovering)
@@ -96,8 +97,8 @@ static void commit(struct efs_log *log)
         return;
     u64 t0 = rdtime();
     for (u32 i = 0; i < log->n; i++) {             /* 1. blocks into the log */
-        struct buf *to = bread(log->start + 1 + i);
-        struct buf *from = bread(log->blocks[i]);
+        struct buf *to = bread(log->disk, log->start + 1 + i);
+        struct buf *from = bread(log->disk, log->blocks[i]);
         memcpy(to->data, from->data, EFS_BSIZE);
         bwrite(to);
         brelse(from);
@@ -135,12 +136,13 @@ int efs_arm_crash(const char *point)
 
 struct efs_log *log_create(struct super_block *sb, const struct efs_super *esb)
 {
-    (void)sb;
     struct efs_log *log = kzalloc(sizeof(*log));
     spin_init(&log->lock, "efs-log");
     waitqueue_init(&log->wq, "log-space");
+    log->disk = sb->disk;
     log->start = esb->logstart;
-    log->crash_at = cmdline_get("fs.crash");
+    if (!the_log)                       /* crash testing applies to the root filesystem */
+        log->crash_at = cmdline_get("fs.crash");
 
     struct efs_logheader lh;
     read_head(log, &lh);

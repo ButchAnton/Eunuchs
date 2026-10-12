@@ -71,7 +71,13 @@ uintptr_t dma_addr(const void *va)
 
 int virtio_find(u32 device_id, u64 want, struct virtio_dev *dev)
 {
-    for (int i = 0; i < platform.nvirtio; i++) {
+    return virtio_find_from(0, device_id, want, dev);
+}
+
+/* The first device of this type in slot `from` or later (dev->slot tells where). */
+int virtio_find_from(int from, u32 device_id, u64 want, struct virtio_dev *dev)
+{
+    for (int i = from; i < platform.nvirtio; i++) {
         uintptr_t regs = (uintptr_t)ioremap(platform.virtio[i].base, PAGE_SIZE);
         struct virtio_dev d = { .slot = i, .regs = regs, .irq = platform.virtio[i].irq };
         if (rd(&d, REG_MAGIC) != VIRTIO_MAGIC || rd(&d, REG_DEVICE_ID) != device_id)

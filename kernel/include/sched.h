@@ -42,8 +42,18 @@ struct proc;
 
 #define MAX_HELD_MUTEX 8
 
+/* User floating-point state (f0-f31 and fcsr), saved at context switches. */
+struct fpstate {
+    u64 f[32];
+    u64 fcsr;
+};
+void fp_save_regs(struct fpstate *fp);          /* fp.S: hardware -> memory */
+void fp_load_regs(const struct fpstate *fp);    /* fp.S: memory -> hardware */
+
 struct thread {
     struct context ctx;             /* must be first (switch.S) */
+    bool fp_used;                   /* a user thread that has used floating point */
+    struct fpstate fp;              /* its FP registers while it isn't running */
     int tid;
     char name[16];
     enum thread_state state;

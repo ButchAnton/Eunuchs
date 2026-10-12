@@ -395,6 +395,8 @@ static void __schedule(bool preempt)
     c->kstack_top = (uintptr_t)next->kstack + next->kstack_size;
     vm_activate(next->proc ? next->proc->mm : NULL);
     csr_clear(sstatus, SSTATUS_SUM);        /* never leak user access across threads */
+    if (prev->fp_used)                      /* the FP registers hold prev's user state */
+        fp_save_regs(&prev->fp);
 
     context_switch(&prev->ctx, &next->ctx);
 
@@ -407,6 +409,8 @@ static void __schedule(bool preempt)
         panic("scheduler: thread %d (%s) resumed on cpu%d, whose current thread is %d (%s)",
               prev->tid, prev->name, c->id, c->cur_thread->tid, c->cur_thread->name);
     finish_switch(c, c->switch_from);
+    if (prev->fp_used)
+        fp_load_regs(&prev->fp);
     /*
      * Interrupts stay off until post_switch is done: preempted in between,
      * we could resume on another CPU and finish *its* predecessor.
@@ -437,6 +441,8 @@ __noreturn void thread_entry(void)
 {
     struct cpu *c = this_cpu();
     finish_switch(c, c->switch_from);
+    if (current->fp_used)       /* a forked child starts with its parent's FP registers */
+        fp_load_regs(&current->fp);
     spin_unlock_irqrestore(&sched_lock, 0);
     post_switch(c);
     intr_on();                  /* from here on we may migrate: no more `c` */

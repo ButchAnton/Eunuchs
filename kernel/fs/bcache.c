@@ -45,19 +45,19 @@ static void dump_held(print_fn print)
             continue;
         char s[96];
         ksym_format(s, sizeof(s), b->get_site);
-        print("  block %6u refcnt %d pins %u %s, taken by %s%s%s\n", b->blockno, b->refcnt,
+        print("  disk%u block %6u refcnt %d pins %u %s, taken by %s%s%s\n", b->disk, b->blockno, b->refcnt,
               b->pins, b->lock.owner ? "locked" : "unlocked", s,
               b->lock.owner ? " held by thread " : "",
               b->lock.owner ? b->lock.owner->name : "");
     }
 }
 
-static struct buf *bget(u32 blockno, uintptr_t site)
+static struct buf *bget(u32 disk, u32 blockno, uintptr_t site)
 {
     unsigned long flags = spin_lock_irqsave(&bc_lock);
     struct buf *b;
     list_for_each_entry(b, &lru, lru) {
-        if (b->blockno == blockno && (b->valid || b->refcnt)) {
+        if (b->blockno == blockno && b->disk == disk && (b->valid || b->refcnt)) {
             b->refcnt++;
             hits++;
             spin_unlock_irqrestore(&bc_lock, flags);
@@ -71,6 +71,7 @@ static struct buf *bget(u32 blockno, uintptr_t site)
         b = list_entry(pos, struct buf, lru);
         if (!b->refcnt && !b->pins) {
             b->blockno = blockno;
+            b->disk = disk;
             b->valid = false;
             b->refcnt = 1;
             misses++;
@@ -86,12 +87,12 @@ static struct buf *bget(u32 blockno, uintptr_t site)
     panic("bcache: no free buffers (a missing brelse?)");
 }
 
-struct buf *bread(u32 blockno)
+struct buf *bread(u32 disk, u32 blockno)
 {
-    struct buf *b = bget(blockno, (uintptr_t)__builtin_return_address(0));
+    struct buf *b = bget(disk, blockno, (uintptr_t)__builtin_return_address(0));
     if (!b->valid) {
-        if (blk_rw((u64)blockno * EFS_SECTORS_PER_BLOCK, b->data, EFS_BSIZE, false))
-            pr_err("bread: I/O error on block %u\n", blockno);
+        if (blk_rw(disk, (u64)blockno * EFS_SECTORS_PER_BLOCK, b->data, EFS_BSIZE, false))
+            pr_err("bread: I/O error on disk%u block %u\n", disk, blockno);
         b->valid = true;
     }
     return b;
@@ -102,7 +103,7 @@ int bwrite(struct buf *b)
     if (b->lock.owner != current)
         panic("bwrite of block %u by a thread that does not hold the buffer", b->blockno);
     writes++;
-    return blk_rw((u64)b->blockno * EFS_SECTORS_PER_BLOCK, b->data, EFS_BSIZE, true);
+    return blk_rw(b->disk, (u64)b->blockno * EFS_SECTORS_PER_BLOCK, b->data, EFS_BSIZE, true);
 }
 
 void brelse(struct buf *b)

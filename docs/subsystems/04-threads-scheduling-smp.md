@@ -81,6 +81,7 @@ The accessors in `percpu.h` are:
 | Field(s) | Meaning |
 |---|---|
 | `ctx` | Callee-saved registers (`struct context`: `ra`, `sp`, `s[12]`). It must be the first field (`_Static_assert` in `sched.c`; `switch.S` uses offsets 0..104). |
+| `fp_used`, `fp` | The thread is a user thread that has executed a floating-point instruction since its last `exec`; `fp` (`struct fpstate`: `f[32]` and `fcsr`) holds its FP registers while it is not running. See [lazy floating point](03-traps-interrupts-syscalls.md#lazy-floating-point-for-user-programs). |
 | `tid`, `name[16]` | Thread id from `next_tid` (boot thread is 0) and its name |
 | `state` | `T_RUNNING` ("R"), `T_RUNNABLE` ("r"), `T_SLEEPING` ("S"), `T_DEAD` ("D") |
 | `on_runq` | Linked into the run queue via `run_node` |
@@ -149,6 +150,8 @@ A mutex's internal spinlock and its wait queue's spinlock both take the mutex's 
 
 `context_switch(old, new)` stores `ra, sp, s0..s11` at offsets 0..104 of `*old`, loads the same from `*new`, and does `ret`. A new thread has `ctx.ra = thread_start`, `ctx.sp = kstack + KSTACK_SIZE - TRAP_FRAME_SIZE` and `ctx.s[0] = 0` (end of the frame-pointer chain). `thread_start` clears `ra` and jumps to `thread_entry`, so backtraces end cleanly. A sleeping thread's backtrace starts at `ctx.ra` with frame pointer `ctx.s[0]`.
 
+`context_switch` does not touch the floating-point registers. The kernel itself uses no FP (it is compiled for `rv64imac`), so they always hold the user state of the thread that ran last; `__schedule` saves and restores them around the switch for threads with `fp_used` (below).
+
 ## How it works
 
 ### Boot and bring-up
@@ -179,7 +182,7 @@ A mutex's internal spinlock and its wait queue's spinlock both take the mutex's 
 
 `kthread_bind(t, cpu)` sets `bound_cpu` under `sched_lock`. It is meant for not-yet-started threads. A `cpu >= ncpus_online` silently becomes -1. `kthread_start(t)` clears `wait_what` and calls `wake_thread`.
 
-A new thread first runs `thread_entry` (via `thread_start`). At that point it holds `sched_lock`, which the previous thread on this CPU took in `__schedule`. `thread_entry` calls `finish_switch` and unlocks, then calls `post_switch` and turns interrupts on. After that it calls `fn(arg)` and finally `thread_exit(0)`.
+A new thread first runs `thread_entry` (via `thread_start`). At that point it holds `sched_lock`, which the previous thread on this CPU took in `__schedule`. `thread_entry` calls `finish_switch`, loads the thread's FP registers if `fp_used` is set (a forked child starts with a copy of its parent's), and unlocks, then calls `post_switch` and turns interrupts on. After that it calls `fn(arg)` and finally `thread_exit(0)`.
 
 ### `__schedule(bool preempt)`: the core
 
@@ -205,10 +208,12 @@ A new thread first runs `thread_entry` (via `thread_start`). At that point it ho
    - count a migration if `next->cpu != c->id` (and it has run before);
    - set `cur_thread = next`, `switch_from = prev`, and `kstack_top`;
    - call `vm_activate(next->proc ? next->proc->mm : NULL)` and clear `SSTATUS_SUM` (user access never leaks across threads);
+   - if `prev->fp_used`, save the FP registers into `prev->fp` (`fp_save_regs`);
    - call `context_switch(&prev->ctx, &next->ctx)`.
 9. **Back in `prev`, possibly on a different CPU:**
    - re-read `c = this_cpu()`. Panic if `c->cur_thread != prev`;
    - `finish_switch(c, c->switch_from)`;
+   - if `prev->fp_used`, load its FP registers back (`fp_load_regs`), since whatever ran in between may have replaced them;
    - release `sched_lock` (flags 0: interrupts stay off);
    - `post_switch(c)`;
    - only then restore interrupts if they were on.
@@ -654,6 +659,7 @@ Each CPU records into its own ring, and the Perfetto export has one track per CP
 - **A thread that is never joined or detached stays forever** as `T_DEAD`, together with its 16 KiB stack.
 - **Nested waits clobber multi-source sleeps.** If code called after `set_current_sleeping` blocks on a mutex or wait queue, `finish_wait` sets `T_RUNNING` and clears `wait_what`. The following `schedule_until` then returns immediately. This is safe (a spurious wakeup) but costs one extra loop.
 - **Racy statistics.** `tlb_shootdowns++` and `spinlock.contentions++` are non-atomic updates from several CPUs. These counters are approximate.
+- **FP state is switched eagerly.** Once a thread has used floating point, every switch saves and loads all 32 FP registers and `fcsr` (about 66 memory operations) whether or not it touched them; `sstatus.FS` = Clean is never used to skip the save ([03](03-traps-interrupts-syscalls.md#potential-improvements) has the fix). Kernel threads and integer-only processes pay nothing.
 - **The tick runs on idle CPUs.** Every CPU takes 100 timer interrupts per second even when idle (no tickless idle).
 
 ## Potential improvements

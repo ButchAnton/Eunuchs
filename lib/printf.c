@@ -102,7 +102,249 @@ static void emit_string(struct fmt_state *st, const char *s, int flags, int widt
         emit_repeat(st, ' ', pad);
 }
 
-enum length { L_INT, L_CHAR, L_SHORT, L_LONG, L_LLONG, L_SIZE, L_PTRDIFF, L_INTMAX };
+enum length { L_INT, L_CHAR, L_SHORT, L_LONG, L_LLONG, L_SIZE, L_PTRDIFF, L_INTMAX, L_LDOUBLE };
+
+#ifdef FMT_FLOAT
+/*
+ * Floating point (user programs only: the kernel has no FP). Scaling is
+ * done in 128-bit long double, so the 17 significant digits a double can
+ * need come out right.
+ */
+static long double pow10l_(int n)
+{
+    long double r = 1, b = 10;
+    int neg = n < 0;
+    unsigned u = neg ? -n : n;
+    while (u) {
+        if (u & 1)
+            r *= b;
+        b *= b;
+        u >>= 1;
+    }
+    return neg ? 1 / r : r;
+}
+
+/* v > 0, finite: digits (up to 18) of v rounded to `sig` significant digits,
+ * and the decimal exponent of the first digit. */
+static unsigned long long sig_digits(double v, int sig, int *exp10)
+{
+    long double x = v;
+    int e = 0;
+    /* estimate the exponent from the binary one, then fix it up */
+    union { double d; unsigned long long u; } bits = { v };
+    int e2 = (int)((bits.u >> 52) & 0x7ff) - 1023;
+    e = (int)(e2 * 0.30102999566398119521);
+    long double scaled = x / pow10l_(e);
+    while (scaled >= 10) { scaled /= 10; e++; }
+    while (scaled < 1) { scaled *= 10; e--; }
+    long double m = scaled * pow10l_(sig - 1);
+    unsigned long long d = (unsigned long long)m;
+    long double frac = m - (long double)d;
+    if (frac > 0.5L || (frac == 0.5L && (d & 1)))     /* exact halves round to even */
+        d++;
+    if (d >= (unsigned long long)pow10l_(sig)) {     /* 9.99.. rounded up */
+        d /= 10;
+        e++;
+    }
+    *exp10 = e;
+    return d;
+}
+
+static void emit_digits_str(struct fmt_state *st, const char *s)
+{
+    while (*s)
+        emit(st, *s++);
+}
+
+static void emit_float(struct fmt_state *st, long double lv, char conv, int flags, int width, int prec)
+{
+    char body[400];
+    int n = 0;
+    double v = (double)lv;
+    union { double d; unsigned long long u; } bits = { v };
+    int neg = bits.u >> 63;
+    if (neg)
+        v = -v;
+    int upper = conv == 'F' || conv == 'E' || conv == 'G' || conv == 'A';
+    char sign = neg ? '-' : (flags & F_PLUS) ? '+' : (flags & F_SPACE) ? ' ' : 0;
+
+    if (v != v || v > 1.7976931348623157e308) {
+        const char *t = v != v ? (upper ? "NAN" : "nan") : (upper ? "INF" : "inf");
+        while (*t)
+            body[n++] = *t++;
+        flags &= ~F_ZERO;
+    } else if (conv == 'a' || conv == 'A') {
+        unsigned long long mant = bits.u & ((1ULL << 52) - 1);
+        int e2 = (int)((bits.u >> 52) & 0x7ff);
+        int lead = e2 != 0;
+        e2 = e2 ? e2 - 1023 : (mant ? -1022 : 0);
+        const char *hex = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+        int nd = 13;
+        if (prec >= 0 && prec < 13) {
+            /* round to prec hex digits */
+            int drop = (13 - prec) * 4;
+            unsigned long long half = 1ULL << (drop - 1);
+            unsigned long long full = ((unsigned long long)lead << 52) | mant;
+            full = (full + half) >> drop << drop;
+            lead = (int)(full >> 52);
+            mant = full & ((1ULL << 52) - 1);
+            nd = prec;
+        } else if (prec < 0) {
+            while (nd > 0 && !((mant >> ((13 - nd) * 4)) & 0xf))
+                nd--;
+        }
+        body[n++] = '0';
+        body[n++] = upper ? 'X' : 'x';
+        body[n++] = '0' + lead;
+        if (nd || (flags & F_ALT))
+            body[n++] = '.';
+        for (int i = 0; i < nd; i++)
+            body[n++] = hex[(mant >> (48 - 4 * i)) & 0xf];
+        for (int i = 13; i < prec && n < 300; i++)
+            body[n++] = '0';
+        n += ksnprintf(body + n, sizeof(body) - n, "%c%c%d", upper ? 'P' : 'p', e2 < 0 ? '-' : '+',
+                       e2 < 0 ? -e2 : e2);
+    } else {
+        if (prec < 0)
+            prec = 6;
+        int style = conv == 'e' || conv == 'E' ? 'e' : conv == 'g' || conv == 'G' ? 'g' : 'f';
+        int strip = 0;
+        if (style == 'g') {
+            int p = prec ? prec : 1;
+            int x = 0;
+            if (v != 0)
+                sig_digits(v, p > 17 ? 17 : p, &x);
+            if (x < p && x >= -4) {
+                style = 'f';
+                prec = p - 1 - x;
+            } else {
+                style = 'e';
+                prec = p - 1;
+            }
+            strip = !(flags & F_ALT);
+        }
+        char digits[400];
+        int nd = 0, point;               /* digits[] with the point after `point` digits */
+        if (v == 0) {
+            digits[nd++] = '0';
+            point = 1;
+            if (style == 'f')
+                for (int i = 0; i < prec && nd < 350; i++)
+                    digits[nd++] = '0';
+            else
+                for (int i = 0; i < prec && nd < 350; i++)
+                    digits[nd++] = '0';
+        } else if (style == 'e') {
+            int x, sig = prec + 1 > 17 ? 17 : prec + 1;
+            unsigned long long d = sig_digits(v, sig, &x);
+            char tmp[24];
+            int k = ksnprintf(tmp, sizeof(tmp), "%llu", d);
+            for (int i = 0; i < k; i++)
+                digits[nd++] = tmp[i];
+            while (nd < prec + 1 && nd < 350)
+                digits[nd++] = '0';
+            point = 1;
+            /* exponent appended below */
+            body[0] = 0;
+            int e = x;
+            /* assemble mantissa then exponent */
+            int m = 0;
+            char mant[400];
+            mant[m++] = digits[0];
+            if (prec > 0 || (flags & F_ALT))
+                mant[m++] = '.';
+            for (int i = 1; i < nd; i++)
+                mant[m++] = digits[i];
+            if (strip && m > 1) {
+                while (m > 1 && mant[m - 1] == '0')
+                    m--;
+                if (mant[m - 1] == '.')
+                    m--;
+            }
+            for (int i = 0; i < m; i++)
+                body[n++] = mant[i];
+            n += ksnprintf(body + n, sizeof(body) - n, "%c%c%02d", upper ? 'E' : 'e', e < 0 ? '-' : '+',
+                           e < 0 ? -e : e);
+            goto out;
+        } else {
+            /* %f: all integer digits, then prec decimals; at most 17 significant */
+            int x;
+            int total = 0;
+            sig_digits(v, 17, &x);       /* exponent of the first digit */
+            total = x + 1 + prec;        /* significant digits we would print */
+            if (total <= 0) {
+                /* rounds to 0.000..., or the last place rounds up to 1 */
+                long double r = (long double)v * pow10l_(prec);
+                digits[nd++] = '0';
+                for (int i = 0; i < prec && nd < 350; i++)
+                    digits[nd++] = '0';
+                if (r > 0.5L && prec < 350)     /* 0.5 exactly rounds to the even 0 */
+                    digits[nd - 1] = '1';
+                point = 1;
+            } else {
+                int sig = total > 17 ? 17 : total;
+                unsigned long long d = sig_digits(v, sig, &x);
+                char tmp[24];
+                int k = ksnprintf(tmp, sizeof(tmp), "%llu", d);
+                if (k > sig)             /* rounding added a digit */
+                    sig = k;
+                /* digit string with exponent x for the first digit */
+                if (x < 0) {
+                    digits[nd++] = '0';
+                    point = 1;
+                    for (int i = 0; i < -x - 1 && nd < 350; i++)
+                        digits[nd++] = '0';
+                    for (int i = 0; i < k && nd < 350; i++)
+                        digits[nd++] = tmp[i];
+                } else {
+                    for (int i = 0; i < k && nd < 350; i++)
+                        digits[nd++] = tmp[i];
+                    while (nd < x + 1 && nd < 350)
+                        digits[nd++] = '0';
+                    point = x + 1;
+                }
+                while (nd < point + prec && nd < 350)
+                    digits[nd++] = '0';
+                nd = point + prec < nd ? point + prec : nd;
+            }
+        }
+        int m = 0;
+        char out[400];
+        for (int i = 0; i < point; i++)
+            out[m++] = digits[i];
+        if (prec > 0 || (flags & F_ALT))
+            out[m++] = '.';
+        for (int i = point; i < nd && m < 390; i++)
+            out[m++] = digits[i];
+        if (strip) {
+            int has_point = 0;
+            for (int i = 0; i < m; i++)
+                has_point |= out[i] == '.';
+            if (has_point) {
+                while (m > 1 && out[m - 1] == '0')
+                    m--;
+                if (out[m - 1] == '.')
+                    m--;
+            }
+        }
+        for (int i = 0; i < m; i++)
+            body[n++] = out[i];
+    }
+out:
+    body[n] = 0;
+    int len = n + (sign != 0);
+    int pad = width > len ? width - len : 0;
+    if (!(flags & F_LEFT) && !(flags & F_ZERO))
+        emit_repeat(st, ' ', pad);
+    if (sign)
+        emit(st, sign);
+    if (!(flags & F_LEFT) && (flags & F_ZERO))
+        emit_repeat(st, '0', pad);
+    emit_digits_str(st, body);
+    if (flags & F_LEFT)
+        emit_repeat(st, ' ', pad);
+}
+#endif
 
 int kvcbprintf(fmt_out_fn out, void *arg, const char *fmt, va_list ap)
 {
@@ -166,6 +408,7 @@ int kvcbprintf(fmt_out_fn out, void *arg, const char *fmt, va_list ap)
         case 'z': len = L_SIZE; fmt++; break;
         case 't': len = L_PTRDIFF; fmt++; break;
         case 'j': len = L_INTMAX; fmt++; break;
+        case 'L': len = L_LDOUBLE; fmt++; break;
         default: break;
         }
 
@@ -228,6 +471,19 @@ int kvcbprintf(fmt_out_fn out, void *arg, const char *fmt, va_list ap)
         case '%':
             emit(&st, '%');
             break;
+#ifdef FMT_FLOAT
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
+            long double v = len == L_LDOUBLE ? va_arg(ap, long double) : va_arg(ap, double);
+            emit_float(&st, v, conv, flags, width, prec);
+            break;
+        }
+        case 'n': {
+            int *np = va_arg(ap, int *);
+            if (np)
+                *np = st.count;
+            break;
+        }
+#endif
         case '\0':
             return st.count;
         default:

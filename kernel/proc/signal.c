@@ -36,6 +36,8 @@ struct sigframe {
     u64 sepc;
     u32 blocked;                /* mask to restore */
     u32 sig;
+    u64 fp_valid;               /* the interrupted code's FP registers follow */
+    struct fpstate fp;
 };
 
 /*
@@ -209,6 +211,15 @@ static bool setup_frame(struct trap_frame *tf, int sig, struct ksigaction *act, 
     f.sepc = tf->sepc;
     f.blocked = old_blocked;
     f.sig = sig;
+    f.fp_valid = current->fp_used;
+    if (f.fp_valid) {
+        unsigned long fl = csr_read(sstatus) & SSTATUS_SIE;
+        intr_off();
+        fp_save_regs(&current->fp);
+        if (fl)
+            intr_on();
+        f.fp = current->fp;
+    }
     uintptr_t sp = ALIGN_DOWN(TF_SP(tf) - sizeof(f), 16);
     if (!act->restorer || copy_to_user(sp, &f, sizeof(f)))
         return false;
@@ -382,6 +393,14 @@ long do_rt_sigreturn(const u64 *a)
     memcpy(&tf->regs[1], &f.regs[1], sizeof(f.regs) - sizeof(f.regs[0]));
     tf->sepc = f.sepc;
     p->sig_blocked = f.blocked & ~UNBLOCKABLE;
+    if (f.fp_valid && current->fp_used) {   /* the handler may have used the FP registers */
+        unsigned long fl = csr_read(sstatus) & SSTATUS_SIE;
+        intr_off();
+        current->fp = f.fp;
+        fp_load_regs(&current->fp);
+        if (fl)
+            intr_on();
+    }
     return (long)f.regs[10];            /* dispatch stores this in a0: keep it */
 }
 

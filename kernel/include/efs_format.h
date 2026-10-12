@@ -52,6 +52,7 @@ struct efs_super {
     uint32_t bmapstart;
     uint32_t datastart;
     uint64_t mkfs_time;     /* ns since the epoch */
+    char label[16];         /* volume label ("root", "home"); zeros in old images */
 };
 
 struct efs_dinode {

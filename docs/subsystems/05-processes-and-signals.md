@@ -112,10 +112,13 @@ offset  size  field
    264     8  sepc       (where to resume)
    272     4  blocked    (mask to restore on rt_sigreturn)
    276     4  sig
-   280        (total)
+   280     8  fp_valid   (1 if the FP registers below are meaningful)
+   288   256  fp.f[32]   (f0..f31)
+   544     8  fp.fcsr
+   552        (total)
 ```
 
-The handler is entered with `a0 = sig`, `ra = restorer`, `sp = frame`, and `sepc = handler`. Floating-point state is not saved; user code is integer-only (FPU off, see `do_exec`).
+The handler is entered with `a0 = sig`, `ra = restorer`, `sp = frame`, and `sepc = handler`. If the interrupted thread had used floating point (`fp_used`), `setup_frame` saves the live FP registers (`fp_save_regs`, with interrupts off) and copies them into the frame with `fp_valid = 1`; otherwise `fp_valid = 0` and the FP area is zeroes. The handler runs with the same FP registers and `FS` as the interrupted code.
 
 ### User address layout (`proc.h`)
 
@@ -173,7 +176,7 @@ Invariants:
 2. `mm_fork(parent->mm)` (`uvm.c`): copies the VMA list. For every present page it clears `PTE_W` and sets `PTE_COW` in the parent's PTE (if it was writable or already COW), copies the PTE to the child, and takes a page reference (`page_get`). The parent's TLB is flushed. A later write fault in either process goes through `uvm_fault`: if the page's refcount is 1 it is simply made writable again; otherwise the page is copied and the old one is released (`cow_copies++`).
 3. Creates a suspended thread running `fork_child_entry`.
 4. Shares the program image (`exe->refcnt++`). Copies `strace` only when it is 2 (follow). Copies all credentials and `umask`. Then `files_fork` (dups every descriptor, copies `fd_flags` and `cwd`) and `signal_fork` (copies `sigactions`, `sig_blocked`, `pgid`, `sid` and `ctty`; clears `sig_pending`).
-5. Copies the parent's user trap frame to the child's kernel stack and sets the child's `a0 = 0`. `syscall_dispatch` has already advanced `sepc` past the `ecall`.
+5. Copies the parent's user trap frame to the child's kernel stack and sets the child's `a0 = 0`. `syscall_dispatch` has already advanced `sepc` past the `ecall`. If the parent has used floating point, it saves its live FP registers (interrupts off) and gives the child a copy with `fp_used` set; the child loads them in `thread_entry` when it first runs. The copied `sstatus` carries the parent's `FS`.
 6. Starts the child and returns the child's pid to the parent.
 
 On failure (no `mm` or no thread) the child is unlinked under `proc_lock` and freed, and the call returns `-ENOMEM`.
@@ -221,7 +224,7 @@ On failure (no `mm` or no thread) the child is unlinked under `proc_lock` and fr
    - `files_exec` closes `FD_CLOEXEC` descriptors and clears all fd flags.
 5. **Prepare the trap frame.**
    - Zeroes it, then sets `sepc = entry`, `sp`, `a0 = argc`, `a1 = sp + 8` (argv) and `a2 = envp`.
-   - `sstatus` gets user mode (`SPP = 0`), `SPIE` set, `SUM` clear, and FS (bits 13–14) = 0, so the FPU is off. A floating-point instruction therefore traps as illegal and is reported as "floating point is not supported in user mode yet" (`trap.c: user_exception`).
+   - `sstatus` gets user mode (`SPP = 0`), `SPIE` set, `SUM` clear, and FS (bits 13–14) = 0, so the FPU is off, and `current->fp_used` is cleared. The new program's first floating-point instruction traps and gets fresh zeroed FP registers ([lazy floating point](03-traps-interrupts-syscalls.md#lazy-floating-point-for-user-programs)); nothing of the old image's FP state is visible.
    - Emits the `proc_exec` trace event, then returns `argc`. The dispatcher stores that in `a0`, which matches what was just put in the frame.
 
 `crt0.S: _start` reads `argc` from `0(sp)` and computes `argv = sp + 8` and `envp = argv + argc + 1`.
@@ -333,6 +336,7 @@ intr_off();
 `rt_sigreturn` (`do_rt_sigreturn`):
 - Reads the frame at the current `sp`. If the copy fails or the magic is wrong, it logs `rt_sigreturn with a bad signal frame at ... (magic ...)` and calls `user_fault(tf, "bad signal frame", SIGSEGV)`.
 - Otherwise it restores x1..x31 and `sepc`, and sets `sig_blocked = frame.blocked` (minus the unblockable signals).
+- If the frame has `fp_valid` set and the thread uses FP, it copies the frame's FP registers into `current->fp` and loads them (interrupts off), undoing whatever the handler did to them. A handler can therefore change the interrupted code's FP registers by editing the frame, as with the integer registers.
 - It returns `frame.regs[10]`, because `syscall_dispatch` writes the return value into `a0`.
 
 ### System-call restart (`ERESTARTSYS`)
@@ -593,7 +597,8 @@ The monitor's `kill` sends SIGKILL with `spin_lock_debug`, so it works even if t
 - **Orphans of init**: when init itself exits (utest mode), its children get `parent = NULL` and are never reaped.
 - **No orphaned-process-group rules**: there is no SIGHUP/SIGCONT to orphaned stopped groups, and SIGTTIN is still sent to an orphaned background group. Such a group can stop forever.
 - **No SIGCHLD semantics beyond notification**: `SA_NOCLDSTOP` is ignored, `SIG_IGN`/`SA_NOCLDWAIT` do not auto-reap, and there is no `WCONTINUED` and no SIGCHLD on continue.
-- **Signals**: 31 numbers in a `u32` mask, no real-time or queued signals (a second instance of a pending signal is merged), no `siginfo`, no `sigaltstack` (so a SIGSEGV handler cannot run after a stack overflow), no FP state in frames, `kill(-1)` is unsupported, and signalling a zombie returns `ESRCH` (Linux returns 0).
+- **Signals**: 31 numbers in a `u32` mask, no real-time or queued signals (a second instance of a pending signal is merged), no `siginfo`, no `sigaltstack` (so a SIGSEGV handler cannot run after a stack overflow), `kill(-1)` is unsupported, and signalling a zombie returns `ESRCH` (Linux returns 0).
+- **FP state across handlers is not fully symmetric**: if a handler is the first code in the thread to use floating point, the frame has `fp_valid = 0`, so `rt_sigreturn` leaves the handler's FP register values (and `FS` on) for the interrupted code. That code had never used FP, so it is harmless, but it is not a strict restore. Every frame is 552 bytes, FP area included, even for programs that never use FP.
 - **TTY job control is partial**: only one tty; no SIGTTOU or `TOSTOP` for writes or `tcsetpgrp` from the background; `TIOCSPGRP` accepts any number; `TIOCSCTTY` steals the console from another session; a session leader's exit does not detach the terminal or send SIGHUP; `tty.pgrp` is read and written without a lock.
 - **Credentials**: `u16` ids, no supplementary groups, no `setreuid`/`setresuid`/`setfsuid`; `access()` checks effective rather than real ids; `chown` does not clear setuid/setgid bits; there is no `nosuid` handling.
 - **Restart corner cases**:

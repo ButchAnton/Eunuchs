@@ -27,6 +27,7 @@ struct efs_info {
 };
 
 static struct efs_info *info(struct super_block *sb) { return sb->priv; }
+#define BREAD(...) bread(sb->disk, __VA_ARGS__)   /* every caller has its sb */
 
 u64 rtc_time_ns(void);
 
@@ -34,7 +35,7 @@ u64 rtc_time_ns(void);
 
 static void bzero_block(struct super_block *sb, u32 bno)
 {
-    struct buf *b = bread(bno);
+    struct buf *b = BREAD(bno);
     memset(b->data, 0, EFS_BSIZE);
     log_write(info(sb)->log, b);
     brelse(b);
@@ -48,7 +49,7 @@ static u32 balloc(struct super_block *sb)
         u32 bno = fi->s.datastart + (fi->bhint - fi->s.datastart + n) % (size - fi->s.datastart);
         if (n && bno == fi->bhint)
             break;
-        struct buf *b = bread(fi->s.bmapstart + bno / per);
+        struct buf *b = BREAD(fi->s.bmapstart + bno / per);
         u8 *byte = &b->data[(bno % per) / 8];
         u8 bit = 1 << (bno % 8);
         if (!(*byte & bit)) {
@@ -75,7 +76,7 @@ static void bfree(struct super_block *sb, u32 bno)
         return;
     }
     u32 per = EFS_BSIZE * 8;
-    struct buf *b = bread(fi->s.bmapstart + bno / per);
+    struct buf *b = BREAD(fi->s.bmapstart + bno / per);
     u8 *byte = &b->data[(bno % per) / 8];
     u8 bit = 1 << (bno % 8);
     if (!(*byte & bit))
@@ -99,8 +100,9 @@ static bool block_ok(struct super_block *sb, u32 bno, struct inode *ip)
 
 static struct buf *inode_block(struct inode *ip, struct efs_dinode **d)
 {
+    struct super_block *sb = ip->sb;
     struct efs_info *fi = info(ip->sb);
-    struct buf *b = bread(fi->s.inodestart + ip->ino / EFS_IPB);
+    struct buf *b = BREAD(fi->s.inodestart + ip->ino / EFS_IPB);
     *d = (struct efs_dinode *)b->data + ip->ino % EFS_IPB;
     return b;
 }
@@ -152,7 +154,7 @@ static struct inode *efs_alloc_inode(struct super_block *sb, enum itype type)
 {
     struct efs_info *fi = info(sb);
     for (u32 ino = 1; ino < fi->s.ninodes; ino++) {
-        struct buf *b = bread(fi->s.inodestart + ino / EFS_IPB);
+        struct buf *b = BREAD(fi->s.inodestart + ino / EFS_IPB);
         struct efs_dinode *d = (struct efs_dinode *)b->data + ino % EFS_IPB;
         if (d->type == EFS_T_FREE) {
             memset(d, 0, sizeof(*d));
@@ -172,9 +174,10 @@ static struct inode *efs_alloc_inode(struct super_block *sb, enum itype type)
 /* Entry `idx` of indirect block `ind`, allocating a block for it if asked. */
 static u32 ind_get(struct inode *ip, u32 ind, u64 idx, bool alloc)
 {
+    struct super_block *sb = ip->sb;
     if (!block_ok(ip->sb, ind, ip))
         return 0;
-    struct buf *b = bread(ind);
+    struct buf *b = BREAD(ind);
     u32 *a = (u32 *)b->data;
     u32 bno = a[idx];
     if (!bno && alloc && (bno = balloc(ip->sb))) {
@@ -218,7 +221,7 @@ static void free_ind(struct super_block *sb, u32 bno, u64 from, int depth, struc
 {
     if (!block_ok(sb, bno, ip))
         return;
-    struct buf *b = bread(bno);
+    struct buf *b = BREAD(bno);
     u32 *a = (u32 *)b->data;
     u64 per = depth == 2 ? EFS_NINDIRECT : 1;
     for (u64 i = 0; i < EFS_NINDIRECT; i++) {
@@ -284,6 +287,7 @@ static void efs_free_inode(struct inode *ip)
 
 static long efs_read(struct inode *ip, void *dst, u64 off, size_t n, bool user)
 {
+    struct super_block *sb = ip->sb;
     if (off >= ip->size)
         return 0;
     if (n > ip->size - off)
@@ -298,7 +302,7 @@ static long efs_read(struct inode *ip, void *dst, u64 off, size_t n, bool user)
         struct buf *b = NULL;
         static const u8 zeros[EFS_BSIZE];
         if (bno) {
-            b = bread(bno);
+            b = BREAD(bno);
             src = b->data + boff;
         } else {
             src = zeros;                        /* hole */
@@ -316,6 +320,7 @@ static long efs_read(struct inode *ip, void *dst, u64 off, size_t n, bool user)
 
 static long efs_write(struct inode *ip, const void *src, u64 off, size_t n, bool user)
 {
+    struct super_block *sb = ip->sb;
     if (off + n > EFS_MAXFILE)
         return -EFBIG;
     size_t done = 0;
@@ -326,7 +331,7 @@ static long efs_write(struct inode *ip, const void *src, u64 off, size_t n, bool
         u32 bno = bmap(ip, bn, true);
         if (!bno)
             break;                              /* disk full */
-        struct buf *b = bread(bno);
+        struct buf *b = BREAD(bno);
         long r = user ? copy_from_user(b->data + boff, (uintptr_t)src + done, chunk)
                       : (memcpy(b->data + boff, (const u8 *)src + done, chunk), 0);
         if (r) {
@@ -437,7 +442,7 @@ u32 efs_free_blocks(struct super_block *sb)
         if (!b || bno % per == 0 || bno == fi->s.datastart) {
             if (b)
                 brelse(b);
-            b = bread(fi->s.bmapstart + bno / per);
+            b = BREAD(fi->s.bmapstart + bno / per);
         }
         used += (b->data[(bno % per) / 8] >> (bno % 8)) & 1;
     }
@@ -482,7 +487,7 @@ static const struct fs_ops efs_ops = {
 static int efs_mount(struct super_block *sb)
 {
     struct efs_info *fi = kzalloc(sizeof(*fi));
-    struct buf *b = bread(1);
+    struct buf *b = BREAD(1);
     memcpy(&fi->s, b->data, sizeof(fi->s));
     brelse(b);
     if (fi->s.magic != EFS_MAGIC) {
@@ -502,7 +507,7 @@ static int efs_mount(struct super_block *sb)
     sb->root = iget(sb, EFS_ROOT_INO);
     fi->nfree_blocks = efs_free_blocks(sb);
     for (u32 blk = 0; blk < (fi->s.ninodes + EFS_IPB - 1) / EFS_IPB; blk++) {
-        struct buf *b = bread(fi->s.inodestart + blk);
+        struct buf *b = BREAD(fi->s.inodestart + blk);
         for (u32 i = 0; i < EFS_IPB; i++) {
             u32 ino = blk * EFS_IPB + i;
             if (ino >= 1 && ino < fi->s.ninodes)
@@ -513,6 +518,21 @@ static int efs_mount(struct super_block *sb)
     pr_info("efs: %u blocks, %u inodes, log %u blocks at %u\n", fi->s.size, fi->s.ninodes,
             fi->s.nlog, fi->s.logstart);
     return 0;
+}
+
+/* The volume label of the efs filesystem on a disk (before mounting it). */
+int efs_label(int disk, char out[17])
+{
+    struct buf *b = bread(disk, 1);
+    const struct efs_super *s = (const void *)b->data;
+    int r = -1;
+    if (s->magic == EFS_MAGIC) {
+        memcpy(out, s->label, 16);
+        out[16] = 0;
+        r = 0;
+    }
+    brelse(b);
+    return r;
 }
 
 const struct fs_type efs_type = { .name = "efs", .mount = efs_mount, .ops = &efs_ops };

@@ -20,6 +20,8 @@
 #define SSTATUS_SPIE  (1UL << 5)
 #define SSTATUS_SPP   (1UL << 8)
 #define SSTATUS_SUM   (1UL << 18)
+#define SSTATUS_FS    (3UL << 13)      /* FP state: 0 off, 1 initial, 2 clean, 3 dirty */
+#define SSTATUS_FS_INITIAL (1UL << 13)
 
 /* sie / sip */
 #define SIE_SSIE      (1UL << 1)

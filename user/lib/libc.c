@@ -187,6 +187,9 @@ struct tm *gmtime_r(const time_t *t, struct tm *tm)
     }
     tm->tm_mon = mon;
     tm->tm_mday = (int)days + 1;
+    tm->tm_isdst = 0;
+    tm->tm_gmtoff = 0;
+    tm->tm_zone = "UTC";
     return tm;
 }
 
@@ -433,133 +436,14 @@ pid_t getpgrp(void) { return getpgid(0); }
 pid_t setsid(void) { return ret(SC0(SYS_setsid)); }
 pid_t getsid(pid_t pid) { return ret(SC1(SYS_getsid, pid)); }
 
-const char *strerror(int err)
+char *strerror(int err)
 {
     switch (err) {
-#define X(name, num, desc) case num: return desc;
+#define X(name, num, desc) case num: return (char *)desc;
         ERRNOS(X)
 #undef X
     }
-    return "Unknown error";
-}
-
-/* ---- stdio ---- */
-
-static char outbuf[512];
-static size_t outlen;
-
-void fflush_stdout(void)
-{
-    if (outlen)
-        write(1, outbuf, outlen);
-    outlen = 0;
-}
-
-static void out_char(char c, void *arg)
-{
-    (void)arg;
-    outbuf[outlen++] = c;
-    if (c == '\n' || outlen == sizeof(outbuf))
-        fflush_stdout();
-}
-
-int vprintf(const char *fmt, va_list ap)
-{
-    return kvcbprintf(out_char, NULL, fmt, ap);
-}
-
-int printf(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vprintf(fmt, ap);
-    va_end(ap);
-    return n;
-}
-
-int fprintf_fd(int fd, const char *fmt, ...)
-{
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = kvsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (fd == 1)
-        fflush_stdout();
-    write(fd, buf, n < (int)sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
-    return n;
-}
-
-int putchar(int c)
-{
-    out_char((char)c, NULL);
-    return c;
-}
-
-int puts(const char *s)
-{
-    while (*s)
-        out_char(*s++, NULL);
-    out_char('\n', NULL);
-    return 0;
-}
-
-int getchar(void)
-{
-    char c;
-    fflush_stdout();
-    return read(0, &c, 1) == 1 ? (unsigned char)c : EOF;
-}
-
-/* ---- string extras ---- */
-
-size_t strcspn(const char *s, const char *reject)
-{
-    size_t n = 0;
-    while (s[n] && !strchr(reject, s[n]))
-        n++;
-    return n;
-}
-
-size_t strspn(const char *s, const char *accept)
-{
-    size_t n = 0;
-    while (s[n] && strchr(accept, s[n]))
-        n++;
-    return n;
-}
-
-char *strcpy(char *d, const char *s)
-{
-    char *r = d;
-    while ((*d++ = *s++))
-        ;
-    return r;
-}
-
-char *strcat(char *d, const char *s)
-{
-    strcpy(d + strlen(d), s);
-    return d;
-}
-
-int atoi(const char *s)
-{
-    return (int)strtol(s, 0, 10);
-}
-
-long strtol(const char *s, char **end, int base)
-{
-    int neg = 0;
-    while (kisspace(*s))
-        s++;
-    if (*s == '-' || *s == '+')
-        neg = *s++ == '-';
-    const char *e;
-    long v = (long)kstrtoul(s, &e, base);
-    if (end)
-        *end = (char *)e;
-    return neg ? -v : v;
+    return (char *)"Unknown error";
 }
 
 /* ---- malloc ----
@@ -718,9 +602,12 @@ void malloc_stats(void)
 
 int main(int argc, char **argv);
 
+/* stdio.c and stdlib.c: run atexit handlers, flush every stream */
+void __libc_exit_hooks(void);
+
 void exit(int status)
 {
-    fflush_stdout();
+    __libc_exit_hooks();
     _exit(status);
 }
 

@@ -82,7 +82,6 @@ The system is a single-user teaching OS running in a VM, but it does have users 
   - Pipes ignore `O_NONBLOCK`.
   - `getdents64` truncates 59-byte names.
   - `access()` uses effective ids.
-  - mkfs makes every file mode 0755, `/etc/passwd` included.
 - **Profiler:**
   - The real sampling rate is `HZ * (hz / HZ)`, but the requested rate is recorded (250 → 200 Hz).
   - A failed dump leaves profiling off.
@@ -106,6 +105,8 @@ The stale statements in `docs/` were fixed during the review; the comments in th
 
 - **H5, spurious end-of-file on the terminal.** The TTY input queue now stores `^D` as a marker entry (`Q_EOF`) in line with the text, and one counter of line ends is kept right by every push and pop, in every mode ([07](subsystems/07-devices-and-tty.md#tty-read-tty_read)).
 - **Flaky `tcp_loopback_echo`.** A blocking TCP `send` returned a short count when the send buffer filled, so the test's echo server (and `echod`) gave up on a "short" `write` and reset the connection, about one boot in seven. Blocking sends now wait until all the data is queued, as on Linux. The test's client uses a non-blocking socket for its `poll` loop, and its server loops on `write`.
+- **mkfs file modes.** mkfs now takes file modes from the host: 0755 for executables, 0644 for everything else (`/etc/passwd` included).
+- **The kernel could have used floating point.** It was compiled for `rv64gc` while saving no FP state. It is now built for `rv64imac_zicsr_zifencei`/`lp64`, so the compiler cannot emit an FP instruction in kernel code; `fp.S` is the only kernel code that touches the FP registers ([11](subsystems/11-build-and-testing.md#compiler-flags-and-why)).
 - **C10 and the old shell's wrong behavior.** The shell was replaced by [esh](subsystems/12-shell.md). It expands each command when it runs, applies redirections to builtins, has its own state per `source`, and frees per-command memory. It has no fixed word limits, and doesn't use process groups when not interactive.
 
 ## 2. Top recommendations
@@ -144,7 +145,7 @@ Ranked by value for effort. The first group is mostly small fixes for the bugs a
 |---:|---|:-:|:-:|
 | 17 | Shell: regular expressions for `[[ =~ ]]`, extended globbing and glob qualifiers, `SIGWINCH` from the console | M | M |
 | 18 | TCP: NewReno fast recovery, delayed ACKs and Nagle, window scaling with configurable buffers | M | M |
-| 19 | User-space C library: malloc with checked poison, canaries and delayed reuse; buffered input; flush before `fork` | H | M |
+| 19 | User-space C library: malloc with checked poison, canaries and delayed reuse; flush before `fork`; POSIX leftmost-longest regex; `grep -E` on the libc regex | H | M |
 | 20 | Scheduler: per-CPU run queues, or at least last-CPU affinity; split `sched_lock`; ticket spinlocks | M | L |
 
 ## 3. Cross-cutting themes
@@ -155,7 +156,7 @@ Patterns that showed up in several independent reviews. Fixing them as patterns,
    - the command line (32 words, 256 bytes) and the `log=` spec (128 bytes);
    - reserved regions, harts and virtio devices (8 each);
    - ppoll wait registrations (128) and the environment (63 entries);
-   - stdout lines (511 bytes), `getdents64` names, `httpd` files over 64 KiB;
+   - `getdents64` names, `httpd` files over 64 KiB;
    - the ARP and lockdep class tables.
 
    Several of these drop data with no message; a dropped reserved region could even hand firmware memory to the allocator. A `WARN_ONCE`-style helper that reports the first truncation per site would make all of them visible at boot or at first use.
@@ -205,7 +206,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - SIGTRAP for user `ebreak` instead of stopping the machine (M/S).
 - Sstc timer and tickless idle (M/M).
 - Spread device interrupts across CPUs, with PLIC contexts from the device tree (M/M).
-- User floating point: a better diagnosis first, then real support (M/L).
+- Save FP registers only when `sstatus.FS` says they are dirty (L/S).
 - Smaller items (L/S): `TF_*` offsets generated from C; prompt signal delivery to running processes; `missed_ticks` and per-syscall statistics; a sorted exception table.
 
 ### [Threads, scheduling and SMP](subsystems/04-threads-scheduling-smp.md#potential-improvements)
@@ -244,6 +245,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Ordered-mode journaling so file data isn't logged (H/L).
 - An inode cache with hashing (M/M).
 - Validate geometry at mount and in fsck; let fsck replay a committed log (M/S).
+- A mount table (`/etc/fstab` or a `mount` call) instead of the two fixed labels, `/dev` nodes for every disk, and a real `st_dev` per filesystem (M/M).
 - Pipe `O_NONBLOCK` and atomic writes (M/S).
 - Smaller items: `getdents64` names; harden `vfs_getcwd`; root-only `DBG_FSCRASH`; `eu-files` for pipes.
 
@@ -256,7 +258,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - SIGTTOU and ioctl validation (M/S).
 - Interrupt-driven, buffered UART output (M/M).
 - Line-discipline ktests (M/S).
-- Smaller items: `OPOST` and SIGWINCH; `EVENT_IDX` and batched kicks; scatter-gather I/O; a driver registry; `_POSIX_VDISABLE`.
+- Smaller items: `OPOST` and SIGWINCH; `/dev/diskN` for every disk; `EVENT_IDX` and batched kicks; scatter-gather I/O; a driver registry; `_POSIX_VDISABLE`.
 
 ### [Networking](subsystems/08-networking.md#potential-improvements)
 - netd lost kick (H/S).
@@ -284,14 +286,15 @@ Condensed. Each document's last section has the detail, code locations and reaso
 
 ### [User space](subsystems/10-user-space.md#potential-improvements)
 - A malloc with real checks: delayed reuse, checked poison, canaries (H/M).
-- Flush before `fork` (M/S).
-- `printf` short writes (M/S).
-- Buffered line input (M/M).
+- Flush stdio before `fork` (M/S).
+- `grep` and `head` on stdio, and `regcomp` in `grep` (`-E`, `-F`) and the pager (M/S).
+- Payne–Hanek argument reduction for `sin`/`cos`/`tan` of huge arguments (L/S).
+- POSIX leftmost-longest regular expressions without a step limit (M/M).
 - Harden `httpd` (M/S).
 - Smaller items: eutils arguments; consistent `execvp` limits; safer signal handlers; unwind information for `__restore_rt`.
 
 ### [The shell](subsystems/12-shell.md#potential-improvements)
-- Regular expressions for `[[ =~ ]]` (M/M).
+- Regular expressions for `[[ =~ ]]` (M/S now that libc has `regcomp`).
 - Extended globbing and glob qualifiers (M/M).
 - More completion: program arguments, hosts, pids (M/M).
 - vi mode and `bindkey` (M/M).
@@ -307,18 +310,23 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Stamp files so flag and file-list changes trigger rebuilds (M/S).
 - Machine-readable results (M/S).
 - `APPEND` overrides stage options (M/S).
-- Smaller items: build the kernel without floating point (`-march=rv64imac`, which removes a latent hazard: the kernel never saves FP state); unique scratch paths; mkfs file modes; host tests that don't need the cross toolchain.
+- A test stage with a second (home) disk (M/S).
+- Smaller items: unique scratch paths; owners and modes for files in mkfs specs; host tests that don't need the cross toolchain.
 
 ## 5. Larger directions
 
 Bigger projects that would each change what the system can do. They are listed roughly in the order they build on each other.
+
+**Done since the review:**
+- **Floating point for user programs.** User code is built for `rv64gc`/`lp64d`. The kernel enables FP per thread on its first FP instruction, saves and restores the registers at context switches of threads that use them, copies them at `fork`, resets them at `exec`, and carries them in signal frames ([03](subsystems/03-traps-interrupts-syscalls.md#lazy-floating-point-for-user-programs)).
+- **A real C library.** Buffered `FILE` stdio, `printf` with floating point, `scanf`, `strto*`, `qsort`, `getopt`, `math.h`, `strftime`, `setjmp`/`sigsetjmp`, and POSIX regular expressions (BRE and ERE) ([10](subsystems/10-user-space.md#stdio-streams)).
+- **Several disks and a persistent `/home`.** Up to four virtio disks, a buffer cache keyed by disk, a log per filesystem, volume labels, and `home.img`, which survives rebuilds ([06](subsystems/06-filesystems.md#boot-and-mounting)).
 
 | Direction | What it involves | Why |
 |---|---|---|
 | **User threads** (`clone`, futex, per-thread signal masks, TLS via `tp`) | Many threads per `mm`: per-thread kernel state, an `mm` lock for real, TLB shootdowns for user mappings, thread-directed signals | The single-thread-per-process assumption is everywhere (mm locking, signals, `current_proc`); this is the largest structural change |
 | **Page cache and file-backed `mmap`** | Cache file pages instead of whole-program `kmalloc` images; demand paging from disk; shared text; `msync` | Removes the 4 MiB program limit, makes `exec` cheap, enables shared libraries |
 | **Dynamic linking** (an `ld.so`, a shared libc) | Needs the page cache and `mmap` of files | Smaller binaries; a more realistic user space |
-| **Floating point for user programs** | Lazy FP context switching (`sstatus.FS`), `lp64d` for user builds | Programs are integer-only today; most real C code expects FP |
 | **A real filesystem alongside efs** (ext2, read-only first) | A second filesystem type through the VFS | Exchange files with the Mac; exercises the VFS boundaries |
 | **Networking breadth:** DHCP, a DNS resolver, IPv6 | DHCP and DNS are small user programs on top of UDP; IPv6 is a larger stack addition | Talk to the outside world by name; QEMU's user network provides DHCP and DNS |
 | **Per-CPU scheduling and a better scheduler** | Per-CPU run queues with load balancing, priorities and `nice`, maybe CFS-like fairness | Scales beyond a handful of harts; gives interactive priority |

@@ -30,7 +30,7 @@ command make run
 
 | Target | What it does |
 |---|---|
-| `make run` | Boot with 4 CPUs, the disk image and a NIC (`CPUS=`, `MEM=`, `APPEND="boot options"`) |
+| `make run` | Boot with 4 CPUs, the disk image, a persistent `/home` disk (`home.img`) and a NIC (`CPUS=`, `MEM=`, `APPEND="boot options"`) |
 | `make debug` / `make gdb` | Boot halted, then attach GDB with the `eu-*` helpers |
 | `make test` | The whole test scenario, headless (kernel and user tests, crash recovery, SMP stress, shell, networking) |
 | `make test-host` | Native tests on the Mac with ASan/UBSan (allocator, printf, TCP over a lossy link, fsck) |
@@ -41,13 +41,14 @@ command make run
 | `make flamegraph` | Profile report and an interactive SVG flamegraph from `profile dump` |
 | `make trace-json` | Event trace for ui.perfetto.dev from `trace dump` |
 | `make fsck` | Check the disk image |
+| `make clean-home` | Delete `home.img`, so the next `make run` starts with an empty `/home` |
 
 ## What's inside
 
-- **Hardware:** QEMU `virt` with RV64GC, OpenSBI firmware, the kernel in S-mode; up to 8 harts, virtio block and network devices.
+- **Hardware:** QEMU `virt` with RV64GC, OpenSBI firmware, the kernel in S-mode; up to 8 harts, virtio block (up to four disks) and network devices. User programs may use floating point (switched lazily by the kernel, which itself uses none).
 - **Memory:** a buddy page allocator and a slab allocator, both with poisoning, redzones, allocation sites and leak reports. Sv39 page tables with a W^X kernel, guard pages under kernel stacks, demand paging and copy-on-write `fork`.
 - **Processes:** ELF executables, `fork`/`exec`/`wait`, signals with handlers, process groups and sessions, a TTY line discipline with job control, users and permissions, and Linux system call numbers.
-- **Files:** a VFS, *efs* (an on-disk filesystem with a write-ahead log that survives power failures), devfs, and procfs with a lot of kernel state.
+- **Files:** a VFS, *efs* (an on-disk filesystem with a write-ahead log that survives power failures), devfs, and procfs with a lot of kernel state. The root filesystem is rebuilt with the programs; `/home` lives on a second disk that survives rebuilds.
 - **SMP:** every hart runs threads from a shared run queue; IPIs handle reschedules, TLB shootdowns and stopping the world.
 - **Network:** Ethernet, ARP, IPv4, ICMP, UDP and TCP (with retransmission, fast retransmit, reassembly and congestion control), BSD sockets, and `poll`/`select`.
 - **User land:** `esh`, a zsh-like shell: functions, arrays, `[[ ]]`, zsh's expansions and job control, with a line editor that does syntax highlighting, history autosuggestions, prefix and incremental history search, and Tab completion with menus ([manual](docs/subsystems/12-shell.md)). Plus about 60 commands including `ps`, `top`, `strace`, `grep`, `nc`, `ping`, `httpd` and `rshd`.

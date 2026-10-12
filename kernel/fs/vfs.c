@@ -14,6 +14,7 @@
 #include <proc.h>
 #include <trace.h>
 #include <uapi/errno.h>
+#include <virtio.h>
 
 struct inode *root_inode;
 static LIST_HEAD(icache);
@@ -174,7 +175,13 @@ void fs_end_op(struct super_block *sb)
 
 int vfs_mount(const struct fs_type *type, const char *path)
 {
+    return vfs_mount_disk(type, path, 0);
+}
+
+int vfs_mount_disk(const struct fs_type *type, const char *path, int disk)
+{
     struct super_block *sb = kzalloc(sizeof(*sb));
+    sb->disk = disk;
     sb->type = type;
     sb->ops = type->ops;
     mutex_init(&sb->ns_lock, "namespace");
@@ -210,7 +217,10 @@ int vfs_mount(const struct fs_type *type, const char *path)
     else
         root_inode = sb->root;
     list_add_tail(&sb->node, &mounts);
-    pr_info("mounted %s on %s\n", type->name, path);
+    if (type == &efs_type)
+        pr_info("mounted %s (disk%d) on %s\n", type->name, disk, path);
+    else
+        pr_info("mounted %s on %s\n", type->name, path);
     return 0;
 }
 
@@ -927,11 +937,32 @@ void *vfs_read_all(const char *path, size_t *size, int *err)
     return data;
 }
 
+/* The disk whose efs volume label is `label`, or -1. */
+static int disk_labeled(const char *label)
+{
+    for (int d = 0; d < blk_count(); d++) {
+        char l[17];
+        if (efs_label(d, l) == 0 && !strcmp(l, label))
+            return d;
+    }
+    return -1;
+}
+
 void vfs_init(void)
 {
     bcache_init();
-    if (vfs_mount(&efs_type, "/"))
+    /* / is the disk labelled "root" (or the first one), /home the one labelled "home" */
+    int root = disk_labeled("root");
+    if (root < 0)
+        root = 0;
+    if (vfs_mount_disk(&efs_type, "/", root))
         panic("cannot mount the root filesystem");
+    int home = disk_labeled("home");
+    if (home >= 0 && home != root) {
+        int hr = vfs_mount_disk(&efs_type, "/home", home);
+        if (hr)
+            pr_warn("/home (disk%d) not mounted: %s\n", home, errno_name(-hr));
+    }
     int r = vfs_mount(&devfs_type, "/dev");
     if (r)
         pr_warn("/dev not mounted (%s); create /dev in the image\n", errno_name(-r));

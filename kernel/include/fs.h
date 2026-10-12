@@ -28,6 +28,7 @@
 
 struct buf {
     u32 blockno;
+    u32 disk;                   /* which disk (blk_rw numbering) */
     bool valid;                 /* data read from disk */
     int refcnt;
     u32 pins;                   /* held by the log until installed */
@@ -39,7 +40,7 @@ struct buf {
 };
 
 void bcache_init(void);
-struct buf *bread(u32 blockno);         /* returns the buffer locked */
+struct buf *bread(u32 disk, u32 blockno);   /* returns the buffer locked */
 int bwrite(struct buf *b);              /* write through; caller holds it */
 void brelse(struct buf *b);
 void bpin(struct buf *b);
@@ -113,6 +114,7 @@ struct super_block {
     struct mutex ns_lock;
     char path[32];
     void *priv;
+    int disk;                   /* the disk a disk-based filesystem lives on */
     u64 errors;                 /* inconsistencies detected while running */
     struct list_head node;
 };
@@ -155,6 +157,8 @@ extern struct inode *root_inode;
 
 void vfs_init(void);
 int vfs_mount(const struct fs_type *type, const char *path);
+int vfs_mount_disk(const struct fs_type *type, const char *path, int disk);
+int efs_label(int disk, char out[17]);         /* -1 if the disk holds no efs */
 struct inode *iget(struct super_block *sb, u32 ino);
 struct inode *idup(struct inode *ip);
 void ilock(struct inode *ip);

@@ -14,7 +14,20 @@
 #include <virtio.h>
 
 enum { DEV_ROOT = 1, DEV_CONSOLE, DEV_NULL, DEV_ZERO, DEV_KMSG, DEV_DISK0, DEV_TTY, DEV_TTY0,
-       DEV_MAX };
+       DEV_DISK1, DEV_MAX };
+
+/* disk0, disk1: which blk_rw disk, or -1 */
+static int disk_of(u32 ino)
+{
+    return ino == DEV_DISK0 ? 0 : ino == DEV_DISK1 ? 1 : -1;
+}
+
+/* Devices that exist (a disk device only if that disk is attached). */
+static bool dev_exists(u32 ino)
+{
+    int d = disk_of(ino);
+    return d < 0 || d < blk_count();
+}
 
 static long out(void *dst, const void *src, size_t n, bool user)
 {
@@ -80,7 +93,8 @@ static void snapshot_close(struct file *f)
 
 static long disk_rd(struct file *f, void *buf, size_t n, bool user)
 {
-    u64 size = blk_capacity() * 512;
+    int disk = disk_of(f->ip->ino);
+    u64 size = blk_capacity(disk) * 512;
     if (f->off >= size)
         return 0;
     n = MIN(n, size - f->off);
@@ -90,7 +104,7 @@ static long disk_rd(struct file *f, void *buf, size_t n, bool user)
     size_t done = 0;
     while (done < n) {
         u64 pos = f->off + done, base = ALIGN_DOWN(pos, PAGE_SIZE);
-        if (blk_rw(base / 512, page, MIN((u64)PAGE_SIZE, size - base), false))
+        if (blk_rw(disk, base / 512, page, MIN((u64)PAGE_SIZE, size - base), false))
             break;
         size_t c = MIN(n - done, (size_t)(base + PAGE_SIZE - pos));
         if (out((u8 *)buf + done, page + (pos - base), c, user))
@@ -123,6 +137,7 @@ static const struct {
     [DEV_ZERO]    = { "zero", &zero_ops, 0666 },
     [DEV_KMSG]    = { "kmsg", &kmsg_ops, 0444 },
     [DEV_DISK0]   = { "disk0", &disk_ops, 0440 },
+    [DEV_DISK1]   = { "disk1", &disk_ops, 0440 },
 };
 
 static int dev_read_inode(struct inode *ip)
@@ -133,15 +148,15 @@ static int dev_read_inode(struct inode *ip)
         ip->mode = 0755;
         return 0;
     }
-    if (ip->ino >= DEV_MAX || !devs[ip->ino].name)
+    if (ip->ino >= DEV_MAX || !devs[ip->ino].name || !dev_exists(ip->ino))
         return -ENOENT;
     ip->type = I_CHR;
     ip->nlink = 1;
     ip->mode = devs[ip->ino].mode;
     ip->rdev = ip->ino;
     ip->cops = devs[ip->ino].ops;
-    if (ip->ino == DEV_DISK0)
-        ip->size = blk_capacity() * 512;
+    if (disk_of(ip->ino) >= 0)
+        ip->size = blk_capacity(disk_of(ip->ino)) * 512;
     return 0;
 }
 
@@ -151,7 +166,7 @@ static u32 dev_lookup(struct inode *dir, const char *name)
     if (!strcmp(name, ".") || !strcmp(name, ".."))
         return DEV_ROOT;
     for (u32 i = DEV_CONSOLE; i < DEV_MAX; i++)
-        if (!strcmp(name, devs[i].name))
+        if (!strcmp(name, devs[i].name) && dev_exists(i))
             return i;
     return 0;
 }
@@ -167,6 +182,10 @@ static int dev_readdir(struct inode *dir, u64 *off, struct kdirent *de)
         return 1;
     }
     u32 ino = DEV_CONSOLE + (u32)(i - 2);
+    while (ino < DEV_MAX && !dev_exists(ino)) {     /* skip missing disks */
+        ino++;
+        (*off)++;
+    }
     if (ino >= DEV_MAX)
         return 0;
     de->ino = ino;

@@ -212,9 +212,19 @@ static void user_exception(struct trap_frame *tf, u64 code)
         break;
     }
     case EXC_ILLEGAL_INSN:
-        user_fault(tf, (tf->sstatus & (3UL << 13)) == 0 && (tf->stval & 0x7f) == 0x07
-                       ? "floating point is not supported in user mode yet"
-                       : "illegal instruction", SIGILL);
+        if (!(tf->sstatus & SSTATUS_FS) && !current->fp_used) {
+            /*
+             * Floating point starts off for every program; the first FP
+             * instruction lands here. Give the thread zeroed FP registers
+             * (never another process's) and retry the instruction.
+             */
+            memset(&current->fp, 0, sizeof(current->fp));
+            current->fp_used = true;
+            fp_load_regs(&current->fp);
+            tf->sstatus |= SSTATUS_FS_INITIAL;
+            break;
+        }
+        user_fault(tf, "illegal instruction", SIGILL);
         break;
     case EXC_INSN_MISALIGNED:
     case EXC_LOAD_MISALIGNED:

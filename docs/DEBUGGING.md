@@ -62,9 +62,13 @@ Use the up/down arrows for history. To exit QEMU, press `Ctrl-A X`.
 
 ## Disk and filesystems
 
-The root filesystem is **efs** on a virtio disk, `build/fs.img`. `make` builds it with the host tool `build/tools/mkfs`. It holds the user programs from `user/bin`, `/etc/motd`, and empty `/dev`, `/proc`, `/tmp` and `/home`. The image is rebuilt whenever a program changes, which discards files created at run time. devfs is mounted on `/dev` (`console null zero kmsg disk0 tty tty0`); procfs is mounted on `/proc`.
+The root filesystem is **efs** on a virtio disk, `build/fs.img` (volume label `root`). `make` builds it with the host tool `build/tools/mkfs`. It holds the user programs from `user/bin`, `/etc/motd`, and empty `/dev`, `/proc`, `/tmp` and `/home`. The image is rebuilt whenever a program changes, which discards files created at run time.
 
-**fsck**: `make fsck` checks `build/fs.img` (`build/tools/mkfs --check IMAGE`). It reports:
+`make run` (and `debug`, `qemu-log`) also attaches a second disk, `home.img` in the top directory (label `home`, 64 MiB, with `/guest` owned by uid 1000). The kernel mounts it on `/home`, so files kept there survive rebuilds and `make clean`; `make clean-home` deletes it. The kernel picks disks by label, not order: `/` is the disk labelled `root` (or disk 0), `/home` the one labelled `home`. The boot log says which (`mounted efs (disk1) on /home`). `make test` boots with the root disk only.
+
+devfs is mounted on `/dev` (`console null zero kmsg disk0 disk1 tty tty0`; `disk1` only when a second disk is attached); procfs is mounted on `/proc`.
+
+**fsck**: `make fsck` checks `build/fs.img` (`build/tools/mkfs --check IMAGE`; run it by hand on `home.img`, with QEMU stopped). It prints the volume label and reports:
 - superblock and log problems, and notes a committed log awaiting replay
 - `.`/`..` errors, bad names, wrong link counts
 - blocks outside the data area or used twice
@@ -75,7 +79,7 @@ The root filesystem is **efs** on a virtio disk, `build/fs.img`. `make` builds i
 
 **/proc** (text, generated at open): `meminfo slabinfo interrupts threads sched procs mounts bcache blk icache trace virtio uptime pipes tty cpus lockdep`, and per process `/proc/<pid>/{status,maps,fds,stack,ustack}` and `/proc/self`. `/dev/kmsg` is a snapshot of the kernel log.
 
-**Monitor**: `mounts` (space, inode use, log statistics: commits, blocks logged/absorbed, commit latency, recovery at mount), `bcache` (hit rate; referenced/pinned buffers and **who took them**), `icache` (cached inodes, references, lock holders), `blk` (I/O counts, latency, in-flight; every virtio slot), `files <pid>`. These never block, so they work while the monitor has the machine stopped. **GDB**: `eu-bcache`, `eu-files <pid>`.
+**Monitor**: `mounts` (space, inode use, log statistics: commits, blocks logged/absorbed, commit latency, recovery at mount), `bcache` (hit rate; referenced/pinned buffers and **who took them**), `icache` (cached inodes, references, lock holders), `blk` (I/O counts, latency, in-flight, per disk; every virtio slot), `files <pid>`. These never block, so they work while the monitor has the machine stopped. **GDB**: `eu-bcache`, `eu-files <pid>`.
 
 **Caught automatically:**
 - buffer-cache exhaustion panics with the list of held buffers and their call sites (usually a missing `brelse`)
@@ -146,7 +150,8 @@ Faults become catchable signals (`SIGSEGV`, `SIGILL`, `SIGBUS`). The detailed cr
 
 **Safety checks that will bite you (on purpose):** the kernel can only touch user memory through `copy_from_user` / `copy_to_user` / `strncpy_from_user`. `sstatus.SUM` is enabled only inside them, so any other kernel dereference of a user pointer panics with "user-space address accessed from the kernel". Kernel addresses passed in by user programs are rejected with `EFAULT`. User memory is W^X, too: `mmap(PROT_WRITE|PROT_EXEC)` fails with `EACCES`.
 
-User programs are integer-only for now (`rv64imac`); a floating-point instruction kills the process with a message saying so.
+User programs are built for `rv64gc` and may use floating point. The kernel is built without FP; a thread gets zeroed FP registers on its first FP instruction (an illegal-instruction trap the kernel absorbs) and from then on they are saved and restored at context switches, copied by `fork`, and carried in signal frames. In GDB, `info registers float` shows the live user values only while that thread is the one running on the CPU; otherwise look at `((struct thread *)T)->fp`.
+
 
 ## Threads, scheduling and locks
 

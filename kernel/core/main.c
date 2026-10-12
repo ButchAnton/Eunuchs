@@ -54,7 +54,7 @@ void cpu_early_init(unsigned long hartid);
 static void kinit(void *arg)
 {
     (void)arg;
-    if (blk_init())
+    if (blk_init() == 0)
         panic("no disk: the root filesystem lives on a virtio block device "
               "(make run attaches build/fs.img)");
     vfs_init();

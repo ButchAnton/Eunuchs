@@ -4,6 +4,6 @@
 #include <uapi/errno.h>
 
 extern int errno;
-const char *strerror(int err);
+char *strerror(int err);
 
 #endif
