@@ -22,6 +22,8 @@ mon> netstat
 brew install qemu riscv64-elf-gcc riscv64-elf-gdb
 ```
 
+The guest is RISC-V, so the host can be Apple Silicon or Intel. On Intel Macs Homebrew often has no `qemu` bottle; if `qemu-system-riscv64` is missing or breaks after a `brew upgrade`, reinstall the local formula: `brew reinstall local/qemu/qemu`.
+
 ```bash
 command make run
 ```

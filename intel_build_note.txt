@@ -1,0 +1,2 @@
+If qemu updates via homebrew, reinstall the local qemu:
+brew reinstall local/qemu/qemu

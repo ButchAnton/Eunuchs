@@ -118,6 +118,15 @@ QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(SHAREOPTS) $(NETO
 
 .PHONY: all user fsck clean-home run debug gdb test selfhost stress test-host trace-json flamegraph record replay replay-debug replay-gdb replay-check ci qemu-log disasm clean sysroot
 
+# Written on Apple Silicon. A different host (Intel Mac) or Homebrew GCC
+# can change RISC-V ELF ABI tags; .S files have no header deps, so they
+# would otherwise stay stale and the kernel link fails (soft- vs double-float).
+# Updated at parse time so GNU Make 3.81 sees a newer file before it walks
+# the graph (a FORCE recipe can rewrite the stamp in the same second and
+# then skip dependents).
+CC_ID := $(BUILD)/.cc-id
+$(shell mkdir -p $(BUILD) && printf '%s\n' "$(shell uname -m)" "$(CC)" "$(CFLAGS)" "$(UCFLAGS)" "$(shell $(CC) --version 2>/dev/null | head -1)" "$(shell $(HOSTCC) --version 2>/dev/null | head -1)" > $(CC_ID).tmp && { cmp -s $(CC_ID) $(CC_ID).tmp || mv $(CC_ID).tmp $(CC_ID); } && rm -f $(CC_ID).tmp)
+
 all: $(KERNEL) $(FSIMG)
 
 # --- Two-pass link: pass 1 has an empty symbol table; its symbols generate
@@ -479,6 +488,11 @@ $(BUILD)/host/%: tests/host/%.c
 	@mkdir -p $(dir $@)
 	$(call msg,HOSTCC,$@)
 	$(Q)$(HOSTCC) $(HOST_CFLAGS) $(if $(filter %test_tcp,$@),-DNET_HOST_TEST) -o $@ $^
+
+$(KOBJS) $(ULIB) $(UMULTI_OBJS) $(BUILD)/tcc/tcc.o \
+  $(BUILD)/ksyms0.o $(BUILD)/ksyms.o \
+  $(patsubst user/bin/%.c,$(BUILD)/user/bin/%.o,$(wildcard user/bin/*.c)) \
+  $(XTCC) $(MKFS) $(HOST_TESTS): $(CC_ID)
 
 test-host: $(HOST_TESTS) $(MKFS) $(BUILD)/user/bin/hello $(XTCC)
 	@for t in $(HOST_TESTS); do echo "== $$t"; $$t || exit 1; done

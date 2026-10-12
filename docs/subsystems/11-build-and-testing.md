@@ -709,6 +709,8 @@ build/tools/mkfs --check /tmp/t.img
 - **grc wraps `make`** in a zsh shell function that pipes its output, so the guest console is line-buffered (typed characters appear after Return). Use `command make run` (also for `debug`, `record`, `qemu-log`). `\make` does not help, because grc uses a function, not an alias. `check_tty` warns when it detects this.
 - **`cp` aliased to `cp -i`** in interactive shells: copying over an existing image by hand prompts. The Makefile recipes use `cp -f` and run under `sh`, so they are not affected.
 - Ports 8080/2323/5555 in use → `make run` fails to start QEMU; use `HTTP_PORT=...` or `HOSTFWD=`.
+- **`can't link soft-float modules with double-float modules`**: leftover kernel `.S` objects from another host or GCC (the tree was first built on Apple Silicon). `build/.cc-id` records `uname -m` and the compiler so the next `make` rebuilds them; `make clean` also clears it.
+- **Intel Mac QEMU**: Homebrew may not bottle `qemu`. If `qemu-system-riscv64` disappears or breaks after `brew upgrade`, `brew reinstall local/qemu/qemu`.
 - Quit QEMU with `Ctrl-A X`; `Ctrl-]` enters the kernel monitor.
 - `make ci` starts by deleting `build/`, including any recording in `build/rr/` and profiles or traces you dumped.
 
