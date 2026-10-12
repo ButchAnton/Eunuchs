@@ -160,7 +160,7 @@ The operators apply to each element of an array.
 
 Special parameters:
 
-- **Status and processes.** `$?` is the last status: `128 + signal` for a killed command, 148 for a stopped one. `$$` is the shell's pid and `$!` the last background pid. `$pipestatus` is an array with every stage's status.
+- **Status and processes.** `$?` is the last status: `128 + signal` for a killed command, 148 for a stopped one. A command made only of assignments (and redirections) expands its values with `$?` still the previous command's status (so `s=$?` saves it), and its own status is that of its last command substitution (`x=$(false)` sets 1), or 0 if it has none (an earlier version reset `$?` to 0 before expanding the values, so `s=$?` always saved 0). `$$` is the shell's pid and `$!` the last background pid. `$pipestatus` is an array with every stage's status.
 - **Arguments and options.** `$#`, `$1`... and `$@`/`$*` are the positional parameters, `$0` the script or shell name. `$-` holds the single-letter options.
 - **Shell variables.**
   - computed on every read: `RANDOM` (0-32767), `SECONDS` (since start-up; assignable), `EPOCHSECONDS`, `LINENO`;

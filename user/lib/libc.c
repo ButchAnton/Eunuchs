@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/reboot.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -260,6 +261,7 @@ int sched_yield(void) { return ret(SC0(SYS_sched_yield)); }
 int kill(pid_t pid, int sig) { return ret(SC2(SYS_kill, pid, sig)); }
 unsigned sleep_ms(unsigned long ms) { return ret(SC1(SYS_sleep_ms, ms)); }
 unsigned long uptime_ms(void) { return SC0(SYS_uptime_ms); }
+int reboot(int how) { return ret(SC1(SYS_reboot, (unsigned)how)); }
 pid_t waitpid(pid_t pid, int *st, int opt) { return ret(__syscall(SYS_wait4, pid, (long)st, opt, 0, 0, 0)); }
 pid_t wait(int *st) { return waitpid(-1, st, 0); }
 int munmap(void *a, size_t n) { return ret(SC2(SYS_munmap, a, n)); }

@@ -2,7 +2,7 @@
  * eutils: one binary, many small tools, chosen by argv[0] (the disk image
  * has /bin/<tool> as hard links to it):
  *   echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env
- *   id true false yes kill date dmesg free sleep strace su dbg uname clear
+ *   id true false yes kill date dmesg free sleep strace su dbg uname clear reboot poweroff
  */
 #include <dirent.h>
 #include <errno.h>
@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -751,6 +752,10 @@ int main(int argc, char **argv)
     } else if (!strcmp(prog, "mv") && argc == 3) {
         if (rename(argv[1], argv[2]) < 0)
             rc = fail(argv[1]);
+    } else if (!strcmp(prog, "reboot") || !strcmp(prog, "poweroff")) {
+        /* through the boot loader again (reboot), or off */
+        if (reboot(!strcmp(prog, "reboot") ? RB_AUTOBOOT : RB_POWER_OFF) < 0)
+            rc = fail(prog);
     } else if (!strcmp(prog, "cp")) {
         rc = cp_main(argc, argv);
     } else if (!strcmp(prog, "wc")) {

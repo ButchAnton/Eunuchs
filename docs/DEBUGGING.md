@@ -60,6 +60,22 @@ Use the up/down arrows for history. To exit QEMU, press `Ctrl-^ X`.
 `crash null|store|wx|uaf|overflow|stack|illegal|ebreak|panic|assert` deliberately triggers each failure path.
 `demo pingpong|spin|deadlock` spawns threads to watch with `ps` and `trace`.
 
+## Booting
+
+QEMU starts **eboot**, the boot loader (`build/eboot.elf`), which loads `/boot/kernel.elf` from the root disk ([01](subsystems/01-boot-and-platform.md#0-the-boot-loader-bootebootc)). Its lines come first on the console:
+
+| Message | Meaning |
+|---|---|
+| `eboot: Eunuchs boot loader` | it started |
+| `eboot: root disk at 0x…` (with `(a committed transaction in the log: read through it)` after a crash) | the disk it chose |
+| `eboot: loaded /boot/kernel.elf (N KiB), entry 0x…` | it jumped to that kernel |
+| `eboot: /boot/kernel.elf: not found` / `not a RISC-V 64-bit ELF executable` / `does not fit below the boot loader` (with the segment) / `bad program headers` / `read error` | that kernel was refused; it tries `/boot/kernel.old.elf` next |
+| `eboot: no kernel to boot`, `eboot: powering off` | neither kernel worked |
+| `eboot: no disk with an efs filesystem` | no usable root disk |
+| a legacy-virtio message | QEMU without `-global virtio-mmio.force-legacy=false` |
+
+The kernel's banner then says which compiler built it (`by gcc 16.2.0` or `by tcc`). `make run BOOT=direct` skips eboot and has QEMU load `build/kernel.elf` (the old way), for when the loader itself is in doubt. Debugging through the loader works: `make debug` + `make gdb` set breakpoints in the kernel before it is loaded, and since QEMU's GDB breakpoints don't patch memory, eboot's copying doesn't erase them. GDB reads `build/kernel.elf`, whose code is the same as the stripped `/boot/kernel.elf`. To try a kernel on Eunuchs, keep the old one (`cp /boot/kernel.elf /boot/kernel.old.elf`), copy the new one to `/boot/kernel.elf`, and `reboot`; if it does not boot, eboot falls back to the old one only if the new one is unloadable, not if it crashes later (then use `make run BOOT=direct` or rebuild the image).
+
 ## Disk and filesystems
 
 The root filesystem is **efs** on a virtio disk, `build/fs.img` (volume label `root`). `make` builds it with the host tool `build/tools/mkfs`. It holds the user programs from `user/bin`, `/etc/motd`, empty `/dev`, `/proc`, `/tmp` and `/home`, the toolchain in `/usr`, and the system's own source tree in `/usr/src/eunuchs` (64 MiB in all). The image is rebuilt whenever a program changes, which discards files created at run time.

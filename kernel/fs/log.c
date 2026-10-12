@@ -38,6 +38,7 @@ struct efs_log {
     u32 start;                  /* header block; data blocks follow */
     int outstanding;            /* operations in progress */
     bool committing;
+    int syncing;                /* log_sync callers: new operations wait for the commit */
     u32 n;                      /* blocks in the current transaction */
     u32 blocks[EFS_LOGSIZE];
     u64 seq;
@@ -173,7 +174,7 @@ void log_begin(struct efs_log *log)
         return;                             /* nested: already reserved */
     for (;;) {
         unsigned long flags = spin_lock_irqsave(&log->lock);
-        if (!log->committing &&
+        if (!log->committing && !log->syncing &&
             log->n + (log->outstanding + 1) * MAXOPBLOCKS <= EFS_LOGSIZE) {
             log->outstanding++;
             spin_unlock_irqrestore(&log->lock, flags);
@@ -181,7 +182,7 @@ void log_begin(struct efs_log *log)
         }
         spin_unlock_irqrestore(&log->lock, flags);
         t->wait_what = "log space";
-        wait_event(&log->wq, !log->committing &&
+        wait_event(&log->wq, !log->committing && !log->syncing &&
                    log->n + (log->outstanding + 1) * MAXOPBLOCKS <= EFS_LOGSIZE);
     }
 }
@@ -210,6 +211,34 @@ void log_end(struct efs_log *log)
     log->committing = false;
     spin_unlock_irqrestore(&log->lock, flags);
     wake_up(&log->wq);
+}
+
+/*
+ * Wait until every operation that has finished is on disk (sync, fsync,
+ * reboot). A finished operation's blocks wait in the log until the last of
+ * the operations running with it ends and commits them all; that commit
+ * (seq moving past its value now) is the one to wait for. Meanwhile no new
+ * operation starts (log_begin waits while `syncing`), so the ones running
+ * drain and the commit comes even under a steady stream of writers.
+ */
+void log_sync(struct efs_log *log)
+{
+    if (current->fs_op_depth)
+        panic("log_sync inside a transaction: it would wait for its own commit");
+    unsigned long flags = spin_lock_irqsave(&log->lock);
+    bool pending = log->n > 0 || log->committing;
+    u64 target = log->seq + 1;
+    if (pending)
+        log->syncing++;
+    spin_unlock_irqrestore(&log->lock, flags);
+    if (!pending)
+        return;
+    current->wait_what = "log commit";
+    wait_event(&log->wq, log->seq >= target || (!log->committing && log->n == 0));
+    flags = spin_lock_irqsave(&log->lock);
+    log->syncing--;
+    spin_unlock_irqrestore(&log->lock, flags);
+    wake_up(&log->wq);                      /* operations held for the commit */
 }
 
 void log_write(struct efs_log *log, struct buf *b)

@@ -228,6 +228,20 @@ int vfs_mount_disk(const struct fs_type *type, const char *path, int disk)
     return 0;
 }
 
+void vfs_sync(struct super_block *sb)
+{
+    if (sb->ops->sync)
+        sb->ops->sync(sb);
+}
+
+/* Every mounted filesystem (mounts are only ever added, at boot). */
+void vfs_sync_all(void)
+{
+    struct super_block *sb;
+    list_for_each_entry(sb, &mounts, node)
+        vfs_sync(sb);
+}
+
 void vfs_mounts_print(print_fn print)
 {
     struct super_block *sb;

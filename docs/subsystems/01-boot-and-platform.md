@@ -1,12 +1,13 @@
 # Boot, platform discovery, console and kernel logging
 
-This document covers everything from the first instruction the kernel executes to the point where `kmain` turns into cpu0's idle thread. That includes the early page table in `boot.S`, the linker layout, the device-tree parser that fills `struct platform_info`, the kernel command line, the SBI wrappers, and the 16550 console. It also covers the logging stack used by the rest of the kernel (`printk` ring, per-subsystem levels, panic reports) and the embedded symbol table, which the two-pass link in the `Makefile` produces.
+This document covers the boot loader (`eboot`), and everything from the first instruction the kernel executes to the point where `kmain` turns into cpu0's idle thread. That includes the early page table in `boot.S`, the linker layout, the device-tree parser that fills `struct platform_info`, the kernel command line, the SBI wrappers, and the 16550 console. It also covers the logging stack used by the rest of the kernel (`printk` ring, per-subsystem levels, panic reports) and the embedded symbol table, which the two-pass link in the `Makefile` produces.
 
 ## Responsibilities and scope
 
 **In scope:**
 
-- Entry from OpenSBI (`_start`), zeroing BSS, the early Sv39 page table, jumping to the high (linked) address.
+- The boot loader `eboot` (`boot/`): finding the root disk, loading `/boot/kernel.elf` (or `/boot/kernel.old.elf`), and jumping to it.
+- Entry from OpenSBI or eboot (`_start`), zeroing BSS, the early Sv39 page table, jumping to the high (linked) address.
 - Kernel image layout (`kernel.ld`): section order, page alignment for W^X, the guarded boot and overflow stacks, the `.ksyms` section.
 - The order of initialization in `kmain`, and the `kinit` thread's choice between tests and `/bin/init`.
 - Device tree (DTB) parsing into the global `platform`, and the `dtb`/`plat` printers.
@@ -30,6 +31,7 @@ This document covers everything from the first instruction the kernel executes t
 
 | File | Role |
 |---|---|
+| `boot/start.S`, `boot/eboot.c`, `boot/eboot.ld` | `eboot`, the boot loader: a stack and `eboot_main`; the device-tree scan for virtio, a polled virtio-blk driver, a read-only efs reader, the ELF loader; linked at `0x82000000` |
 | `kernel/arch/riscv/boot.S` | `_start` (boot hart entry), early page table, `secondary_entry`, boot and overflow stacks |
 | `kernel/arch/riscv/kernel.ld` | Link address, section order and alignment, linker-provided boundary symbols |
 | `kernel/core/main.c` | `kmain` (init order), `kinit` (first kernel thread), `print_sbi_info` |
@@ -57,7 +59,7 @@ This document covers everything from the first instruction the kernel executes t
 
 ### Address space at boot
 
-The kernel is linked at `KERNEL_BASE + 0x80200000` (`KERNEL_BASE = 0xffffffc000000000`, `kernel.ld` and `kernel/include/mm.h`) and loaded by QEMU/OpenSBI at physical `0x80200000`. `__va(pa)` is `pa + KERNEL_BASE` and `__pa(va)` is `va - KERNEL_BASE` (`mm.h`), so the kernel image sits inside the direct map.
+The kernel is linked at `KERNEL_BASE + 0x80200000` (`KERNEL_BASE = 0xffffffc000000000`, `kernel.ld` and `kernel/include/mm.h`) and loaded at physical `0x80200000`, by eboot (the default) or by QEMU itself (`BOOT=direct`). `__va(pa)` is `pa + KERNEL_BASE` and `__pa(va)` is `va - KERNEL_BASE` (`mm.h`), so the kernel image sits inside the direct map.
 
 Until paging is on, only PC-relative code may run. `la` in `_start` therefore yields *physical* addresses before the jump and *virtual* ones after it (`boot.S` comments).
 
@@ -187,9 +189,26 @@ Only `nm` types `t`, `T` and `W` (text) are kept. Names beginning with `.L`, `$`
 
 ## How it works
 
+### 0. The boot loader (`boot/eboot.c`)
+
+`make run`, `make test` and the others give QEMU `build/eboot.elf` as `-kernel` (`BOOT ?= eboot` in the Makefile; `BOOT=direct` gives it `build/kernel.elf`, the old way; record/replay always loads the kernel directly). QEMU places eboot at its link address, physical `0x82000000` (32 MiB into RAM), and OpenSBI enters `_start` in `boot/start.S` in S-mode with the MMU off, `a0` = hart id, `a1` = the DTB; only the boot hart comes. `_start` masks interrupts, sets a 16 KiB stack in eboot's BSS and calls `eboot_main`, which never returns:
+
+1. **Find the disks.** It walks the device tree for nodes compatible with `virtio,mmio`, taking the base from `reg` (assuming two address cells), up to 16 (`MAX_VIRTIO`).
+2. **Find the root.** For each device that is a modern (version 2) virtio-blk, it reads the efs superblock and log header: the root is the disk labelled `root`, else the first efs disk, the kernel's rule ([06](06-filesystems.md#boot-and-mounting)). A legacy device gets a message asking for `-global virtio-mmio.force-legacy=false`. The driver is polled, with one request at a time, and is reset after each probe.
+3. **Read the kernel.** `/boot/kernel.elf` is found with a small read-only efs reader (path lookup, direct, single- and double-indirect blocks). If the log holds a committed transaction that was not yet installed (a crash after the commit point), every block is read from its log copy when it has one, as recovery would replay it, so eboot sees what the kernel will see after mounting.
+4. **Check it before touching memory.** A RISC-V 64-bit `ET_EXEC`, at most 16 program headers; every `PT_LOAD` must lie between `0x80200000` (OpenSBI is below) and the start of eboot, with `filesz` ≤ `memsz` and its bytes inside the file; the entry point must be inside an executable segment, and is translated from its virtual to its physical address. The checks are written as subtractions after the bounds, so no sum can wrap: `paddr` in [`0x80200000`, eboot's start) and `memsz` ≤ start − `paddr`; `filesz` ≤ file size and `offset` ≤ size − `filesz`; `entry − vaddr` < `memsz`. `file_read` likewise checks `len` ≤ size and `off` ≤ size − `len`. A path component longer than 59 bytes is "not found" rather than truncated, and the 16-byte volume label is compared without assuming a NUL (`label_is`). A bad kernel prints `eboot: PATH: why` (for example `does not fit below the boot loader`).
+5. **Load and jump.** Each segment's bytes go to its `p_paddr`, and the rest of `memsz` (BSS, the `NOLOAD` stacks) is zeroed. eboot resets the virtio device (the kernel finds it as QEMU left it), runs `fence.i`, prints `eboot: loaded PATH (N KiB), entry 0x…`, and jumps with `a0` and `a1` unchanged: the kernel cannot tell eboot from QEMU loading it.
+6. **Fallback.** If `/boot/kernel.elf` is missing or invalid it tries `/boot/kernel.old.elf`; with neither it prints `eboot: no kernel to boot` and powers off through SBI SRST (reason: failure).
+
+Output goes through the SBI legacy console. eboot has its own `memset`, `memcpy` and `memmove` (tcc copies structures with `memmove`). It is built by GCC with the kernel's flags (`$(EBOOT)`, `boot/eboot.ld`), and in self-hosting by tcc and kld (`kernel/build.mk` → `OUT/kernel/eboot.elf`); `kld` reads `eboot.ld` as well.
+
+The image's `/boot/kernel.elf` and `/boot/kernel.old.elf` are both `build/kernel.boot`, the kernel with its DWARF stripped (about 356 KiB; GDB keeps reading `build/kernel.elf`), so the image is rebuilt whenever the kernel changes.
+
+**Installing a kernel on Eunuchs**: `cp /boot/kernel.elf /boot/kernel.old.elf` (to keep a fallback), `cp NEW /boot/kernel.elf`, then `reboot` (system call 142, root only: it syncs every filesystem, waiting for the next log commit so that every completed write is on disk, then does a cold restart through SBI SRST, so QEMU runs OpenSBI, eboot and the new kernel; `poweroff` stops the machine). If the SBI has no SRST, `sbi_reboot` logs `the SBI cannot reset the machine (no SRST); powering off` and powers off; `sbi_shutdown` falls back to the legacy SBI shutdown (extension 0x08). The kernel's banner names its compiler (`built DATE TIME by gcc 16.2.0`, or `by tcc` for a self-built one), which shows which kernel came up.
+
 ### 1. Boot hart entry (`boot.S: _start`)
 
-OpenSBI enters `_start` in S-mode with the MMU off, at physical `0x80200000`, with `a0` = hart id and `a1` = physical DTB address. Only the boot hart arrives here; the others stay parked in OpenSBI.
+OpenSBI (or eboot) enters `_start` in S-mode with the MMU off, at physical `0x80200000`, with `a0` = hart id and `a1` = physical DTB address. Only the boot hart arrives here; the others stay parked in OpenSBI.
 
 1. Disable interrupts: `sie = 0`, clear `sstatus.SIE`. Set `sscratch = 0`; the trap entry reads that as "trap came from the kernel".
 2. Save the hart id in `s1` and the DTB address in `s2`.
@@ -520,6 +539,8 @@ See the table under "Command line". The ones handled in this subsystem are `help
   - `debug/monitor.c` (header comment) and `docs/DEBUGGING.md` say the monitor is entered "at the end of boot". `kmain`/`kinit` do not do that.
   - `uart_disable_rx_irq` has no caller.
 
+- **eboot's assumptions**: it runs at `0x82000000` without checking the device tree's memory size (fine for QEMU's 128 MiB default), so a kernel image, BSS and stacks included, must fit in the 30 MiB between `0x80200000` and `0x82000000`; device-tree `reg` values are read as two address cells; only modern virtio-blk is supported; there is no menu or way to pick a kernel, and no command line of its own (QEMU's `-append` reaches the kernel through the DTB as before). A failed load (a read error part-way) leaves memory partly overwritten before the fallback kernel is loaded over it; that is harmless.
+
 ## Potential improvements
 
 1. **Bounds-check the device-tree parser** — Validate `totalsize`, `version`, and that the structure block, the strings block, every name, `nameoff` and property value, and the `/memreserve/` table lie inside the blob; cap the reserve loop. This turns a corrupt or truncated DTB into a clean `cannot parse device tree` instead of wild reads. Impact: medium. Effort: small.
@@ -537,3 +558,4 @@ See the table under "Command line". The ones handled in this subsystem are `help
 13. **Harden secondary bring-up** — Free the stacks if `start_cpu` fails. Add a per-CPU "start abandoned" flag that `secondary_main` checks before incrementing `ncpus_online`, so a hart that starts after the 2 s timeout parks instead of joining silently. Impact: low. Effort: small.
 14. **One timebase helper** — Replace the four copies of `platform.timebase ? platform.timebase : 10000000` (`printk.c`, `console.c`, `smp.c`, `sched.c`) and the unguarded use in `timer_init` with one function, and panic early with a clear message if the DTB lacks `timebase-frequency`. Impact: low. Effort: small.
 15. **Fix stale comments, docs and dead code** — Update `console.c: console_getc`, the `uart16550.c` header, the `ksyms.c` header, the monitor header and `DEBUGGING.md` ("at the end of boot"). Remove or use `uart_disable_rx_irq` (for example, while the monitor polls the UART). Replace the `__DATE__`/`__TIME__` banner with a build id, so identical sources give identical images. Impact: low. Effort: small.
+16. **A smarter boot loader** — Read the memory size from the device tree instead of assuming RAM at `0x82000000`; offer a choice of kernel (a timeout and a key, or a `/boot/default` file) and a kernel command line; support legacy virtio; honour the device tree's `status` and `#address-cells`. Impact: low. Effort: small.

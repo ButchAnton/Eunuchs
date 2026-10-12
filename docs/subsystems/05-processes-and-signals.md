@@ -534,6 +534,7 @@ Numbers are from `lib/include/uapi/syscall.h`.
 | 134 | rt_sigaction | `do_rt_sigaction` (`-EINVAL` for KILL/STOP) |
 | 135 | rt_sigprocmask | `do_rt_sigprocmask` (`u32` mask) |
 | 139 | rt_sigreturn | `do_rt_sigreturn` |
+| 142 | reboot | `syscall.c: do_reboot` (root only; syncs every filesystem first; [01](01-boot-and-platform.md#0-the-boot-loader-bootebootc)) |
 | 144 / 146 | setgid / setuid | `cred.c` |
 | 154–157 | setpgid, getpgid, getsid, setsid | `signal.c` |
 | 166 | umask | `cred.c` |

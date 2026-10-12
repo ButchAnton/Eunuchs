@@ -83,6 +83,7 @@
     X(226, mprotect,    3, "pux")            \
     X(242, accept4,     4, "dppx")           \
     X(260, wait4,       4, "dpxp")           \
+    X(142, reboot,      1, "x")              \
     X(500, sleep_ms,    1, "u")              \
     X(501, uptime_ms,   0, "")               \
     X(502, debug,       3, "dxx")

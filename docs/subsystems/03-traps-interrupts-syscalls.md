@@ -442,8 +442,8 @@ ABI: `ecall` with `a7` = number, `a0`–`a5` = arguments; result in `a0`, `-errn
 | 73 | `ppoll` | `kernel/fs/poll.c: do_ppoll` | Up to 64 fds (`POLL_MAX_FDS`); the signal-mask argument is not used; interrupted → `EINTR`. |
 | 79 | `fstatat` | `kernel/fs/file.c: do_fstatat` | Flags ignored. |
 | 80 | `fstat` | `kernel/fs/file.c: do_fstat` | Pipes report `S_IFIFO`. |
-| 81 | `sync` | `kernel/fs/file.c: do_sync` | No-op: every transaction is already on disk. |
-| 82 | `fsync` | `kernel/fs/file.c: do_fsync` | No-op apart from the fd check. |
+| 81 | `sync` | `kernel/fs/file.c: do_sync` | `vfs_sync_all`: waits for every filesystem's next log commit (efs `log_sync`). |
+| 82 | `fsync` | `kernel/fs/file.c: do_fsync` | `vfs_sync` of the file's filesystem (`EBADF` for a bad fd). |
 | 88 | `utimensat` | `kernel/proc/cred.c: do_utimensat` | Sets the modification time; a NULL path means the fd (`futimens`); `AT_FDCWD` only otherwise; `UTIME_NOW`/`UTIME_OMIT`; flags ignored. |
 | 93 | `exit` | `kernel/proc/syscall.c: do_exit` | `proc_exit(WEXITSTATUS_ENC(code))`; never returns. |
 | 101 | `nanosleep` | `kernel/proc/cred.c: do_nanosleep` | Fills the remainder; `-ERESTARTSYS` on a signal, restarted to the original deadline. |
@@ -455,6 +455,7 @@ ABI: `ecall` with `a7` = number, `a0`–`a5` = arguments; result in `a0`, `-errn
 | 134 | `rt_sigaction` | `kernel/proc/signal.c: do_rt_sigaction` | SIGKILL/SIGSTOP → `EINVAL`. |
 | 135 | `rt_sigprocmask` | `kernel/proc/signal.c: do_rt_sigprocmask` | 32-bit mask. |
 | 139 | `rt_sigreturn` | `kernel/proc/signal.c: do_rt_sigreturn` | Restores the frame; returns the saved `a0`. |
+| 142 | `reboot` | `kernel/proc/syscall.c: do_reboot` | Root only (`EPERM`). Calls `vfs_sync_all` first, so every completed write is on disk. `RB_AUTOBOOT` (0x01234567): cold reboot through SBI SRST (OpenSBI, eboot, the kernel again); `RB_POWER_OFF` (0x4321fedc): shut down; anything else `EINVAL`. Never returns on success. |
 | 144 | `setgid` | `kernel/proc/cred.c: do_setgid` | |
 | 146 | `setuid` | `kernel/proc/cred.c: do_setuid` | Root sets all three ids; others may set euid to real or saved. |
 | 154 | `setpgid` | `kernel/proc/signal.c: do_setpgid` | |

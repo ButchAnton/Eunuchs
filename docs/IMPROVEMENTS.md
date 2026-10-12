@@ -77,7 +77,6 @@ The system is a single-user teaching OS running in a VM, but it does have users 
 - **Network logging:** `net_log` levels don't match the kernel's log levels (TCP state changes need `log=net:trace`; level 5 can't print).
 - **Terminal:** `O_NONBLOCK`, `VTIME`, `VMIN > 1`, `OPOST`/`ONLCR` and SIGTTOU are not implemented. `TIOCSPGRP`/`TIOCSCTTY` are not validated.
 - **Filesystem:**
-  - `fsync`/`sync` return before in-flight operations commit.
   - Pipes ignore `O_NONBLOCK`.
   - `getdents64` truncates 59-byte names.
   - `access()` uses effective ids.
@@ -106,6 +105,7 @@ The stale statements in `docs/` were fixed during the review; the comments in th
 - **Flaky `tcp_loopback_echo`.** A blocking TCP `send` returned a short count when the send buffer filled, so the test's echo server (and `echod`) gave up on a "short" `write` and reset the connection, about one boot in seven. Blocking sends now wait until all the data is queued, as on Linux. The test's client uses a non-blocking socket for its `poll` loop, and its server loops on `write`.
 - **mkfs file modes.** mkfs now takes file modes from the host: 0755 for executables, 0644 for everything else (`/etc/passwd` included).
 - **The kernel could have used floating point.** It was compiled for `rv64gc` while saving no FP state. It is now built for `rv64imac_zicsr_zifencei`/`lp64`, so the compiler cannot emit an FP instruction in kernel code; `fp.S` is the only kernel code that touches the FP registers ([11](subsystems/11-build-and-testing.md#compiler-flags-and-why)).
+- **`sync` and `fsync` did nothing.** An operation that ends while others run waits in the log until the last of them commits, so a `write()` could return uncommitted. Now `log_sync` waits for the next commit, holding new operations back meanwhile so a stream of writers cannot starve it; `sync` covers every filesystem, `fsync` the file's, and `reboot(2)` syncs first ([06](subsystems/06-filesystems.md#descriptor-tables-and-file-system-calls-filec)).
 - **Editor and libc bugs found while documenting them**: `vi -R` argument order, `:g` without a command, `:noh`, out-of-range addresses, `:wq` with other modified buffers, `:%m0`, `:r !cmd` with no output, pasting macro registers, prompt histories, emacs `C-x C-c`'s prompt, `M-` digit arguments and `M-%` with an empty replacement; `fscanf` losing read-ahead (now `ungetc` backs up in the buffer); prefix-matched regex class names; `round`, NaN and huge arguments in `math.c`; misplaced declarations in `unistd.h`.
 - **H1, transactions and inode locks in both orders.** `vfs_open` (`O_TRUNC`), `chmod_inode`, `do_fchownat` and `do_utimensat` took the inode lock before `fs_begin_op`, which could deadlock waiting for log space. They now begin the transaction first, as writes do ([06](subsystems/06-filesystems.md)).
 - **C10 and the old shell's wrong behavior.** The shell was replaced by [esh](subsystems/12-shell.md). It expands each command when it runs, applies redirections to builtins, has its own state per `source`, and frees per-command memory. It has no fixed word limits, and doesn't use process groups when not interactive.
@@ -135,7 +135,7 @@ Ranked by value for effort. The first group is mostly small fixes for the bugs a
 |---:|---|:-:|:-:|
 | 11 | Turn hangs into failures: per-test watchdog in `ktest_run`, bounded loops in user tests and stress, overall stage time limits | H | S |
 | 12 | Stage and test selection: `run_tests.py --only/--from/--list`, `utest=only:<prefix>`, let `APPEND` override stage options | H | M |
-| 13 | Propagate I/O errors through the buffer cache and log; add virtio flushes and a real `fsync` | H | M |
+| 13 | Propagate I/O errors through the buffer cache and log; add virtio flushes and a per-file `fsync` | H | M |
 | 14 | Wider deadlock detection: hung-thread reports for wait queues and semaphores (not just mutexes), a held-mutex check at `thread_exit`, a soft-lockup detector | H | M |
 | 15 | Fault-injection coverage like `net.drop` for the disk (`blk.fail=`), allocators (`kmalloc.fail=`) and log size, run in CI | M | M |
 | 16 | Machine-readable test results (JSON/JUnit) plus a `make gdb-check` smoke test of the `eu-*` commands | M | S |
@@ -172,6 +172,7 @@ Patterns that showed up in several independent reviews. Fixing them as patterns,
 Condensed. Each document's last section has the detail, code locations and reasoning.
 
 ### [Boot and platform](subsystems/01-boot-and-platform.md#potential-improvements)
+- The boot loader: read the memory size from the device tree instead of assuming RAM at `0x82000000`; choose a kernel (a menu, or a `/boot/default`) and pass a command line; legacy virtio; the DTB's `status` and address cells (L/S).
 - Bounds-check the device-tree parser (M/S).
 - Honor `status = "disabled"`, every `reg` entry and every memory node (M/M).
 - Warn whenever a fixed table overflows (M/S).
@@ -241,7 +242,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - `vfs_read_all` use-after-free (M/S).
 - Use `alloc_lock` (M/S).
 - Bound transaction size (M/M).
-- A real `fsync`/`sync` (M/M).
+- A finer `fsync`, waiting only for the file's transaction (M/M).
 - Ordered-mode journaling so file data isn't logged (H/L).
 - An inode cache with hashing (M/M).
 - Validate geometry at mount and in fsck; let fsck replay a committed log (M/S).
@@ -309,7 +310,7 @@ Condensed. Each document's last section has the detail, code locations and reaso
 
 ### [The native toolchain](subsystems/13-toolchain.md#potential-improvements)
 - Line numbers from `-g` DWARF in kernel fault reports (M/M).
-- After self-hosting (M/L): steps 1–3 are done (the assembler, user space, the kernel with `kld`). Next: build the kernel with `-g` (and check kld's debug relocations on tcc's DWARF); a boot loader so a kernel rebuilt in the guest can boot without the Mac's `-kernel`; relaxation in kld; a terminal line longer than 255 bytes; no libgcc in the regular `libtcc1.a`; `xtcc` with full `long double` precision; tcc code quality (its kernel runs at half speed). Remaining assembler gaps: `%hi`/`%lo`/`%pcrel_*`, automatic compression, `.cfi` unwind tables, `.irpc`, `\@`.
+- After self-hosting (M/L): steps 1–3 are done (the assembler, user space, the kernel with `kld`). Next: build the kernel with `-g` (and check kld's debug relocations on tcc's DWARF); relaxation in kld; a terminal line longer than 255 bytes; no libgcc in the regular `libtcc1.a`; `xtcc` with full `long double` precision; tcc code quality (its kernel runs at half speed). Remaining assembler gaps: `%hi`/`%lo`/`%pcrel_*`, automatic compression, `.cfi` unwind tables, `.irpc`, `\@`.
 - `make -j` (M/M); more GNU make (`define`, `$(call)`, `$(eval)`, `vpath`) (M/M).
 - `tcc -run` without `mprotect` (a fallback through `/tmp` and `exec`) (L/S); a smaller `libtcc1.a` (L/S).
 
@@ -343,6 +344,7 @@ Bigger projects that would each change what the system can do. They are listed r
 - **Several disks and a persistent `/home`.** Up to four virtio disks, a buffer cache keyed by disk, a log per filesystem, volume labels, and `home.img`, which survives rebuilds ([06](subsystems/06-filesystems.md#boot-and-mounting)).
 - **A native C toolchain.** TinyCC runs on Eunuchs (`/bin/tcc`, with `tcc -run` through the new `mprotect`), with a sysroot in `/usr`, a POSIX `make`, and the sources of every program in `/usr/src`, rebuilt in about 6 seconds in the guest ([13](subsystems/13-toolchain.md)).
 - **tcc's assembler fixed and completed** (self-hosting step 1): macros, `.irp`, section types, gas-compatible `la`/`li`/`call`, every S- and M-mode CSR, the missing instructions, rewritten compressed instructions, and a dozen silent mis-encodings fixed; checked byte for byte against GNU as by a host test ([13](subsystems/13-toolchain.md#the-assembler)).
+- **A boot loader.** `eboot` (`boot/`) is QEMU's `-kernel`: it finds the root disk, loads `/boot/kernel.elf` (falling back to `/boot/kernel.old.elf`) with its own read-only efs reader that honours a committed log, checks the ELF, and jumps. With `reboot(2)` (`reboot`, `poweroff`), Eunuchs installs and boots a kernel it built itself, and `make selfhost` does exactly that ([01](subsystems/01-boot-and-platform.md#0-the-boot-loader-bootebootc)).
 - **The image carries its own source tree** (`/usr/src/eunuchs`, 294 files; the image is now 64 MiB, with an inode per 32 KiB): Eunuchs rebuilds itself with no Mac at all (`cd /usr/src/eunuchs && sh tools/selfhost.sh`), and `make selfhost` builds that way, using the share only to hand the results back. `cp` gained `-r`, several sources and mode preservation ([13](subsystems/13-toolchain.md#the-source-tree-in-the-image-usrsrceunuchs)).
 - **Eunuchs builds its own kernel** (self-hosting step 3). `kernel/build.mk` compiles the kernel with tcc and links it with `kld`, a new linker that reads the kernel's linker script and makes the symbol table in one pass. `make selfhost` builds user space and the kernel twice, requires identical results, and runs the test suite on the self-built kernel. On the way, eight tcc bugs were fixed, most of them silent miscompilations (an epilogue that read the saved `ra` from below `sp`, a double store in `__atomic_store_n`, register variables, inline-asm constraints, pointer constants, a non-reproducible `fence` encoding), and `exec` accepts long command lines ([13](subsystems/13-toolchain.md#eunuchs-builds-its-own-kernel-kernelbuildmk)).
 - **Eunuchs builds its own user space** (self-hosting step 2). `user/build.mk`, run by Eunuchs' `make` in the guest, builds the libc, tcc's runtime (without libgcc) and all 26 programs, tcc included, with tcc; `make selfhost` builds twice and requires identical results, then runs the test suite on the self-built image. Two tcc bugs found on the way (zero-extension of narrowed unsigned values, missing symbol tables without `-g`) are fixed ([13](subsystems/13-toolchain.md#eunuchs-builds-its-own-user-space-userbuildmk-make-selfhost)).

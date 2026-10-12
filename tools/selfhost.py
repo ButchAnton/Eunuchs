@@ -9,7 +9,8 @@ at all: user/build.mk and kernel/build.mk, twice:
   stage 2  with stage 1's tcc
 
 Then it copies stage1/, stage2/ and the logs over the share (mounted on
-/mnt/host) into build/selfhost.
+/mnt/host) into build/selfhost, installs stage 2's kernel as /boot/kernel.elf
+and reboots: the boot loader must bring up that kernel (its banner says tcc).
 
 Each stage builds the C library and tcc's runtime into a sysroot, then every
 program (tcc and kld, the kernel's linker, included), then the kernel. The
@@ -75,6 +76,7 @@ def main():
         "-append", "panic=shutdown"]
     t0 = time.time()
     status = None
+    rebooted = False
     with open(os.path.join(OUT, "console.log"), "w") as log:
         con = Console(qemu, log)
         try:
@@ -92,16 +94,29 @@ def main():
             status = int(m.group(1)) if m else None
             # the results (or the logs of a failure) to the Mac
             con.line("cp -r /tmp/selfhost/stage1 /tmp/selfhost/stage2 /tmp/selfhost/*.log "
-                     "/mnt/host/build/selfhost; m=COPIED; echo ${m}-$?.")
+                     "/mnt/host/build/selfhost; s=$?; m=COPIED; echo ${m}-$s.")
             con.expect("COPIED-", 300)
             con.expect(".", 5)
             if not re.search(r"COPIED-0\.", con.log_text()) and status == 0:
                 print("selfhost: copying the results to the Mac failed")
                 status = None
+            if status == 0:
+                # and run it: install the kernel it built, reboot through the
+                # boot loader, and see that one come up
+                con.line("cp /tmp/selfhost/stage2/kernel/kernel.elf /boot/kernel.elf && reboot")
+                con.expect("eboot: loaded /boot/kernel.elf", 60)
+                con.expect("by tcc", 30)
+                con.expect("root@eunuchs:/# ", 60)
+                rebooted = True
         except Exception as e:
             print("selfhost: %s" % e)
         con.close()
     print("selfhost: guest build %s in %.0fs" % ("finished" if status == 0 else "FAILED", time.time() - t0))
+    if status == 0 and not rebooted:
+        print("selfhost: Eunuchs did not reboot into the kernel it built (see build/selfhost/console.log)")
+        return 1
+    if rebooted:
+        print("selfhost: Eunuchs installed the kernel it built and rebooted into it")
     if status != 0:
         for stage in ("stage1", "stage2"):
             p = os.path.join(OUT, stage + ".log")

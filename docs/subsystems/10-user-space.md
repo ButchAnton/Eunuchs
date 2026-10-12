@@ -599,6 +599,7 @@ Fork and exec interactions:
 | `math.h` | See [Mathematics](#mathematics-mathh). |
 | `setjmp.h` | `jmp_buf sigjmp_buf setjmp longjmp _setjmp _longjmp sigsetjmp siglongjmp`. |
 | `regex.h` | `regex_t regmatch_t regoff_t`, `regcomp regexec regerror regfree`, `REG_*` flags and errors. |
+| `sys/reboot.h` | `reboot(how)`, `RB_AUTOBOOT`, `RB_POWER_OFF` (from `uapi/reboot.h`, Linux's values). |
 | `sys/ptrace.h` | `ptrace(request, pid, addr, data)` and, from `uapi/ptrace.h`, the `PTRACE_*` requests, `struct user_regs`, `struct user_fpregs`, `struct ptrace_siginfo`, `struct ptrace_io`, `SI_USER`/`TRAP_*`/`SEGV_*` codes. As in glibc, `PTRACE_PEEKTEXT`/`PEEKDATA` return the word (set `errno` to 0 first to tell a word of -1 from an error); the kernel itself stores it at `*data`. See [14](14-debugger.md). |
 | `sys/mman.h` | `mmap munmap mprotect`, `PROT_*`, `MAP_PRIVATE`, `MAP_ANONYMOUS`, `MAP_FAILED`. |
 | `poll.h` | `poll(fds, n, timeout_ms)`. |
@@ -678,6 +679,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `dbg` | `dbg break \| mark TEXT \| vm \| files \| ps \| fscrash POINT` | Front end for `SYS_debug`. |
 | `uname` | `uname` | Prints `Eunuchs 0.1 riscv64`. |
 | `clear` | `clear` | ANSI home + clear screen. |
+| `reboot`, `poweroff` | `reboot`, `poweroff` | `reboot(RB_AUTOBOOT)` (restart through the boot loader) or `reboot(RB_POWER_OFF)`; root only. The kernel syncs every filesystem first, so every write that has returned survives. To install a kernel: `cp NEW /boot/kernel.elf && reboot` (keep the old one as `/boot/kernel.old.elf`). |
 
 ### Files in the disk image
 
@@ -805,5 +807,5 @@ Commands:
 8. **POSIX leftmost-longest matching** — Track the longest match (and POSIX subexpression rules) at each start position, or compile to a Pike VM / NFA with submatch tracking; that also bounds the time, removing the step limit and the deep recursion. Reject unknown character class names. Impact: medium. Effort: medium.
 9. **Editor: drive prompts from the key queue** — Let macros, `.` and `:normal` feed the `:` and `/` prompts through the same queue as other keys, honour ranges in `:w` and support `:w !cmd`. Impact: medium. Effort: small.
 10. **Editor: the missing big pieces** — Split windows (`C-x 2`/`:split`) sharing buffers; visual block mode; numbered and append registers; `fill-paragraph`/`gq`; emacs keyboard macros (`C-x (`); `SIGWINCH` handling (once the TTY sends it); marks that follow edits; persistent undo across saves (clearing the modified flag at the saved state). Impact: medium. Effort: large.
-11. **Editor: safer saving** — `fsync` the temporary file before the `rename` (a no-op in the kernel today, but correct once `fsync` is real), keep the owner, honour the umask for new files, and warn when the file changed on disk since it was read (compare `st_mtime`). Impact: medium. Effort: small.
+11. **Editor: safer saving** — `fsync` the temporary file before the `rename` (it waits for the next log commit now), keep the owner, honour the umask for new files, and warn when the file changed on disk since it was read (compare `st_mtime`). Impact: medium. Effort: small.
 12. **Unwind info for `__restore_rt` and correct header comments** — Add `.cfi_signal_frame`-style annotations (and keep a minimal `.eh_frame` for it) so GDB can unwind through signal handlers. Fix the stale comments in `uapi/signal.h` (`SA_RESTART`), `echod.c` and `eutils.c`. Impact: low. Effort: small.

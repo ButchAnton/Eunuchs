@@ -98,6 +98,8 @@ struct fs_ops {
     void (*begin_op)(struct super_block *sb);
     void (*end_op)(struct super_block *sb);
     void (*stat_fs)(struct super_block *sb, int (*print)(const char *fmt, ...));
+    /* optional: put everything that has finished on disk */
+    void (*sync)(struct super_block *sb);
     /*
      * For filesystems that work by name (9pfs), where alloc_inode + link and
      * the nlink bookkeeping of unlink and rename don't apply. When present,
@@ -192,6 +194,8 @@ int vfs_permission(struct inode *ip, int mask);
 void fs_begin_op(struct super_block *sb);
 void fs_end_op(struct super_block *sb);
 void vfs_mounts_print(int (*print)(const char *fmt, ...));
+void vfs_sync_all(void);
+void vfs_sync(struct super_block *sb);
 void icache_print(int (*print)(const char *fmt, ...));
 void fs_error(struct super_block *sb, const char *fmt, ...) __printf_like(2, 3);
 
@@ -238,6 +242,7 @@ struct efs_log;
 struct efs_log *log_create(struct super_block *sb, const struct efs_super *esb);
 void log_begin(struct efs_log *log);
 void log_end(struct efs_log *log);
+void log_sync(struct efs_log *log);
 void log_write(struct efs_log *log, struct buf *b);
 void log_print(struct efs_log *log, int (*print)(const char *fmt, ...));
 int efs_arm_crash(const char *point);

@@ -78,7 +78,8 @@ KLD     := $(BUILD)/tools/kld
 FSIMG   := $(BUILD)/fs.img
 FS_MB   ?= 64
 EUTILS_LINKS = echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile \
-               true false yes kill date dmesg free sleep strace su dbg uname clear
+               true false yes kill date dmesg free sleep strace su dbg uname clear \
+               reboot poweroff
 FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(notdir $(p))) \
            $(foreach l,$(EUTILS_LINKS),/bin/$(l)=@/bin/eutils) /bin/sh=@/bin/esh /bin/less=@/bin/more \
            /bin/vi=@/bin/edit /bin/view=@/bin/edit /bin/emacs=@/bin/edit /bin/em=@/bin/edit \
@@ -89,6 +90,7 @@ FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(no
            $(foreach f,$(SYS_FILES),$(patsubst $(SYSROOT)%,%,$(f))=$(f)) \
            $(foreach f,$(filter user/bin/%,$(USR_SRC)),/usr/src/$(patsubst user/bin/%,%,$(f))=$(f)) \
            /usr/src/Makefile=user/usr-src/Makefile \
+           /boot/kernel.elf=$(BUILD)/kernel.boot /boot/kernel.old.elf=$(BUILD)/kernel.boot \
            $(foreach f,$(EU_SRC),/usr/src/eunuchs/$(f)=$(f))
 DISKOPTS = -global virtio-mmio.force-legacy=false \
            -drive file=$(1),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
@@ -97,8 +99,13 @@ DISKOPTS = -global virtio-mmio.force-legacy=false \
 # which is beginning-of-line in emacs and the shell. Ctrl-^ (30) is unused
 # by either; Ctrl-^ X still quits QEMU, Ctrl-^ Ctrl-^ sends a literal Ctrl-^.
 QEMU_ECHR ?= 30
+# QEMU starts the boot loader, which loads /boot/kernel.elf from the root
+# disk (boot/eboot.c); BOOT=direct has QEMU load build/kernel.elf instead.
+BOOT    ?= eboot
+EBOOT   := $(BUILD)/eboot.elf
+BOOT_IMAGE = $(if $(filter direct,$(BOOT)),$(KERNEL),$(EBOOT))
 QEMUBASE = -machine virt -bios default -nographic -echr $(QEMU_ECHR) -smp $(CPUS) -m $(MEM) \
-           -semihosting-config enable=on,target=native -kernel $(KERNEL)
+           -semihosting-config enable=on,target=native -kernel $(BOOT_IMAGE)
 
 # Networking: QEMU's user-mode network (guest 10.0.2.15, host 10.0.2.2).
 # Host ports forward to the guest: HTTP_PORT -> 80 (httpd), SHELL_PORT -> 23
@@ -134,7 +141,18 @@ QEMUOPTS = $(QEMUBASE) $(call DISKOPTS,$(FSIMG)) $(HOMEOPTS) $(SHAREOPTS) $(NETO
 CC_ID := $(BUILD)/.cc-id
 $(shell mkdir -p $(BUILD) && printf '%s\n' "$(shell uname -m)" "$(CC)" "$(CFLAGS)" "$(UCFLAGS)" "$(shell $(CC) --version 2>/dev/null | head -1)" "$(shell $(HOSTCC) --version 2>/dev/null | head -1)" > $(CC_ID).tmp && { cmp -s $(CC_ID) $(CC_ID).tmp || mv $(CC_ID).tmp $(CC_ID); } && rm -f $(CC_ID).tmp)
 
-all: $(KERNEL) $(FSIMG) $(KLD)
+all: $(KERNEL) $(FSIMG) $(KLD) $(EBOOT)
+
+# --- The boot loader (boot/): QEMU's -kernel, which loads /boot/kernel.elf ---
+EBOOT_OBJS := $(BUILD)/boot/start.o $(BUILD)/boot/eboot.o
+
+$(EBOOT): $(EBOOT_OBJS) boot/eboot.ld
+	$(call msg,LD,$@)
+	$(Q)$(CC) $(CFLAGS) $(filter-out -T $(LDSCRIPT),$(LDFLAGS)) -T boot/eboot.ld -o $@ $(EBOOT_OBJS)
+
+# The kernel on the root disk: without DWARF (GDB reads build/kernel.elf)
+$(BUILD)/kernel.boot: $(KERNEL)
+	$(Q)$(CROSS)objcopy --strip-debug $< $@
 
 # --- Two-pass link: pass 1 has an empty symbol table; its symbols generate
 # --- the real table for pass 2. .ksyms is last in the image, so no other
@@ -220,7 +238,7 @@ SYS_LIBS  := $(addprefix $(SYSROOT)/usr/lib/,crt1.o crti.o crtn.o libc.a tcc/lib
 USR_SRC   := $(wildcard user/bin/*.c user/bin/*/*.c user/bin/*/*.h) user/usr-src/Makefile
 # /usr/src/eunuchs: the source tree Eunuchs builds itself from (user/build.mk,
 # kernel/build.mk, tools/selfhost.sh), so it can without the Mac's share
-EU_SRC    := $(shell find kernel lib user/include user/lib user/bin -type f \( -name '*.[chS]' -o -name '*.ld' \) | sort) \
+EU_SRC    := $(shell find boot kernel lib user/include user/lib user/bin -type f \( -name '*.[chS]' -o -name '*.ld' \) | sort) \
              kernel/build.mk user/build.mk ports/tcc/config.h tools/kld/kld.c tools/selfhost.sh \
              $(wildcard $(TCC_SRC)/*.c $(TCC_SRC)/*.h $(TCC_SRC)/*.def $(TCC_SRC)/include/*.h \
                         $(TCC_SRC)/lib/*.c $(TCC_SRC)/lib/*.S) $(TCC_SRC)/COPYING
@@ -300,7 +318,7 @@ $(MKFS): tools/mkfs/mkfs.c kernel/include/efs_format.h
 	$(Q)$(HOSTCC) -O1 -g -Wall -Wextra -Werror -Ikernel/include -o $@ $<
 
 # Rebuilt whenever a program changes, which discards files created at run time.
-$(FSIMG): $(MKFS) $(patsubst $(BUILD)/user/bin/%,$(BUILD)/user/stripped/%,$(UPROGS)) user/etc/* user/www/* $(SYS_FILES) $(USR_SRC) $(EU_SRC)
+$(FSIMG): $(MKFS) $(BUILD)/kernel.boot $(patsubst $(BUILD)/user/bin/%,$(BUILD)/user/stripped/%,$(UPROGS)) user/etc/* user/www/* $(SYS_FILES) $(USR_SRC) $(EU_SRC)
 	$(call msg,MKFS,$@)
 	$(Q)$(MKFS) --label root $@ $(FS_MB) $(FS_FILES) > /dev/null
 
@@ -346,11 +364,11 @@ define check_tty
 	fi
 endef
 
-run: $(KERNEL) $(FSIMG) $(HOME_IMG)
+run: $(KERNEL) $(EBOOT) $(FSIMG) $(HOME_IMG)
 	$(check_tty)
 	$(QEMU) $(QEMUOPTS) -append "$(APPEND)"
 
-debug: $(KERNEL) $(FSIMG) $(HOME_IMG)
+debug: $(KERNEL) $(EBOOT) $(FSIMG) $(HOME_IMG)
 	$(check_tty)
 	@echo "QEMU halted; run 'make gdb' in another terminal."
 	$(QEMU) $(QEMUOPTS) -append "$(APPEND)" -s -S
@@ -436,7 +454,7 @@ disasm: $(KERNEL)
 # tools/timeout.py kills QEMU if a test run hangs.
 # The whole scenario: kernel + user tests, fsck, persistence across a reboot,
 # a simulated power failure mid-commit, log recovery, fsck. See tools/run_tests.py.
-test: $(KERNEL) $(FSIMG) $(MKFS)
+test: $(KERNEL) $(EBOOT) $(FSIMG) $(MKFS)
 	@$(PYTHON) tools/run_tests.py --qemu "$(QEMU) $(QEMUBASE)" --image $(FSIMG) \
 		--mkfs $(MKFS) --timeout $(TEST_TIMEOUT) --append "$(APPEND)"
 
@@ -447,19 +465,21 @@ test: $(KERNEL) $(FSIMG) $(MKFS)
 # boots the kernel it built, with an image made from the rest.
 SH_OUT   := $(BUILD)/selfhost/stage2
 SH_KERNEL := $(SH_OUT)/kernel/kernel.elf
+SH_EBOOT := $(SH_OUT)/kernel/eboot.elf
 SH_LIBS  := crt1.o crti.o crtn.o libc.a tcc/libtcc1.a tcc/runmain.o
 sh_file   = $(if $(findstring =$(BUILD)/user/stripped/,$(1)),$(subst =$(BUILD)/user/stripped/,=$(SH_OUT)/bin/,$(1)),$(if $(filter $(addprefix %/,$(SH_LIBS)),$(1)),$(subst =$(SYSROOT)/usr/lib/,=$(SH_OUT)/sysroot/usr/lib/,$(1)),$(1)))
-SH_FILES  = $(foreach f,$(FS_FILES),$(call sh_file,$(f))) /bin/kld=$(SH_OUT)/bin/kld
+SH_FILES  = $(filter-out /boot/kernel.elf=%,$(foreach f,$(FS_FILES),$(call sh_file,$(f)))) \
+            /bin/kld=$(SH_OUT)/bin/kld /boot/kernel.elf=$(SH_KERNEL)
 # per-stage test timeout: tcc's kernel is about half as fast
 SH_TIMEOUT ?= 120
 
-selfhost: $(KERNEL) $(FSIMG) $(MKFS)
+selfhost: $(KERNEL) $(EBOOT) $(FSIMG) $(MKFS)
 	@$(PYTHON) tools/selfhost.py --qemu "$(QEMU) $(QEMUBASE)" --image $(FSIMG)
 	@if echo "$(SH_FILES)" | tr ' ' '\n' | grep -E '=$(BUILD)/user/stripped/|=$(SYSROOT)/usr/lib/(crt[1in]|libc|tcc/libtcc1|tcc/runmain)\.'; then \
 		echo "selfhost: the files above would still be the gcc-built ones"; exit 1; fi
 	$(Q)$(MKFS) --label root $(BUILD)/selfhost/fs.img $(FS_MB) $(SH_FILES) > /dev/null
 	@echo "selfhost: $(SH_KERNEL) and build/selfhost/fs.img: built on Eunuchs, by tcc"
-	@$(PYTHON) tools/run_tests.py --qemu "$(QEMU) $(subst -kernel $(KERNEL),-kernel $(SH_KERNEL),$(QEMUBASE))" \
+	@$(PYTHON) tools/run_tests.py --qemu "$(QEMU) $(subst -kernel $(BOOT_IMAGE),-kernel $(SH_EBOOT),$(QEMUBASE))" \
 		--image $(BUILD)/selfhost/fs.img --mkfs $(MKFS) --timeout $(SH_TIMEOUT) --append "$(APPEND)" \
 		--programs $(SH_OUT)/bin
 
@@ -477,7 +497,7 @@ tcc-kernel: $(XTCC) $(KLD)
 # $(CPUS) CPUs, booted with lockdep=panic (and the lockup watchdog on), then
 # fsck. Runs on a scratch copy of the disk image.
 STRESS_SECS ?= 120
-stress: $(KERNEL) $(FSIMG) $(MKFS)
+stress: $(KERNEL) $(EBOOT) $(FSIMG) $(MKFS)
 	@cp -f $(FSIMG) $(BUILD)/stress.img
 	@$(PYTHON) tools/timeout.py $$(($(STRESS_SECS) + 60)) $(QEMU) $(QEMUBASE) \
 		$(call DISKOPTS,$(BUILD)/stress.img) \

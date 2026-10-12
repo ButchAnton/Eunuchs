@@ -26,6 +26,7 @@ About 30,000 lines in all:
 
 QEMU's `virt` board: RV64GC harts, 128 MiB of RAM at `0x80000000`, a 16550 UART, a PLIC, a CLINT, a goldfish RTC, the `sifive,test0` exit device, and eight virtio-mmio slots. OpenSBI runs in M-mode and starts the kernel in S-mode at `0x80200000`, on a randomly chosen hart, passing the hart id and a device tree.
 
+0. **`eboot`** (`boot/`), the boot loader QEMU starts (at `0x82000000`): it finds the root disk, reads `/boot/kernel.elf` (or `/boot/kernel.old.elf`) with a read-only efs reader, loads it at `0x80200000` and jumps to it as OpenSBI would. `make run BOOT=direct` skips it.
 1. **`boot.S`.** Clears BSS. Builds an early page table: an identity gigapage for the running code, plus 64 GiB of direct map at `KERNEL_BASE` (`0xffffffc000000000`). Turns on paging and jumps to the linked (high) address. Points `tp` at `cpus[0]` and calls `kmain`.
 2. **`kmain`** (`core/main.c`), in order:
    - per-CPU setup and the trap vector;

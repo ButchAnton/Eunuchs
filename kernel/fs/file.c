@@ -498,13 +498,21 @@ long do_ioctl(const u64 *a)
     return f->cops->ioctl(f, a[1], a[2]);
 }
 
+/* efs commits each operation, but one that ends while others run waits in
+   the log for the last of them: sync waits for that commit */
 long do_sync(const u64 *a)
 {
     (void)a;
-    return 0;                           /* every transaction is already on disk */
+    vfs_sync_all();
+    return 0;
 }
 
 long do_fsync(const u64 *a)
 {
-    return fd_get((long)a[0]) ? 0 : -EBADF;
+    struct file *f = fd_get((long)a[0]);
+    if (!f)
+        return -EBADF;
+    if (f->ip)
+        vfs_sync(f->ip->sb);
+    return 0;
 }

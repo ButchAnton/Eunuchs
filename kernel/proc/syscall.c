@@ -21,9 +21,11 @@
 #include <proc.h>
 #include <profile.h>
 #include <riscv.h>
+#include <sbi.h>
 #include <trace.h>
 #include <trap.h>
 #include <uapi/errno.h>
+#include <uapi/reboot.h>
 #include <uapi/syscall.h>
 
 typedef long (*sys_fn)(const u64 *a);
@@ -127,6 +129,24 @@ long do_sleep_ms(const u64 *a)
 {
     sleep_ms(a[0]);
     return signal_pending(current_proc()) ? -EINTR : 0;
+}
+
+/* reboot(how): RB_AUTOBOOT restarts the machine (QEMU runs it again: OpenSBI,
+   then the boot loader), RB_POWER_OFF stops it. Root only. Syncs first, so
+   every write that has returned is on disk. */
+long do_reboot(const u64 *a)
+{
+    struct proc *p = current_proc();
+    if (p->euid != 0)
+        return -EPERM;
+    if (a[0] != RB_AUTOBOOT && a[0] != RB_POWER_OFF)
+        return -EINVAL;
+    pr_info("%s requested by pid %d (%s)\n", a[0] == RB_AUTOBOOT ? "reboot" : "power off", p->pid,
+            p->name);
+    vfs_sync_all();
+    if (a[0] == RB_AUTOBOOT)
+        sbi_reboot();
+    sbi_shutdown(false);
 }
 
 long do_uptime_ms(const u64 *a)

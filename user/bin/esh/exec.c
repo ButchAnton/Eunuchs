@@ -788,14 +788,16 @@ static int exec_simple(struct node *n, int flags)
     }
 
     if (argc == 0) {
-        /* assignments and/or redirections only */
+        /* assignments and/or redirections only: the status is that of the
+           last command substitution (x=$(false) sets $?), else 0; $? in the
+           values is still the previous command's (s=$? saves it) */
         int st = 0;
-        sh.last_status = 0;
+        unsigned subs = sh.cmdsubs;
         for (struct assign *a = n->assigns; a; a = a->next)
             if (assign_do(a, 0) < 0)
                 st = 1;
         if (!st)
-            st = sh.last_status;    /* x=$(false) sets $? */
+            st = sh.cmdsubs != subs ? sh.last_status : 0;
         xtrace(0, 0, n->assigns);
         struct fdsave save = { 0 };
         if (n->redirs) {

@@ -134,14 +134,18 @@ def main():
     def fsck(name, **kw):
         return stage(name, [a.mkfs, "--check", img], **kw)
 
-    def interactive(name, steps, extra=()):
+    def interactive(name, steps, extra=(), image=None):
         """steps: (send, expect[, prompt]) tuples. send is a command line (then we
         wait for `expect` and the next prompt, unless prompt=False) or bytes for
-        raw keys like ^C (sent after a short pause so the target is running)."""
+        raw keys like ^C (sent after a short pause so the target is running).
+        image: a disk of its own instead of the shared one."""
         t0 = time.time()
         logpath = os.path.join(logs, name + ".log")
+        cmd = qemu
+        if image:
+            cmd = [arg.replace("file=%s," % img, "file=%s," % image) for arg in qemu]
         with open(logpath, "w") as log:
-            con = Console(qemu + list(extra) + ["-append", "panic=shutdown lockdep=panic " + a.append], log)
+            con = Console(cmd + list(extra) + ["-append", "panic=shutdown lockdep=panic " + a.append], log)
             problem = None
             try:
                 con.expect("root@eunuchs:/# ", 20)
@@ -330,6 +334,12 @@ def main():
         ("V=hi sh -c 'echo inner=$V'", "inner=hi"),
         ("mkdir -p /tmp/p/q/r && mkdir -p /tmp/p/q && touch /tmp/p/q/r/f && ls /tmp/p/q/r", "f"),
         ("rm -rf /tmp/p && rm -f /tmp/nonexistent && ls /tmp/p", "cannot access '/tmp/p'"),
+        # sync finishes while another process keeps writing (new operations
+        # wait for its commit instead of postponing it)
+        ("i=0; while [ $i -lt 3000 ]; do echo x >> /tmp/w; i=$((i+1)); done & sync; sync; echo synced",
+         "synced"),
+        # an assignment keeps $? (s=$? saves the status), x=$(false) sets it
+        ("false; s=$?; x=$(false); echo st=$s,$?", "st=1,1"),
         # cp -r copies a tree; a copied program keeps its execute bit
         ("mkdir -p /tmp/c/d && echo copied > /tmp/c/d/f && cp -r /tmp/c /tmp/c2 && cat /tmp/c2/d/f",
          "copied"),
@@ -399,6 +409,23 @@ def main():
     # for tcc's assembler, with a C caller
     for name in ("asmtest.S", "asmtest.c"):
         shutil.copy(os.path.join(ROOT, "tests", "guest", name), share)
+    # The boot loader (boot/eboot.c): reboot is for root; without
+    # /boot/kernel.elf it boots /boot/kernel.old.elf; with neither it says so
+    # and powers off. On a disk of its own: this deletes the kernels.
+    bootimg = os.path.join(build, "test-boot.img")
+    shutil.copyfile(img, bootimg)
+    interactive("boot loader, reboot", [
+        ("su guest", None, False), (None, "guest@eunuchs:~% ", False),
+        ("reboot", "Operation not permitted"),
+        ("exit", None),
+        ("rm /boot/kernel.elf && reboot", "eboot: /boot/kernel.elf: not found", False),
+        (None, "eboot: loaded /boot/kernel.old.elf", False),
+        (None, "Eunuchs 0.1 (riscv64)", False),
+        (None, "root@eunuchs:/# ", False),
+        ("rm /boot/kernel.old.elf && reboot", "eboot: no kernel to boot", False),
+        (None, "eboot: powering off", False),
+    ], image=bootimg)
+
     interactive("host share (9p)", [
         ("cat /mnt/host/from-mac.txt", "made on the mac"),
         ("echo made in eunuchs > /mnt/host/from-guest.txt && mkdir /mnt/host/d && "

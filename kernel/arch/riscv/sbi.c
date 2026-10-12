@@ -1,3 +1,5 @@
+#define LOG_SUBSYS SUBSYS_CORE
+#include <printk.h>
 #include <sbi.h>
 
 #define SBI_EXT_LEGACY_PUTCHAR 0x01
@@ -74,6 +76,7 @@ void sbi_shutdown(bool failure)
 {
     /* SRST type 0 = shutdown; reason 0 = none, 1 = system failure */
     sbi_call(SBI_EXT_SRST, 0, 0, failure ? 1 : 0, 0);
+    sbi_call(0x08, 0, 0, 0, 0);         /* no SRST: the legacy shutdown */
     for (;;)
         asm volatile("wfi");
 }
@@ -81,6 +84,6 @@ void sbi_shutdown(bool failure)
 void sbi_reboot(void)
 {
     sbi_call(SBI_EXT_SRST, 0, 1 /* cold reboot */, 0, 0);
-    for (;;)
-        asm volatile("wfi");
+    pr_err("reboot: the SBI cannot reset the machine (no SRST); powering off\n");
+    sbi_shutdown(false);
 }

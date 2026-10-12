@@ -18,6 +18,13 @@
 #include <trace.h>
 #include <trap.h>
 
+/* which compiler built this kernel (in the boot banner: a self-built kernel says tcc) */
+#ifdef __TINYC__
+#define KERNEL_CC "tcc"
+#else
+#define KERNEL_CC "gcc " __VERSION__
+#endif
+
 static void print_sbi_info(void)
 {
     long spec = sbi_spec_version();
@@ -109,7 +116,7 @@ void kmain(unsigned long hartid, uintptr_t dtb)
     cmdline_init(platform.bootargs);
     printk_apply_cmdline();
 
-    pr_info("Eunuchs 0.1 (riscv64), built " __DATE__ " " __TIME__ "\n");
+    pr_info("Eunuchs 0.1 (riscv64), built " __DATE__ " " __TIME__ " by " KERNEL_CC "\n");
     if (dt_err)
         panic("cannot parse device tree at %#lx", (unsigned long)dtb);
     print_sbi_info();

@@ -32,7 +32,7 @@ This subsystem turns one or more virtio disks, and directories shared by the hos
 | `kernel/include/efs_format.h` | On-disk efs format, shared by the kernel and the host tool (only `<stdint.h>` types). |
 | `lib/include/uapi/fs.h` | ABI: `O_*`, `F_*`, `S_*`, `struct stat` (with `st_mtim`/`st_ctim` timespecs), `UTIME_NOW`/`UTIME_OMIT`, `struct dirent`, `R_OK..`, `PATH_MAX` (256), `NAME_MAX` (59). |
 | `kernel/fs/bcache.c` | Buffer cache: `bread`, `bwrite`, `brelse`, `bpin`/`bunpin`, LRU, statistics. |
-| `kernel/fs/log.c` | Write-ahead log: `log_begin`/`log_end`/`log_write`, `commit`, `install`, recovery in `log_create`, crash points. |
+| `kernel/fs/log.c` | Write-ahead log: `log_begin`/`log_end`/`log_write`, `commit`, `install`, recovery in `log_create`, crash points, `log_sync`. |
 | `kernel/fs/efs.c` | efs `fs_ops`: `balloc`/`bfree`, inode read/write/alloc/free, `bmap`, `efs_truncate`, `efs_read`/`efs_write`, directories, `efs_mount`, `efs_label`. |
 | `kernel/fs/vfs.c` | Inode cache (`iget`/`iput`/`ilock`), `vfs_mount`/`vfs_mount_disk`, `disk_labeled`, `vfs_permission`, `walk`/`namei`/`nameiparent`, `vfs_open`, `vfs_mkdir`, `vfs_unlink`, `vfs_link`, `vfs_rename`, `vfs_getcwd`, `vfs_read_all`, `vfs_init`, `fs_error`. |
 | `kernel/fs/file.c` | `file_read`/`file_write`/`file_close`, descriptor tables (`fd_install`, `files_fork`, `files_exec`, `files_close_all`), file system calls `do_*`. |
@@ -125,6 +125,7 @@ file block bn            where
 | `disk` | the disk of the filesystem this log belongs to (`sb->disk`) |
 | `start` | header block number (`esb->logstart`) |
 | `outstanding` | operations between `log_begin` and `log_end` (outermost level only) |
+| `syncing` | threads waiting in `log_sync`; while it is nonzero `log_begin` admits no new top-level operation |
 | `committing` | a commit is in progress; no new operation may start |
 | `n`, `blocks[64]` | distinct blocks modified by the current transaction, with their home numbers |
 | `seq` | next transaction number |
@@ -150,7 +151,7 @@ file block bn            where
   - `mounted`: the filesystem mounted on this directory.
   - `u.efs`: a full copy of the `efs_dinode`, including `addrs`.
 - **`struct efs_info`** (`efs.c`): a copy of the superblock, the log pointer, `bhint` (the next place to look for a free block), and the in-memory counters `nfree_blocks` and `nfree_inodes`. It also has an `alloc_lock`, which is initialized but never taken (see Limitations).
-- **`struct fs_ops`**: `read_inode`, `write_inode`, `alloc_inode`, `free_inode`, `read`, `write`, `truncate`, `lookup`, `link`, `unlink`, `readdir`, `begin_op`, `end_op` and `stat_fs`, plus four optional hooks for filesystems that work by name rather than by allocating inodes and editing directories (9pfs): `create` (make a file or directory and return it locked), `remove`, `rename`, and `refresh` (re-read attributes that may have changed elsewhere). When present, the VFS calls them instead of its generic code (see Opening and creating, Namespace operations). Any of them may be `NULL`. devfs and procfs provide only `read_inode`, `lookup` and `readdir`. Because they have no `alloc_inode`, `link`, `unlink` or `write_inode`, the VFS returns `EPERM` for creates, removals, chmod and chown on them.
+- **`struct fs_ops`**: `read_inode`, `write_inode`, `alloc_inode`, `free_inode`, `read`, `write`, `truncate`, `lookup`, `link`, `unlink`, `readdir`, `begin_op`, `end_op`, `stat_fs` and `sync` (make every completed operation durable; efs only), plus four optional hooks for filesystems that work by name rather than by allocating inodes and editing directories (9pfs): `create` (make a file or directory and return it locked), `remove`, `rename`, and `refresh` (re-read attributes that may have changed elsewhere). When present, the VFS calls them instead of its generic code (see Opening and creating, Namespace operations). Any of them may be `NULL`. devfs and procfs provide only `read_inode`, `lookup` and `readdir`. Because they have no `alloc_inode`, `link`, `unlink` or `write_inode`, the VFS returns `EPERM` for creates, removals, chmod and chown on them.
 - **`struct chr_ops`**: `open`, `read`, `write`, `close`, `ioctl` and `poll`. They are used for devices, procfs files, pipes and sockets. When `f->cops->read` or `write` is set, `file_read`/`file_write` call it instead of `fs_ops`.
 
 **The inode "cache" is not a cache.** `iput` frees the in-memory inode as soon as `refcnt` reaches 0 (`kernel/fs/vfs.c: iput`). Every later `iget` + `ilock` therefore re-reads the dinode, which usually comes from the buffer cache. The `icache` list holds exactly the inodes that are referenced (`icache_busy` counts them for leak tests).
@@ -254,7 +255,7 @@ Every efs modification happens between `fs_begin_op(sb)` and `fs_end_op(sb)`, wh
 **`log_begin`** (`kernel/fs/log.c`):
 
 - If `current->fs_op_depth` was already nonzero, the call is nested and returns at once. The outer operation's reservation covers it.
-- Otherwise it loops until `!committing && n + (outstanding+1) × 16 ≤ 64`, then increments `outstanding`.
+- Otherwise it loops until `!committing && !syncing && n + (outstanding+1) × 16 ≤ 64`, then increments `outstanding`. While a `sync` is waiting (`syncing > 0`), no new top-level operation starts, so the running ones drain and the commit happens; nested operations never get here, so they are not held.
 - While waiting it sleeps on `log->wq` with `wait_what = "log space"` (not interruptible).
 - So at most 4 operations run at once, fewer when blocks are already pending.
 
@@ -499,7 +500,7 @@ All of these take `sb->ns_lock` and run as one transaction, so each is atomic ac
 - **`getdents64`**: fills fixed 64-byte `struct dirent` records (`d_ino`, `d_type`, `d_name[59]`) and advances `f->off` after each record it copies.
 - **`chdir`**: requires a directory and swaps `p->cwd` under `proc_lock`.
 - **`getcwd`**: returns the length including the NUL.
-- **`sync` and `fsync`** do nothing. They are justified by "every transaction is already on disk", which is true only when no other operation was in progress (see Limitations).
+- **`sync` and `fsync`**: `sync` calls `vfs_sync_all`, which calls the optional `fs_ops.sync` of every mount (the mount list only grows at boot, so it is walked without a lock); `fsync(fd)` calls `vfs_sync` on the file's filesystem (pipes and sockets: nothing). For efs, `efs_sync` is `log_sync`: if the log holds blocks or is committing, it increments `syncing` (which stops `log_begin` from starting new top-level operations), sleeps on the log's wait queue (`wait_what = "log commit"`) until `seq` passes its current value + 1, that is, until the next commit has finished, or until the log is idle and empty, then decrements `syncing` and wakes the queue. The wait is therefore bounded by the operations already running, not by a stream of new ones: with a shell loop appending to a file nonstop, `sync` takes about 44 ms. Calling `log_sync` inside a transaction panics (it would wait for its own commit). So every write that had returned before the call is on disk when it returns. (They used to do nothing, on the claim that every transaction is already on disk, which is false when an operation ends while others run: its blocks wait in the log until the last of them ends.) `reboot(2)` calls `vfs_sync_all` before restarting or powering off. 9pfs has no `sync`.
 
 ### Pipes
 
@@ -613,6 +614,10 @@ Each request is one `p9_transact`: the message is built in a `kmalloc`ed buffer,
 
 **Permissions.** The VFS checks the guest's credentials against the host's owners and modes (the Mac's uid 501 and gid 20, say), so the guest's root can do anything, and `guest` (1000) only what the files' "other" bits allow. Then QEMU, running as the Mac user, applies the Mac's own permissions: guest root can do whatever that Mac user can, and no more.
 
+### efs outside the kernel: the boot loader
+
+The boot loader (`boot/eboot.c`, [01](01-boot-and-platform.md#0-the-boot-loader-bootebootc)) has its own read-only efs reader to load `/boot/kernel.elf`: superblock, path lookup through directory entries, direct, single- and double-indirect blocks, holes. It never writes. If the log header says a committed transaction is waiting to be installed (`n > 0`), it reads each block from its log copy when there is one, so it sees exactly what the kernel's recovery will install at mount. It chooses the root disk by the same rule as `vfs_init` (label `root`, else the first efs disk).
+
 ### Host mkfs and fsck (`tools/mkfs/mkfs.c`)
 
 **`mkfs [--label NAME] IMAGE SIZE_MB specs...`** builds the image in memory (`calloc`):
@@ -625,7 +630,7 @@ Each request is one `p9_transact`: the message is built in a `kmalloc`ed buffer,
   - `/dir/[:mode[:uid[:gid]]]`: a directory, created with any missing parents.
 - Blocks and inodes are allocated sequentially (`next_block`, `next_ino`).
 
-The Makefile builds `build/fs.img` with `FS_MB ?= 64` (it was 32 until the image carried its own source tree) from the user programs (`/bin/*`; the `eutils` names are hard links), `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc`, `/dev/`, `/proc/`, `/tmp/:0777`, `/www/`, `/home/` and `/home/guest/:0755:1000:1000`. The image is rebuilt whenever a program changes, which discards run-time files. It gets `--label root`.
+The Makefile builds `build/fs.img` with `FS_MB ?= 64` (it was 32 until the image carried its own source tree) from the kernel (`/boot/kernel.elf` and `/boot/kernel.old.elf`, read by the boot loader), the user programs (`/bin/*`; the `eutils` names are hard links), `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc`, `/dev/`, `/proc/`, `/tmp/:0777`, `/www/`, `/home/` and `/home/guest/:0755:1000:1000`. The image is rebuilt whenever a program changes, which discards run-time files. It gets `--label root`.
 
 The persistent `/home` disk, `home.img` (`HOME_IMG ?= home.img` in the top directory, `HOME_MB ?= 64`), is made once with `--label home` and the single spec `/guest/:0755:1000:1000`, so it holds `/guest` owned by uid and gid 1000 (`guest` in `/etc/passwd`, home `/home/guest`). The Makefile never rebuilds it, so what is created there survives `make` and `make clean`; `make clean-home` deletes it. `make run`, `debug` and `qemu-log` attach it as a second virtio disk; the test scenarios do not. The root image keeps its own `/home/guest`, which is what you see when no home disk is attached.
 
@@ -698,7 +703,7 @@ ns_lock  ->  fs_begin_op (log space)  ->  inode lock(s) (dir, then entry)  ->  b
 
 **Transactions and sleeping:**
 - `commit` runs in the thread that ended the last operation, with no spinlocks held. It sleeps on disk I/O.
-- New operations wait in `log_begin` (not interruptible) while a commit runs.
+- New operations wait in `log_begin` (not interruptible) while a commit runs, and while a `log_sync` is waiting (`syncing`).
 - A thread may nest operations. The depth is per thread (`fs_op_depth`), so a nested `iput` → `free_inode` joins the outer transaction.
 
 **Buffers:**
@@ -766,7 +771,7 @@ Numbers are Linux RISC-V (`lib/include/uapi/syscall.h`).
 | 62 / 63 / 64 | lseek / read / write | | |
 | 73 | ppoll | `do_ppoll` | sigmask ignored |
 | 79 / 80 | fstatat / fstat | | |
-| 81 / 82 | sync / fsync | no-ops | |
+| 81 / 82 | sync / fsync | `do_sync`, `do_fsync` | wait for the next log commit (`log_sync`) of every filesystem / the file's |
 | 502 | debug(`DBG_FSCRASH`, point) | `kernel/proc/syscall.c` | arms a crash point; also `DBG_FILES` prints the caller's table |
 
 ### Files
@@ -857,7 +862,7 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 
 **Durability and the log:**
 - Full data journaling: every modified block, file data included, reaches the disk twice (into the log, then home). On allocation, the zeroing and the data write absorb into one log entry, so a new block is not written a third time.
-- Commits are synchronous and happen only when no operation is outstanding. A steady stream of overlapping operations delays the commit, and under concurrency `write()` can return before its data is durable. `sync` and `fsync` do nothing, so they do not close this gap.
+- Commits are synchronous and happen only when no operation is outstanding. A steady stream of overlapping operations delays the commit, and under concurrency `write()` can return before its data is durable; `sync`/`fsync` close that gap: they hold new operations back until the running ones finish and the commit happens. `fsync` waits for the whole filesystem's next commit, not just the file's.
 - A `write()` larger than 16 KiB is split into several transactions and is not atomic as a whole.
 - There are no disk cache flushes (`virtio_blk.c` sends only `T_IN`/`T_OUT`). Crash consistency relies on each `blk_rw` write being durable when it completes, which holds for QEMU's emulation but not for a disk with a volatile write cache.
 - I/O errors are not propagated:
@@ -906,7 +911,7 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 - **Nothing is reclaimed**: nodes, and the fids they hold on the server, live until the mount goes away (never), so walking a huge tree uses kernel memory and server fids without bound. Every file seen in a listing gets a node.
 - **No caching**: every path component is a `Twalk` and every `stat` and `open` a `Tgetattr`, so a long path costs one round trip per component. A file deleted on the Mac fails `open` with ENOENT (or ESTALE); `stat` keeps showing its last attributes. A directory's buffered `Treaddir` batch is dropped whenever a listing restarts at offset 0 and after every create, remove, link and rename in it.
 - **Host types and names**: symbolic links, devices, FIFOs and sockets appear as regular files (the type is only "directory or not"); names longer than 59 bytes are skipped in listings (and cannot be looked up through a listing's name); uids and gids above 65535 are truncated.
-- **No `Tfsync`**: `fsync` does nothing on the share either; writes reach the Mac's page cache, not necessarily its disk.
+- **No `Tfsync`**: 9pfs has no `sync` operation, so `fsync` on the share does nothing; writes reach the Mac's page cache, not necessarily its disk.
 - **No unmount or remount**, and only tags whose `/mnt/TAG` exists in the image (`host`) are mounted.
 
 **procfs:**
@@ -952,12 +957,7 @@ Export them to Perfetto as described in `DEBUGGING.md`.
    - Add a debug check in `log_write` that panics when one operation exceeds `MAXOPBLOCKS`, so oversize operations are caught on small images too.
 
    Today, deleting a big file on a large image can panic with "transaction too big". Impact: medium. Effort: medium.
-7. **Make `fsync` and `sync` mean something**:
-   - Record the transaction `seq` each operation joined.
-   - Have `fsync`/`sync` (and optionally `O_SYNC`) wait until that `seq` has committed, and force a commit when no other operation is running.
-   - Add `VIRTIO_BLK_T_FLUSH` around the commit point if the device offers it.
-
-   Impact: medium. Effort: medium.
+7. **Faster, finer `fsync` and `sync`**: record the transaction `seq` each operation joined so `fsync` waits only for its file's transaction; add `VIRTIO_BLK_T_FLUSH` around the commit point if the device offers it; `Tfsync` for 9pfs. Impact: medium. Effort: medium.
 8. **Ordered-mode journaling for file data**: write data blocks to their home locations before the commit instead of logging them. Only metadata (bitmap, inodes, indirect blocks, directories) would go through the log. This halves write traffic for bulk writes, lets one transaction carry much more file data than 16 KiB, and stops large writes from consuming log space. Impact: high. Effort: large.
 9. **Keep unreferenced inodes cached and hash lookups**:
    - Retain inodes with `refcnt == 0` on an LRU instead of `kfree`ing them in `iput`.

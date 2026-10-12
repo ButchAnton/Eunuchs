@@ -233,6 +233,7 @@ static void emit_cmdsub(struct ex *e, const char *src, int mode)
     int st;
     char *out = run_cmdsub(src, &st);
     sh.last_status = st;
+    sh.cmdsubs++;
     if (mode)
         emit_str(e, out, 1);
     else if (e->flags & EX_SPLIT)

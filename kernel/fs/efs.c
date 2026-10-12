@@ -431,6 +431,7 @@ static int efs_readdir(struct inode *dir, u64 *off, struct kdirent *out)
 
 static void efs_begin_op(struct super_block *sb) { log_begin(info(sb)->log); }
 static void efs_end_op(struct super_block *sb) { log_end(info(sb)->log); }
+static void efs_sync(struct super_block *sb) { log_sync(info(sb)->log); }
 
 /* Free blocks counted from the on-disk bitmap (tests compare with the counter). */
 u32 efs_free_blocks(struct super_block *sb)
@@ -482,6 +483,7 @@ static const struct fs_ops efs_ops = {
     .begin_op = efs_begin_op,
     .end_op = efs_end_op,
     .stat_fs = efs_stat_fs,
+    .sync = efs_sync,
 };
 
 static int efs_mount(struct super_block *sb)

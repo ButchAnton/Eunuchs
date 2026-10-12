@@ -7,6 +7,7 @@
 #   cd /mnt/host && make -f kernel/build.mk [OUT=dir] [TCC=compiler] [KLD=linker]
 #
 # OUT/kernel/kernel.elf   the kernel (with its symbol table: kld --ksyms)
+# OUT/kernel/eboot.elf    the boot loader (boot/), which loads /boot/kernel.elf
 
 TCC     = tcc
 OUT     = build/selfhost
@@ -27,11 +28,16 @@ KOBJS   := $(patsubst %.S,$(KOUT)/%.o,$(KSRC_S)) $(patsubst %.c,$(KOUT)/%.o,$(KS
 RT_O    := $(patsubst %,$(KOUT)/rt/%.o,atomic stdatomic builtin)
 LDSCRIPT = kernel/arch/riscv/kernel.ld
 
-all: $(KOUT)/kernel.elf
-	@echo "kernel built in $(KOUT)"
+all: $(KOUT)/kernel.elf $(KOUT)/eboot.elf
+	@echo "kernel and boot loader built in $(KOUT)"
 
 $(KOUT)/kernel.elf: $(KOBJS) $(RT_O) $(LDSCRIPT) $(KLD)
 	$(KLD) -T $(LDSCRIPT) -o $@ --ksyms $(KOBJS) $(RT_O)
+
+EBOOT_O := $(KOUT)/boot/start.o $(KOUT)/boot/eboot.o
+
+$(KOUT)/eboot.elf: $(EBOOT_O) boot/eboot.ld $(KLD)
+	$(KLD) -T boot/eboot.ld -o $@ $(EBOOT_O)
 
 $(KOUT)/%.o: %.c
 	@mkdir -p $(@D)

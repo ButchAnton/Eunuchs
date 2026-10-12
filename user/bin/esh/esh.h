@@ -125,6 +125,7 @@ int opt_find(const char *name);         /* ignores case and '_'; "no" prefix han
 
 struct sh {
     int last_status;
+    unsigned cmdsubs;           /* command substitutions run (x=$(cmd) takes their status) */
     int interactive;            /* reading commands from a terminal */
     int tty_fd;                 /* the terminal (job control, zle), or -1 */
     pid_t pgid;                 /* the shell's own process group */
