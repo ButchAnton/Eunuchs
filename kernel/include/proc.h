@@ -7,7 +7,7 @@
  * User virtual layout (Sv39 lower half):
  *   0x0000000000000000  unmapped (NULL guard)
  *   0x0000000000010000  program (ELF PT_LOAD segments), then the heap (brk)
- *   0x0000002000000000  mmap area (grows up)
+ *   0x0000002000000000  mmap area (the lowest free range that fits; freed ranges are reused)
  *   USER_STACK_TOP      stack: USER_STACK_SIZE below it, demand-paged,
  *                       with an unmapped gap under it (stack overflow -> SIGSEGV)
  *   0x0000004000000000  USER_TOP (end of the lower half)
@@ -36,7 +36,9 @@
 #define VM_WRITE 2
 #define VM_EXEC  4
 
-enum vma_kind { VMA_ELF, VMA_HEAP, VMA_STACK, VMA_ANON };
+enum vma_kind { VMA_ELF, VMA_HEAP, VMA_STACK, VMA_ANON, VMA_FILE };
+
+struct file;
 
 struct vma {
     struct list_head node;          /* sorted by start */
@@ -44,22 +46,35 @@ struct vma {
     u32 prot;
     enum vma_kind kind;
     char name[16];
+    /* VMA_FILE: the file (a reference), the file page at start, and whether
+       writes go to the file (MAP_SHARED) or to private copies (MAP_PRIVATE) */
+    struct file *file;
+    u64 pgoff;
+    bool shared;
 };
 
 struct mm {
     pagetable_t pt;
     /*
-     * Only the owning process changes its mm. vma_lock serializes those
-     * changes to the VMA list against readers from other processes
-     * (/proc/<pid>/maps, which also holds proc_lock to keep the mm alive).
+     * lock: held while the page table or the VMA list changes: by the
+     * owning process (faults, mmap, munmap, brk, fork, exit), by a debugger
+     * (ptrace), and by reclaim, which takes other processes' pages
+     * (mutex_trylock, under proc_lock, so the mm cannot go away).
+     * vma_lock additionally serializes VMA list changes against readers
+     * that cannot sleep (/proc/<pid>/maps under proc_lock, the monitor).
      */
+    struct mutex lock;
     spinlock_t vma_lock;
     struct list_head vmas;
     uintptr_t brk_start, brk;
-    uintptr_t mmap_next;
     u64 rss;                        /* resident pages */
+    u64 swapped;                    /* pages out in swap */
     u64 faults, cow_copies;         /* statistics */
+    u64 major_faults;               /* faults that read a file or swap */
     u32 kernel_gen;                 /* kernel_root_gen when the upper half was synced */
+    u64 id;                         /* unique for the life of the system (ASIDs) */
+    u64 tlb_gen;                    /* bumped by every PTE change other CPUs may cache */
+    uintptr_t scan_va;              /* where reclaim continues */
 };
 
 /* Fault access types */
@@ -75,13 +90,25 @@ struct vma *vma_find(struct mm *mm, uintptr_t addr);
 int vma_add(struct mm *mm, uintptr_t start, uintptr_t end, u32 prot, enum vma_kind kind,
             const char *name);
 int vma_unmap(struct mm *mm, uintptr_t start, uintptr_t end);
+int vma_unmap_locked(struct mm *mm, uintptr_t start, uintptr_t end);    /* holding mm->lock */
 int vma_protect(struct mm *mm, uintptr_t start, uintptr_t end, u32 prot);
-int uvm_fault(struct mm *mm, uintptr_t addr, int access);
+int uvm_fault(struct mm *mm, uintptr_t addr, int access);  /* takes mm->lock */
+/* Reclaim: unmap up to `want` pages of mm that were not used since the last
+   pass (caller holds mm->lock); returns pages unmapped. */
+unsigned long uvm_reclaim(struct mm *mm, unsigned long want, unsigned long *scanned);
+/* msync: write-protect and write back the shared file pages in a range. */
+int uvm_msync(struct mm *mm, uintptr_t start, uintptr_t end);
+/* mmap: a free range of len bytes in the mmap area (with a guard page). */
+uintptr_t uvm_find_gap(struct mm *mm, size_t len);
+int vma_add_file(struct mm *mm, uintptr_t start, uintptr_t end, u32 prot, struct file *f, u64 pgoff,
+                 bool shared);
 void *uvm_populate(struct mm *mm, uintptr_t va);   /* map a zeroed page; kernel VA of it */
 int uvm_write(struct mm *mm, uintptr_t dst, const void *src, size_t n);
 int uvm_read(struct mm *mm, uintptr_t src, void *dst, size_t n);  /* no faulting in */
 int uvm_peek(struct mm *mm, uintptr_t addr, void *dst, size_t n);        /* ptrace: faults in */
 int uvm_poke(struct mm *mm, uintptr_t addr, const void *src, size_t n);  /* ptrace: ignores prot */
+int uvm_peek_locked(struct mm *mm, uintptr_t addr, void *dst, size_t n);    /* holding mm->lock */
+int uvm_poke_locked(struct mm *mm, uintptr_t addr, const void *src, size_t n);
 void vm_activate(struct mm *mm);                    /* NULL: kernel page table */
 void mm_print(int (*print)(const char *fmt, ...), struct mm *mm);
 const char *vma_kind_name(enum vma_kind k);

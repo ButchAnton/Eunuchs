@@ -228,6 +228,28 @@ static int cmd_meminfo(int argc, char **argv)
     return MON_STAY;
 }
 
+static int cmd_vmstat(int argc, char **argv)
+{
+    (void)argc, (void)argv;
+    vm_counters_print(kprintf);
+    asid_print(kprintf);
+    return MON_STAY;
+}
+
+static int cmd_swap(int argc, char **argv)
+{
+    (void)argc, (void)argv;
+    swap_print(kprintf);
+    return MON_STAY;
+}
+
+static int cmd_pagecache(int argc, char **argv)
+{
+    (void)argc, (void)argv;
+    pc_print(kprintf);
+    return MON_STAY;
+}
+
 static int cmd_pt(int argc, char **argv)
 {
     uintptr_t va;
@@ -926,6 +948,9 @@ static const struct mon_cmd commands[] = {
     { "poke",     "<addr> <val> [size]", "write memory", cmd_poke },
     { "sym",      "<addr|name>",         "symbol lookup", cmd_sym },
     { "meminfo",  "",                    "physical memory summary", cmd_meminfo },
+    { "vmstat",   "",                    "paging counters: faults, cache, swap, reclaim, ASIDs", cmd_vmstat },
+    { "swap",     "",                    "swap space: slots used, pages in and out", cmd_swap },
+    { "pagecache", "",                   "cached file pages by file, dirty pages", cmd_pagecache },
     { "pt",       "[va]",                "page table dump, or walk one address", cmd_pt },
     { "v2p",      "<va>",                "translate virtual -> physical", cmd_v2p },
     { "p2v",      "<pa>",                "physical -> direct-map virtual", cmd_p2v },

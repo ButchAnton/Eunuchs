@@ -214,7 +214,7 @@ All devfs inodes have uid and gid 0 (they are `kzalloc`ed and never set). `rdev`
 `kinit` calls `blk_init`, which finds every virtio disk (up to `MAX_DISKS` = 4; with none, `kinit` panics), then `vfs_init` (`kernel/fs/vfs.c`):
 
 1. `bcache_init` allocates 128 zeroed pages, links them on the LRU, and logs `buffer cache: 128 buffers of 4096 bytes`.
-2. `blk_scan_volumes` reads each disk's GUID partition table ([07](07-devices-and-tty.md#volumes-gpt-partitions)): every partition becomes a volume, and a disk without a valid table is one whole-disk volume. The boot log lists them (`blk: disk0p1: 16 MiB "boot"`). The disk image has four partitions, all efs, each with an efs label equal to its GPT name: `boot` (16 MiB), `boot.old` (16 MiB), `root` (`FS_MB`, 64) and `home` (`HOME_MB`, 64).
+2. `blk_scan_volumes` reads each disk's GUID partition table ([07](07-devices-and-tty.md#volumes-gpt-partitions)): every partition becomes a volume, and a disk without a valid table is one whole-disk volume. The boot log lists them (`blk: disk0p1: 16 MiB "boot"`). The disk image has four efs partitions, each with an efs label equal to its GPT name: `boot` (16 MiB), `boot.old` (16 MiB), `root` (`FS_MB`, 64) and `home` (`HOME_MB`, 64), plus `swap` (`SWAP_MB`, 128), which is swap space ([02](02-memory.md#swap-swapc-swap_formath)), not a filesystem.
 3. It chooses the root volume: `volume_labeled("root")` returns the first volume whose GPT name is `root`, else the first whose efs volume label is `root` (`efs_label` reads each volume's superblock through the buffer cache). If none is, `root_volume` takes the first efs volume that is not a boot slot (`is_boot_volume`: GPT name or efs label `boot` or `boot.old`), and failing that volume 0, so a bare unlabelled efs image attached alone still boots and the `boot` partition of a partitioned image is never mounted as `/`. The boot loader applies the same rule (`is_boot_vol`), so both agree on the root.
 4. `vfs_mount_disk(&efs_type, "/", root)` records the volume in `sb->disk` and calls `efs_mount`:
    - It reads block 1 of that volume and checks `magic`, `bsize` and `version`; on a mismatch it fails with `-EINVAL`, and `vfs_init` panics with "cannot mount the root filesystem".
@@ -332,7 +332,7 @@ So each newly allocated block costs two log entries: the bitmap block (often abs
 
 - It clips the read at `size`.
 - Then, block by block, it calls `bmap(..., alloc=false)` and copies from the buffer, or from zeros for a hole.
-- Copies to user space use `copy_to_user` while the buffer is locked.
+- It is now called with a kernel destination: the page cache fills pages through it (`pc_get`), so its user-copy path is unused for efs files.
 - A fault returns the bytes copied so far, or `-EFAULT`.
 
 **`efs_write`**:
@@ -343,13 +343,15 @@ So each newly allocated block costs two log entries: the bitmap block (often abs
 - It updates `size` and `mtime` and writes the inode.
 - It returns the bytes written, or `-ENOSPC`/`-EFAULT` if nothing was written.
 
-**`file_write`** (`file.c`) splits a request into 16 KiB chunks. Each chunk is its own transaction: `fs_begin_op`, then `ilock`, then the write, then `iunlock`, then `fs_end_op`. With `O_APPEND`, `f->off` is reset to `ip->size` under the inode lock for every chunk.
+**`file_write`** (`file.c`) splits a request into 16 KiB chunks. Each chunk is first copied from the user into a kernel bounce buffer, with no lock held (the user's buffer may be a file mapping or swapped out, and bringing it in takes `mm->lock` and possibly filesystem locks); then `pc_update` copies the bytes written into any cached pages of the file, so `read`, `write` and `mmap` agree. Each chunk is its own transaction: `fs_begin_op`, then `ilock`, then the write, then `iunlock`, then `fs_end_op`. With `O_APPEND`, `f->off` is reset to `ip->size` under the inode lock for every chunk.
 
 Worst-case logged blocks for one chunk: 4 data blocks, the bitmap block(s), the single-indirect, the double-indirect and one inner indirect block, and the inode block. That is about 10, under the 16 reserved.
 
 A large `write()` is therefore **not atomic** across chunks: a crash can leave a prefix of it on disk. Each 16 KiB chunk is atomic.
 
-**`file_read`** takes `ilock`, reads at `f->off`, and advances it. A regular file read never starts a transaction.
+**`file_read`**: for efs files it goes through the page cache ([02](02-memory.md#the-page-cache-pagecachec)), a page at a time: under `ilock` it clips at `size`, gets the cached page (`pc_get`, which fills it from the file on a miss), and advances `f->off`; it then copies to the user with no lock held, holding only a reference on the page. If that copy faults, the offset stays advanced (an unlocked rollback could undo another reader's progress on a shared file description), and the call returns the bytes copied so far, or `-EFAULT` if there were none. Other filesystems (9pfs) read into a kernel bounce page under `ilock` and copy out after. A regular file read never starts a transaction.
+
+**The page cache and the filesystem**: `O_TRUNC` (and truncation) calls `pc_truncate`; the final `iput` of an unlinked file calls `pc_drop_inode`; `sync`/`fsync` first write dirty mapped pages back (`pc_writeback`), then wait for the log.
 
 ### Truncate and freeing inodes
 
@@ -504,7 +506,7 @@ All of these take `sb->ns_lock` and run as one transaction, so each is atomic ac
 - **`getdents64`**: fills fixed 64-byte `struct dirent` records (`d_ino`, `d_type`, `d_name[59]`) and advances `f->off` after each record it copies.
 - **`chdir`**: requires a directory and swaps `p->cwd` under `proc_lock`.
 - **`getcwd`**: returns the length including the NUL.
-- **`sync` and `fsync`**: `sync` calls `vfs_sync_all`, which calls the optional `fs_ops.sync` of every mount (the mount list only grows at boot, so it is walked without a lock); `fsync(fd)` calls `vfs_sync` on the file's filesystem (pipes and sockets: nothing). For efs, `efs_sync` is `log_sync`: if the log holds blocks or is committing, it increments `syncing` (which stops `log_begin` from starting new top-level operations), sleeps on the log's wait queue (`wait_what = "log commit"`) until `seq` passes its current value + 1, that is, until the next commit has finished, or until the log is idle and empty, then decrements `syncing` and wakes the queue. The wait is therefore bounded by the operations already running, not by a stream of new ones: with a shell loop appending to a file nonstop, `sync` takes about 44 ms. Calling `log_sync` inside a transaction panics (it would wait for its own commit). So every write that had returned before the call is on disk when it returns. (They used to do nothing, on the claim that every transaction is already on disk, which is false when an operation ends while others run: its blocks wait in the log until the last of them ends.) `reboot(2)` calls `vfs_sync_all` before restarting or powering off. 9pfs has no `sync`.
+- **`sync` and `fsync`**: both first write back file pages dirtied through shared mappings (`pc_writeback`: all files for `sync`, the file for `fsync`). `sync` then calls `vfs_sync_all`, which calls the optional `fs_ops.sync` of every mount (the mount list only grows at boot, so it is walked without a lock); `fsync(fd)` calls `vfs_sync` on the file's filesystem (pipes and sockets: nothing). For efs, `efs_sync` is `log_sync`: if the log holds blocks or is committing, it increments `syncing` (which stops `log_begin` from starting new top-level operations), sleeps on the log's wait queue (`wait_what = "log commit"`) until `seq` passes its current value + 1, that is, until the next commit has finished, or until the log is idle and empty, then decrements `syncing` and wakes the queue. The wait is therefore bounded by the operations already running, not by a stream of new ones: with a shell loop appending to a file nonstop, `sync` takes about 44 ms. Calling `log_sync` inside a transaction panics (it would wait for its own commit). So every write that had returned before the call is on disk when it returns. (They used to do nothing, on the claim that every transaction is already on disk, which is false when an operation ends while others run: its blocks wait in the log until the last of them ends.) `reboot(2)` calls `vfs_sync_all` before restarting or powering off. 9pfs has no `sync`.
 
 ### Pipes
 
@@ -740,7 +742,7 @@ ns_lock  ->  fs_begin_op (log space)  ->  inode lock(s) (dir, then entry)  ->  b
 |---|---|
 | `vfs_init` | `kinit` |
 | `vfs_mount_disk(type, path, disk)`, `efs_label(disk, out)` | `vfs_init` (`vfs_mount` is the disk-0 form, used for devfs and procfs) |
-| `namei`, `nameiparent`, `iget`, `idup`, `ilock`, `iunlock`, `iput`, `iunlockput` | `exec`, `cred.c`, procfs, tests |
+| `namei`, `nameiparent`, `iget`, `idup`, `ilock`, `ilock_try`, `iunlock`, `iput`, `iunlockput` | `exec`, `cred.c`, procfs, tests |
 | `vfs_open`, `file_read`, `file_write`, `file_dup`, `file_close`, `fd_install`, `fd_get` | sockets, exec, ktests |
 | `vfs_read_all(path, &size, &err)` | `exec`: whole file into `kmalloc` memory, max 16 MiB, regular files only |
 | `vfs_permission`, `vfs_stat`, `vfs_getcwd`, `fs_begin_op`/`fs_end_op` | `cred.c`, `proc.c`, procfs |

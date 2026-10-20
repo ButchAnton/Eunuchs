@@ -12,6 +12,10 @@ import sys
 import tempfile
 
 
+def cat3(run, img):
+    return run("cat", img + ":root:/mine", ok=False).stdout
+
+
 def main():
     eudisk, kernel = sys.argv[1], sys.argv[2]
     tmp = tempfile.mkdtemp()
@@ -90,6 +94,17 @@ def main():
     check("the same kernel again is a no-op", "already" in out and slot("boot.old") == kern1)
     run("kernel", "rollback", img)
     check("rollback swaps them", slot("boot") == kern1 and slot("boot.old") == kern1 + b"x")
+
+    # swap space: made by create, added to an existing image, left alone by fsck
+    img3 = os.path.join(tmp, "s.img")
+    run("create", img3, "root:8", "swap:4")
+    check("create: a swap partition", "swap space, 1023 pages" in run("info", img3).stdout)
+    run("put", mine, img3 + ":/mine")
+    run("add", img3, "home:4")
+    check("add: a partition at the end", "home" in run("info", img3).stdout and cat3(run, img3) == "my work\n")
+    check("add keeps the table valid", run("fsck", img3).returncode == 0 and
+          '"swap":true' in run("info", "--json", img3).stdout)
+    check("add refuses a name in use", run("add", img3, "home:4", ok=False).returncode != 0)
 
     # copy between images keeps owners and links
     img2 = os.path.join(tmp, "e.img")

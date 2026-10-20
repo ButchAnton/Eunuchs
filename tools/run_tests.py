@@ -135,10 +135,11 @@ def main():
         return stage(name, [a.mkfs, "--check", img], **kw)
 
     def interactive(name, steps, extra=(), image=None):
-        """steps: (send, expect[, prompt]) tuples. send is a command line (then we
-        wait for `expect` and the next prompt, unless prompt=False) or bytes for
-        raw keys like ^C (sent after a short pause so the target is running).
-        image: a disk of its own instead of the shared one."""
+        """steps: (send, expect[, prompt[, timeout]]) tuples. send is a command
+        line (then we wait for `expect` and the next prompt, unless
+        prompt=False) or bytes for raw keys like ^C (sent after a short pause
+        so the target is running). image: a disk of its own instead of the
+        shared one."""
         t0 = time.time()
         logpath = os.path.join(logs, name + ".log")
         cmd = qemu
@@ -152,15 +153,16 @@ def main():
                 for step in steps:
                     send, want = step[0], step[1]
                     prompt = step[2] if len(step) > 2 else True
+                    tmo = step[3] if len(step) > 3 else 10
                     if isinstance(send, bytes):
                         time.sleep(0.5)
                         con.send(send)
                     elif send is not None:
                         con.line(send)
                     if want:
-                        con.expect(want)
+                        con.expect(want, tmo)
                     if prompt:
-                        con.expect("@eunuchs:")     # the next prompt: command finished
+                        con.expect("@eunuchs:", tmo)    # the next prompt: command finished
                         con.expect(" ")
             except Exception as e:
                 problem = "%s (after sending %r)" % (e, send)
@@ -319,6 +321,15 @@ def main():
     boot("smp stress", "utest=stress", expect=["STRESS RESULT: PASS", "UTEST RESULT: PASS"],
          forbid=["LOCKDEP", "HUNG THREAD", "filesystem error"])
     fsck("fsck after stress", expect=["clean"], forbid=["note: log holds"])
+
+    # Swapping: on a 64 MiB machine, a program uses 80 MiB, forks, and checks
+    # every word in both processes (user/bin/memhog.c); the pages that don't
+    # fit go to the swap partition and come back.
+    interactive("swap", [
+        ("memhog 80", "memhog: ok", True, 180),
+        ("cat /proc/swaps", "disk0p5"),
+        ("grep oom /proc/vmstat", "oom 0"),
+    ], extra=["-m", "64M"])
 
     # The shell, driven like a user at the console.
     interactive("interactive shell", [

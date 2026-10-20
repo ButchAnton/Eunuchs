@@ -42,6 +42,13 @@ static inline void list_del(struct list_head *e)
     e->next = e->prev = NULL;
 }
 
+static inline void list_move_tail(struct list_head *e, struct list_head *head)
+{
+    e->next->prev = e->prev;
+    e->prev->next = e->next;
+    __list_add(e, head->prev, head);
+}
+
 static inline bool list_empty(const struct list_head *h)
 {
     return h->next == h;

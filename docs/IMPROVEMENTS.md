@@ -193,12 +193,13 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Clear `SUM` on kernel trap entry (M/S).
 - Allocate slab pages outside the cache lock (M/S).
 - Word-at-a-time user copies (M/M).
-- ASIDs and ranged TLB shootdowns (M/M).
+- Ranged and ASID-targeted TLB shootdowns (L/S).
+- Swap readahead and clustered writes; shared anonymous memory; truncation that unmaps pages beyond the new end (M/M).
 - Per-CPU page and object caches (M/L).
 - Host tests for the slab and `uvm` logic (M/M).
 - Smaller items:
-  - failure-atomic `vma_unmap` and `vma_protect`, remote `fence.i` only to harts that ran the process, robust `ioremap`, atomic statistics (L/S);
-  - freeing empty user page tables and reusing `mmap` holes, and a boot option to slim down slab debugging (L/M).
+  - failure-atomic `vma_protect` across VMAs, remote `fence.i` only to harts that ran the process, robust `ioremap`, atomic statistics (L/S);
+  - a boot option to slim down slab debugging (L/M).
 
 ### [Traps, interrupts and system calls](subsystems/03-traps-interrupts-syscalls.md#potential-improvements)
 - `strace_enter` bounds (H/S).
@@ -320,7 +321,6 @@ Condensed. Each document's last section has the detail, code locations and reaso
 - Separate debug files for `/bin` (`build/user/bin` DWARF installed under `/usr/lib/debug`) so the system programs debug at source level (M/S).
 - CFI (`.debug_frame`/`.eh_frame`) unwinding instead of frame-pointer heuristics (M/M).
 - Casts to struct and union types, and function calls, in `db` expressions (L/M).
-- Do `ptrace` memory copies without holding `proc_lock` with interrupts off (M/S).
 
 ### [Build and testing](subsystems/11-build-and-testing.md#potential-improvements)
 - eudisk: keep hard links whose first name `copy` skipped; repair a damaged primary GPT from the backup; a stricter in-use check than matching QEMU's `file=` argument; save only on success in `put`; manifest paths with spaces; valid JSON for non-UTF-8 names; one place for the kernel banner key (M/S).
@@ -343,6 +343,7 @@ Bigger projects that would each change what the system can do. They are listed r
 **Done since the review:**
 - **Floating point for user programs.** User code is built for `rv64gc`/`lp64d`. The kernel enables FP per thread on its first FP instruction, saves and restores the registers at context switches of threads that use them, copies them at `fork`, resets them at `exec`, and carries them in signal frames ([03](subsystems/03-traps-interrupts-syscalls.md#lazy-floating-point-for-user-programs)).
 - **A real C library.** Buffered `FILE` stdio, `printf` with floating point, `scanf`, `strto*`, `qsort`, `getopt`, `math.h`, `strftime`, `setjmp`/`sigsetjmp`, and POSIX regular expressions (BRE and ERE) ([10](subsystems/10-user-space.md#stdio-streams)).
+- **Virtual memory: page cache, file mappings, swap, reclaim, ASIDs.** A page cache (efs reads go through it; `write` keeps it coherent), file-backed `mmap` (`MAP_SHARED`, `MAP_PRIVATE`, `MAP_FIXED`, `msync`), a `swap` partition with per-slot counts and a swap cache, kswapd and direct reclaim with free-memory marks and second-chance aging, `mm->lock` with faults that allocate unlocked, reuse of freed address space and empty page tables, a failure-atomic `vma_unmap`, and ASIDs ([02](subsystems/02-memory.md#the-page-cache-pagecachec)). `memhog 128` checks every word of 128 MiB (with a fork) on a 128 MiB machine.
 - **One partitioned disk, managed from the Mac.** The image is a GPT disk with `boot`, `boot.old`, `root` and `home` efs partitions; the kernel and eboot read the partition table, `/boot` holds the current kernel and `/boot.old` the previous one (`kinstall` in the guest, `eudisk kernel install` on the Mac). `disk.img` is updated in place by `eudisk install`, which keeps the user's files and edits; `eudisk` and the Eudisk app read and write images from the Mac ([11](subsystems/11-build-and-testing.md#disk-image-contents-fs_files-in-the-makefile)).
 - **Several disks and a persistent `/home`.** Up to four virtio disks, a buffer cache keyed by disk, a log per filesystem, volume labels, and `home.img`, which survived rebuilds (since replaced by the partitioned `disk.img`, above) ([06](subsystems/06-filesystems.md#boot-and-mounting)).
 - **A native C toolchain.** TinyCC runs on Eunuchs (`/bin/tcc`, with `tcc -run` through the new `mprotect`), with a sysroot in `/usr`, a POSIX `make`, and the sources of every program in `/usr/src`, rebuilt in about 6 seconds in the guest ([13](subsystems/13-toolchain.md)).
@@ -358,8 +359,8 @@ Bigger projects that would each change what the system can do. They are listed r
 | Direction | What it involves | Why |
 |---|---|---|
 | **User threads** (`clone`, futex, per-thread signal masks, TLS via `tp`) | Many threads per `mm`: per-thread kernel state, an `mm` lock for real, TLB shootdowns for user mappings, thread-directed signals | The single-thread-per-process assumption is everywhere (mm locking, signals, `current_proc`); this is the largest structural change |
-| **Page cache and file-backed `mmap`** | Cache file pages instead of whole-program `kmalloc` images; demand paging from disk; shared text; `msync` | Removes the 4 MiB program limit, makes `exec` cheap, enables shared libraries |
-| **Dynamic linking** (an `ld.so`, a shared libc) | Needs the page cache and `mmap` of files | Smaller binaries; a more realistic user space |
+| **`exec` through the page cache** | Map program text and data from the file (the page cache and file-backed `mmap` now exist) instead of reading whole programs into `kmalloc` memory; shared text | Removes the 4 MiB program limit, makes `exec` cheap, and is the base for shared libraries |
+| **Dynamic linking** (an `ld.so`, a shared libc) | Builds on the page cache and file `mmap` (now there) and on exec through the page cache | Smaller binaries; a more realistic user space |
 | **A real filesystem alongside efs** (ext2, read-only first) | A second on-disk filesystem type through the VFS | Read disk images made elsewhere (exchanging files with the Mac is now done by 9pfs) |
 | **Networking breadth:** DHCP, a DNS resolver, IPv6 | DHCP and DNS are small user programs on top of UDP; IPv6 is a larger stack addition | Talk to the outside world by name; QEMU's user network provides DHCP and DNS |
 | **Per-CPU scheduling and a better scheduler** | Per-CPU run queues with load balancing, priorities and `nice`, maybe CFS-like fairness | Scales beyond a handful of harts; gives interactive priority |

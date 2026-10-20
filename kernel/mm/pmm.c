@@ -330,6 +330,9 @@ void page_put(struct page *pg)
     }
 }
 
+u64 pmm_free_pages(void) { return __atomic_load_n(&zone.free_pages, __ATOMIC_RELAXED); }
+u64 pmm_total_pages(void) { return zone.npages; }
+
 const char *pmm_region_name(uintptr_t pa)
 {
     for (int i = 0; i < nr_reserved_regions; i++)
@@ -402,6 +405,7 @@ void pmm_print(print_fn print)
     print("allocs %lu, frees %lu, failures %lu, corruptions %lu, poisoning %s\n",
           (unsigned long)st.allocs, (unsigned long)st.frees, (unsigned long)st.failures,
           (unsigned long)mm_corruptions, page_poison ? "on" : "off");
+    vm_memory_print(print);
     print("free blocks by order:");
     for (int o = 0; o <= MAX_ORDER; o++)
         print(" %d:%lu", o, (unsigned long)st.free_blocks[o]);

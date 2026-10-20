@@ -28,6 +28,7 @@
 
 #define MAX_CPUS        8
 #define MAX_HELD_LOCKS  8
+#define ASID_SLOTS      15          /* ASIDs 1..15 (0: the kernel's page table) */
 
 /* Inter-processor interrupt kinds (smp.c). */
 enum ipi_kind {
@@ -86,6 +87,12 @@ struct cpu {
     /* IPIs: bits of enum ipi_kind waiting to be handled. */
     volatile u32 ipi_pending;
     volatile u64 tlb_done_gen;      /* last shootdown generation flushed */
+
+    /* ASIDs (vmm.c: vm_switch): the address spaces whose TLB entries this
+       CPU may hold, by ASID - 1, and the mm->tlb_gen they were current to. */
+    struct { u64 mm_id, gen, uses; } asid[ASID_SLOTS];
+    u32 asid_next;                  /* the next slot to recycle */
+    u64 asid_hits, asid_flushes;
 
     /* Stop-the-world (monitor/panic): where this CPU was when it parked. */
     volatile bool stopped;

@@ -12,6 +12,8 @@ struct Partition: Decodable, Identifiable, Hashable {
     let start: UInt64
     let sectors: UInt64
     let efs: Bool
+    let swap: Bool?
+    let swap_pages: Int?
     let label: String?
     let files: Int?
     let dirs: Int?
@@ -20,6 +22,7 @@ struct Partition: Decodable, Identifiable, Hashable {
     let free_inodes: Int?
     let replayed: Int?
     var id: String { name }
+    var isSwap: Bool { swap ?? false }
     var megabytes: UInt64 { (sectors * 512) >> 20 }
     var usedFraction: Double {
         guard let b = blocks, let u = used_blocks, b > 0 else { return 0 }

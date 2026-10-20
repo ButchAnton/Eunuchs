@@ -75,7 +75,7 @@ The linker script `user/user.ld` and the kernel's `do_exec` (`kernel/proc/proc.c
 | next page | `.rodata` (r--), including `.srodata`. | `user.ld` |
 | next page | `.data` + `.bss` (rw-). `__bss_start`/`__bss_end` mark the BSS. | `user.ld` |
 | `PAGE_ALIGN(end of image)` | Heap, grown by `brk`. `do_brk` refuses to grow it to or past `USER_MMAP_BASE` or into another mapping. | kernel (`mm->brk_start`) |
-| `0x2000000000` (`USER_MMAP_BASE`) | Anonymous `mmap` area, grows up. | kernel |
+| `0x2000000000` (`USER_MMAP_BASE`) | `mmap` area, anonymous and file mappings: each in the lowest free range, with guard pages, so freed ranges are reused. | kernel |
 | `0x3ffff00000 - 8 MiB` .. `0x3ffff00000` (`USER_STACK_TOP`) | Stack, 8 MiB, demand-paged, with an unmapped gap below it. | kernel |
 
 The linker discards `.comment`, `.riscv.attributes`, `.note*` and `.eh_frame*`. `__global_pointer$` is set to `__bss_start` with `PROVIDE`, and `_start` loads it into `gp` with relaxation disabled (the `.option norelax` block), so the linker can relax nearby small-data accesses to `gp`-relative ones.
@@ -304,7 +304,7 @@ The editor's searches and substitutions use it; `grep`, `more` and the shell's `
 
 The flow is described under "malloc heap" above. `sbrk(inc)` caches the break in `cur_brk` (fetched with `brk(0)` the first time) and calls `brk(old + inc)`. `brk(addr)` stores whatever the kernel returns, which is the old break if the request was refused, and fails with `ENOMEM` if that differs from `addr`. `calloc` is `malloc` + `memset`; it returns `NULL` if `n * size` overflows. `realloc` returns the same pointer when the block is already big enough. Otherwise it allocates, copies and frees, and never grows in place.
 
-Programs that want big, page-granular memory can use `mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`. The kernel rejects writable+executable mappings with `EACCES` (tested in `utests.c` `t_mmap`).
+Programs that want big, page-granular memory can use `mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`. Files can be mapped too: `MAP_SHARED` (writes reach the file, at `msync`, `fsync` or later) or `MAP_PRIVATE` (writes make private copies), with `MAP_FIXED` or an address hint; shared anonymous memory is not supported (`EINVAL`). Touching a page wholly past the end of a mapped file is SIGBUS. The kernel rejects writable+executable mappings with `EACCES` (tested in `utests.c` `t_mmap`; file mappings in `t_mmap_file`, address reuse in `t_mmap_reuse`). Memory can exceed RAM: cold anonymous pages go to the swap partition ([02](02-memory.md)).
 
 ### poll and select
 
@@ -601,7 +601,7 @@ Fork and exec interactions:
 | `regex.h` | `regex_t regmatch_t regoff_t`, `regcomp regexec regerror regfree`, `REG_*` flags and errors. |
 | `sys/reboot.h` | `reboot(how)`, `RB_AUTOBOOT`, `RB_POWER_OFF` (from `uapi/reboot.h`, Linux's values). |
 | `sys/ptrace.h` | `ptrace(request, pid, addr, data)` and, from `uapi/ptrace.h`, the `PTRACE_*` requests, `struct user_regs`, `struct user_fpregs`, `struct ptrace_siginfo`, `struct ptrace_io`, `SI_USER`/`TRAP_*`/`SEGV_*` codes. As in glibc, `PTRACE_PEEKTEXT`/`PEEKDATA` return the word (set `errno` to 0 first to tell a word of -1 from an error); the kernel itself stores it at `*data`. See [14](14-debugger.md). |
-| `sys/mman.h` | `mmap munmap mprotect`, `PROT_*`, `MAP_PRIVATE`, `MAP_ANONYMOUS`, `MAP_FAILED`. |
+| `sys/mman.h` | `mmap munmap mprotect msync`, `PROT_*`, `MAP_SHARED`, `MAP_PRIVATE`, `MAP_FIXED`, `MAP_ANONYMOUS`, `MAP_FAILED`, `MS_ASYNC`, `MS_SYNC`, `MS_INVALIDATE`. |
 | `poll.h` | `poll(fds, n, timeout_ms)`. |
 | `sys/select.h` | `select`, `fd_set` (`FD_SETSIZE` 64), `FD_*` macros. |
 | `sys/socket.h` | `socket bind listen accept accept4 connect getsockname getpeername send recv sendto recvfrom setsockopt getsockopt shutdown`, `MSG_NOSIGNAL` (defined here, but not in `uapi/net.h`'s list). |
@@ -641,6 +641,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `stress` | `stress [-j WORKERS] [-t SECS] [-n ITERS] [-v]` | Defaults: 8 workers, 10 s. Each iteration: an `echo \| cat` pipeline, file I/O in `/tmp`, a COW fork with `mmap`, and 16 KiB over loopback TCP. Prints `STRESS RESULT: PASS\|FAIL`. |
 | `segv` | `segv [null\|text\|stack\|illegal\|kernel]` | Crashes on purpose to show the kernel's fault report. |
 | `spin` | `spin [MS]` | Busy loop in user mode (default 2000 ms). |
+| `memhog` | `memhog [-q] MB` | Fills MB MiB of anonymous memory with a pattern derived from each word's address and checks it; forks; the child checks again and rewrites a quarter of the pages; the parent re-checks its own; prints the paging counters that changed (`-q`: less output). Exit 0 if every word was right. A test of swap. |
 | `exitcode` | `exitcode N [check-args A B]`, `exitcode fdopen FD`, `exitcode env NAME VALUE` | Test helper used by `utests`. |
 | `hello` | `hello [ARGS...]` | Prints its pid, parent and arguments. |
 | `eutils` | (through the links below) | Multi-call binary. |
@@ -673,7 +674,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `kill` | `kill [-SIG\|-N] PID...`, `kill -l` | Negative pid = process group. Names: `HUP INT QUIT KILL USR1 SEGV USR2 PIPE ALRM TERM CHLD CONT STOP TSTP`. Job specs need the shell's `kill`. |
 | `date` | `date` | UTC from `CLOCK_REALTIME` via `gmtime_r`. |
 | `dmesg` | `dmesg` | Copies `/dev/kmsg`. |
-| `free` | `free` | Copies `/proc/meminfo`. |
+| `free` | `free` | Copies `/proc/meminfo` (including page cache, swap cache and swap). |
 | `sleep` | `sleep SECS[.FRACTION]` | Millisecond resolution (three fraction digits). |
 | `strace` | `strace CMD [ARGS...]` | `dbg_strace(1)` then `execvp`; the trace goes to the kernel log/console. |
 | `su` | `su [USER]` | `setgid`+`setuid` from `/etc/passwd` (only root can switch), `chdir` home, sets `HOME`, `USER`, `LOGNAME` and `SHELL`, execs the user's shell from `/etc/passwd`. No password check. |
@@ -684,7 +685,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 
 ### Files in the disk image
 
-`FS_FILES` in the Makefile, installed in order into the image's `root` partition by `build/tools/eudisk install` (partition size `FS_MB` = 64 MiB). The image is one GPT disk: `boot` and `boot.old` (16 MiB each, `kernel.elf` in each, mounted on `/boot` and `/boot.old`), `root` and `home` (64 MiB, `/guest` owned by 1000:1000):
+`FS_FILES` in the Makefile, installed in order into the image's `root` partition by `build/tools/eudisk install` (partition size `FS_MB` = 64 MiB). The image is one GPT disk: `boot` and `boot.old` (16 MiB each, `kernel.elf` in each, mounted on `/boot` and `/boot.old`), `root` and `home` (64 MiB, `/guest` owned by 1000:1000), and `swap` (128 MiB of swap space):
 
 | Path | Source |
 |---|---|

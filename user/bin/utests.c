@@ -161,6 +161,119 @@ static void t_mmap(void)
     CHECK(wx == MAP_FAILED && errno == EACCES);
 }
 
+/* A child that touches addr: how it ended (wait status). */
+static int touch_in_child(volatile char *addr)
+{
+    pid_t pid = fork();
+    if (pid == 0)
+        _exit(*addr == 'q' ? 3 : 0);    /* (a value used: tcc drops a (void) load) */
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return st;
+}
+
+static void t_mmap_file(void)
+{
+    const char *p = "/tmp/ut_map";
+    static char page[4096];
+    char c, buf[256];
+    int fd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0);
+    memset(page, 'a', sizeof(page));
+    CHECK(write(fd, page, 4096) == 4096);
+    memset(page, 'b', sizeof(page));
+    CHECK(write(fd, page, 4096) == 4096);
+    CHECK(write(fd, "tail", 4) == 4);           /* 8196 bytes: 3 pages */
+    size_t len = 3 * 4096;
+
+    /* private: the file's bytes; writes stay in this process */
+    char *m = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    CHECK(m != MAP_FAILED);
+    CHECK(m[0] == 'a' && m[4096] == 'b' && !memcmp(m + 8192, "tail", 4) && m[8196] == 0);
+    m[0] = 'X';
+    CHECK(lseek(fd, 0, SEEK_SET) == 0 && read(fd, &c, 1) == 1 && c == 'a');
+    CHECK(munmap(m, len) == 0);
+    m = mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd, 4096);            /* from an offset */
+    CHECK(m != MAP_FAILED && m[0] == 'b');
+    CHECK(munmap(m, 4096) == 0);
+    CHECK(mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd, 100) == MAP_FAILED && errno == EINVAL);
+
+    /* shared: writes reach the file, and read/write and the mapping agree */
+    char *s = mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    CHECK(s != MAP_FAILED);
+    s[1] = 'Y';
+    s[4097] = 'Z';
+    CHECK(lseek(fd, 1, SEEK_SET) == 1 && read(fd, &c, 1) == 1 && c == 'Y');
+    CHECK(lseek(fd, 2, SEEK_SET) == 2 && write(fd, "W", 1) == 1 && s[2] == 'W');
+    pid_t pid = fork();                         /* a child shares the mapping */
+    if (pid == 0) {
+        s[3] = 'C';
+        _exit(0);
+    }
+    waitpid(pid, 0, 0);
+    CHECK(s[3] == 'C');
+    int mfd = open("/proc/self/maps", O_RDONLY);
+    char maps[4096];
+    long mn = mfd >= 0 ? read(mfd, maps, sizeof(maps) - 1) : -1;
+    close(mfd);
+    maps[mn > 0 ? mn : 0] = 0;
+    CHECK(strstr(maps, "shared+0x0 /tmp/ut_map") != NULL);
+    if (!strstr(maps, "shared+0x0 /tmp/ut_map"))
+        printf("%s", maps);
+    CHECK(msync(s, len, MS_SYNC) == 0);
+    s[5] = 'D';                                 /* dirty again after msync */
+    CHECK(munmap(s, len) == 0);
+    close(fd);
+    fd = open(p, O_RDONLY);
+    CHECK(read(fd, buf, 6) == 6 && !memcmp(buf, "aYWCaD", 6));
+    CHECK(lseek(fd, 4097, SEEK_SET) == 4097 && read(fd, &c, 1) == 1 && c == 'Z');
+
+    /* past the end of the file: SIGBUS; a read-only descriptor can't be
+       mapped shared and writable (privately is fine) */
+    s = mmap(0, 4 * 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    CHECK(s != MAP_FAILED);
+    int st = touch_in_child(s + 3 * 4096);
+    CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
+    CHECK(WIFEXITED(touch_in_child(s + 2 * 4096)));
+    CHECK(munmap(s, 4 * 4096) == 0);
+    CHECK(mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) == MAP_FAILED && errno == EACCES);
+    m = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    CHECK(m != MAP_FAILED && munmap(m, 4096) == 0);
+    close(fd);
+    fd = open("/dev/null", O_RDONLY);
+    CHECK(mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED && errno == ENODEV);
+    close(fd);
+    CHECK(mmap(0, 4096, PROT_READ, MAP_SHARED | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == EINVAL);
+    CHECK(unlink(p) == 0);
+}
+
+static void t_mmap_reuse(void)
+{
+    size_t len = 1 << 20;
+    char *a = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(a != MAP_FAILED);
+    for (size_t i = 0; i < len; i += 4096)
+        a[i] = 1;
+    CHECK(munmap(a, len) == 0);
+    char *b = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(b == a);                              /* the freed range again */
+    CHECK(b[0] == 0);                           /* fresh zero pages */
+    char *c = mmap(b + 4096, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    CHECK(c == b + 4096);
+    int st = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        c[0] = 1;                               /* now read-only */
+        _exit(0);
+    }
+    waitpid(pid, &st, 0);
+    CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
+    char *h = (char *)0x3000000000UL;
+    CHECK(mmap(h, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == h);   /* the hint */
+    CHECK(munmap(h, 4096) == 0);
+    CHECK(munmap(b, len) == 0);
+}
+
 static void t_bad_pointers_rejected(void)
 {
     CHECK(write(1, (void *)0x10, 5) == -1 && errno == EFAULT);
@@ -1576,6 +1689,8 @@ static const struct {
     { "faults_kill_with_signals", t_faults_kill_with_signals },
     { "malloc", t_malloc },
     { "mmap", t_mmap },
+    { "mmap_file", t_mmap_file },
+    { "mmap_reuse", t_mmap_reuse },
     { "bad_pointers_rejected", t_bad_pointers_rejected },
     { "kill", t_kill },
     { "sleep_and_ids", t_sleep_and_ids },
@@ -1587,7 +1702,7 @@ static const struct {
 
 /*
  * Multi-boot scenarios driven by tools/run_tests.py:
- *   (default run)     ...also writes /home/persist.txt
+ *   (default run)     ...also writes /persist.txt
  *   persist-check     the file survived a reboot
  *   crash-commit-write / -check: a crash right after the commit point; the
  *                     interrupted append must be present after recovery

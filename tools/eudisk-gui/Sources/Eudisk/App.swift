@@ -121,7 +121,8 @@ struct Sidebar: View {
                     ForEach(info.partitions) { p in
                         VStack(alignment: .leading, spacing: 3) {
                             HStack {
-                                Image(systemName: p.name.hasPrefix("boot") ? "bolt.horizontal.circle" : "internaldrive")
+                                Image(systemName: p.isSwap ? "arrow.left.arrow.right.square" :
+                                      p.name.hasPrefix("boot") ? "bolt.horizontal.circle" : "internaldrive")
                                 Text(p.name).fontWeight(.medium)
                                 Spacer()
                                 Text("\(p.megabytes) MiB").foregroundStyle(.secondary).monospacedDigit()
@@ -135,7 +136,8 @@ struct Sidebar: View {
                                     Text("log holds a committed transaction").font(.caption).foregroundStyle(.orange)
                                 }
                             } else {
-                                Text("not efs").font(.caption).foregroundStyle(.secondary)
+                                Text(p.isSwap ? "swap space (empty at every boot)" : "not efs")
+                                    .font(.caption).foregroundStyle(.secondary)
                             }
                         }
                         .padding(.vertical, 2)

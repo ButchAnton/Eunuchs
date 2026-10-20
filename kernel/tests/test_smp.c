@@ -314,7 +314,12 @@ KTEST(hung_thread_detector_reports_long_mutex_waits)
     KT_ASSERT(t != NULL);
     KT_EXPECT(wait_for(&hung_waiting, 1, 1000));
     sleep_ms(150);
-    hung_thread_check();
+    /* (the check skips a round when the scheduler lock is busy) */
+    for (int i = 0; i < 100 && !t->hung_reported; i++) {
+        hung_thread_check();
+        if (!t->hung_reported)
+            sleep_ms(2);
+    }
     KT_EXPECT(t->blocked_on == &hung_m);
     KT_EXPECT(t->hung_reported);
     mutex_unlock(&hung_m);

@@ -66,6 +66,7 @@ static void kinit(void *arg)
               "(make run attaches build/fs.img)");
     p9_init();                          /* host directories, mounted by vfs_init */
     vfs_init();
+    reclaim_init();                     /* swap (needs the volumes vfs_init found), kswapd */
     net_init();
 
     const char *tests = cmdline_get("ktest");
@@ -134,6 +135,7 @@ void kmain(unsigned long hartid, uintptr_t dtb)
 
     pmm_init();
     vm_init();
+    asid_init();
     slab_init();
     trace_init();
     sched_init();

@@ -53,7 +53,14 @@ enum page_flags {
     PG_LARGE    = 1 << 3,   /* head of a large (multi-page) kmalloc */
     PG_PGTABLE  = 1 << 4,   /* page-table page */
     PG_TAIL     = 1 << 5,   /* non-head page of an allocated block */
+    /* user memory (kernel/mm/pagecache.c, swap.c, reclaim.c) */
+    PG_CACHE    = 1 << 6,   /* in the page cache: a file's page (cache.sb/ino/index) */
+    PG_SWAPCACHE = 1 << 7,  /* in the swap cache: an anonymous page with a swap slot (cache.index) */
+    PG_DIRTY    = 1 << 8,   /* newer than its copy in the file or the swap slot */
+    PG_REFERENCED = 1 << 9, /* used since reclaim last looked (second chance) */
+    PG_USER     = 1 << 10,  /* user memory: anonymous or cache (statistics, `page`) */
 };
+
 
 struct kmem_cache;
 
@@ -73,8 +80,18 @@ struct page {
             u32 inuse;
         } slab;
         size_t large_size;      /* PG_LARGE: requested size */
+        struct {                /* PG_CACHE, PG_SWAPCACHE (list: the reclaim LRU) */
+            const void *owner;  /* the file's super_block, or &swap_owner */
+            u32 ino;            /* the file's inode number */
+            u32 wmap;           /* writable shared mappings of it (PTEs) */
+            u64 index;          /* page number in the file, or the swap slot */
+            struct page *hnext; /* hash chain */
+        } cache;
     };
 };
+/* Page flags change under several locks; these are atomic. */
+static inline void page_set_flag(struct page *pg, u32 f) { __atomic_or_fetch(&pg->flags, f, __ATOMIC_RELAXED); }
+static inline void page_clear_flag(struct page *pg, u32 f) { __atomic_and_fetch(&pg->flags, ~f, __ATOMIC_RELAXED); }
 
 /* ---- physical page allocator (pmm.c) ---- */
 
@@ -127,6 +144,88 @@ extern struct mem_region reserved_regions[MAX_RESERVED];
 const char *pmm_region_name(uintptr_t pa);  /* reserved region containing pa, or NULL */
 extern int nr_reserved_regions;
 
+/* ---- user memory: allocation with reclaim (reclaim.c) ---- */
+
+/*
+ * A page for user memory (anonymous, page cache, swap cache). When memory is
+ * short this reclaims first (it may sleep: no spinlocks held), keeping a
+ * reserve for the kernel's own allocations. NULL when nothing can be freed.
+ */
+struct page *user_page_alloc(bool zero);
+void reclaim_init(void);                /* starts kswapd */
+void kswapd_wake(void);                 /* the allocator: free memory is low */
+unsigned long reclaim(unsigned long want, bool direct);  /* pages freed */
+void vm_counters_print(int (*print)(const char *fmt, ...));     /* /proc/vmstat */
+void vm_memory_print(int (*print)(const char *fmt, ...));       /* meminfo's user-memory part */
+u64 pmm_free_pages(void);
+u64 pmm_total_pages(void);
+
+/* Counters (/proc/vmstat); updated without locks, so approximate under SMP. */
+struct vm_counters {
+    u64 faults, major_faults;           /* every user fault; those that read a disk */
+    u64 cache_hits, cache_misses;       /* page cache lookups (read, mmap faults) */
+    u64 swap_outs, swap_ins;            /* pages written to / read from swap */
+    u64 swap_out_skipped;               /* reclaimed swap-cache pages nobody needed */
+    u64 writebacks;                     /* dirty file pages written to their files */
+    u64 scanned, unmapped, freed;       /* reclaim: PTEs looked at, unmapped; pages freed */
+    u64 kswapd_runs, direct_reclaims, alloc_stalls, oom;
+};
+extern struct vm_counters vmc;
+
+/* ---- page cache (pagecache.c): file pages, and the swap cache ---- */
+
+struct inode;
+struct super_block;
+extern const char swap_owner;           /* the swap cache's owner key */
+
+/* The cached page of file ip at index, filled from the file on a miss (then
+   *major is set, if major isn't NULL). Caller holds ip's lock. Referenced:
+   page_put it. NULL: *err says why. */
+struct page *pc_get(struct inode *ip, u64 index, bool *major, int *err);
+/* The same with the page for a miss supplied: from *spare (taken), or
+   -EAGAIN if *spare is NULL (mm faults allocate with no locks held). */
+struct page *pc_get_spare(struct inode *ip, u64 index, bool *major, int *err, struct page **spare);
+/* Look up without filling (any locks); referenced, or NULL. */
+struct page *pc_find(const void *owner, u32 ino, u64 index);
+/* Add a page (the cache takes a reference); returns the page already there
+   instead (referenced) if another got in first, else NULL. */
+struct page *pc_insert(struct page *pg, const void *owner, u32 ino, u64 index);
+/* Take a page out of the cache (drops the cache's reference). */
+void pc_remove(struct page *pg);
+/* After write(): copy the new bytes into the cached pages they cover. */
+void pc_update(struct inode *ip, u64 off, const void *src, size_t n);
+/* The file shrank: forget pages past the end, zero the tail of the last. */
+void pc_truncate(struct inode *ip, u64 size);
+/* The file is gone: forget its pages (dirty ones too). */
+void pc_drop_inode(struct super_block *sb, u32 ino);
+/* Write dirty pages of one file (ino 0: every file on sb; sb NULL: all) to
+   their files. With lock_wait false, files whose lock is busy are skipped. */
+int pc_writeback(struct super_block *sb, u32 ino, u64 first, u64 last, bool lock_wait);
+/* Free unmapped clean pages from the cold end of the LRU (writing dirty and
+   swap-cache pages first when allowed). Returns pages freed. */
+unsigned long pc_shrink(unsigned long want, bool may_write);
+void pc_stats(u64 *file_pages, u64 *swap_pages, u64 *dirty, u64 *mapped);
+void pc_print(int (*print)(const char *fmt, ...));
+
+/* ---- swap space (swap.c) ---- */
+
+/* A swapped-out page's PTE: not valid, PTE_SWAP set, the slot above bit 10. */
+#define PTE_SWAP           (1UL << 9)
+#define PTE_IS_SWAP(pte)   (((pte) & (PTE_V | PTE_SWAP)) == PTE_SWAP)
+#define SWAP_PTE(slot)     (((u64)(slot) << 10) | PTE_SWAP)
+#define SWAP_SLOT(pte)     ((u32)((pte) >> 10))
+
+void swap_init(void);                   /* finds the swap partition */
+bool swap_enabled(void);
+u32 swap_alloc(void);                   /* a free slot, count 1; 0 if full */
+void swap_dup(u32 slot);                /* another reference (a PTE) */
+void swap_free(u32 slot);               /* drop one; the slot is free at 0 */
+u32 swap_count(u32 slot);
+int swap_write(u32 slot, struct page *pg);
+int swap_read(u32 slot, struct page *pg);
+void swap_stats(u64 *total, u64 *used);
+void swap_print(int (*print)(const char *fmt, ...));
+
 /* ---- page tables (vmm.c) ---- */
 
 typedef u64 pte_t;
@@ -166,12 +265,24 @@ int vm_translate(pagetable_t pt, uintptr_t va, uintptr_t *pa, pte_t *pte);
 /* Level-0 PTE for va (4 KiB pages only); creates tables if alloc. */
 pte_t *vm_walk(pagetable_t pt, uintptr_t va, bool alloc);
 void vm_sync_kernel(pagetable_t pt);    /* copy the kernel's upper-half root entries */
+/* Make pt the active page table (satp), for address space mm_id at TLB
+   generation gen (0, 0: the kernel's own table). */
+void vm_switch(pagetable_t pt, u64 mm_id, u64 gen);
 pagetable_t vm_current(void);           /* page table in satp */
 void vm_dump(pagetable_t pt, int (*print)(const char *fmt, ...));
 void vm_walk_print(pagetable_t pt, uintptr_t va, int (*print)(const char *fmt, ...));
 const char *vm_fault_hint(uintptr_t addr, u64 scause);
 void *ioremap(uintptr_t pa, size_t size);
 void pte_flags_str(pte_t pte, char *buf);   /* "rwx-gad" style, buf >= 9 */
+
+/*
+ * ASIDs (address-space IDs): each CPU keeps the TLB entries of the last few
+ * address spaces it ran, tagged, so switching between processes needs no
+ * flush. 0 bits: not supported (every switch flushes).
+ */
+extern unsigned asid_bits;
+void asid_init(void);
+void asid_print(int (*print)(const char *fmt, ...));
 
 static inline void sfence_vma_all(void) { asm volatile("sfence.vma zero, zero" ::: "memory"); }
 static inline void sfence_vma(uintptr_t va) { asm volatile("sfence.vma %0, zero" :: "r"(va) : "memory"); }

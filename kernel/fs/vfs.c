@@ -91,6 +91,16 @@ void ilock(struct inode *ip)
     }
 }
 
+/* ilock without waiting (writeback from reclaim); false if it is held. */
+bool ilock_try(struct inode *ip)
+{
+    if (!mutex_trylock(&ip->lock))
+        return false;
+    if (!ip->valid && ip->sb->ops->read_inode(ip) == 0)
+        ip->valid = true;
+    return true;
+}
+
 void iunlock(struct inode *ip)
 {
     mutex_unlock(&ip->lock);
@@ -111,6 +121,7 @@ void iput(struct inode *ip)
         spin_unlock_irqrestore(&icache_lock, flags);
         fs_begin_op(ip->sb);
         mutex_lock(&ip->lock);
+        pc_drop_inode(ip->sb, ip->ino);         /* its cached pages, dirty or not */
         ip->sb->ops->free_inode(ip);
         mutex_unlock(&ip->lock);
         fs_end_op(ip->sb);
@@ -234,10 +245,12 @@ void vfs_sync(struct super_block *sb)
         sb->ops->sync(sb);
 }
 
-/* Every mounted filesystem (mounts are only ever added, at boot). */
+/* Every mounted filesystem (mounts are only ever added, at boot), with the
+   file pages written through shared mappings first. */
 void vfs_sync_all(void)
 {
     struct super_block *sb;
+    pc_writeback(NULL, 0, 0, ~0ULL, true);
     list_for_each_entry(sb, &mounts, node)
         vfs_sync(sb);
 }
@@ -574,8 +587,10 @@ struct file *vfs_open(const char *path, int flags, int mode, int *err)
         iunlock(ip);
         fs_begin_op(ip->sb);
         ilock(ip);
-        if (ip->size)
+        if (ip->size) {
             ip->sb->ops->truncate(ip, 0);
+            pc_truncate(ip, 0);
+        }
         iunlock(ip);
         fs_end_op(ip->sb);
         ilock(ip);

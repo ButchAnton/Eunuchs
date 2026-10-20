@@ -25,6 +25,27 @@ static spinlock_t file_lock = SPINLOCK_INIT("file");
 
 /* ---- files ---- */
 
+/*
+ * Regular files: efs files are read through the page cache (pagecache.c);
+ * writes go to the filesystem and then into any cached pages (pc_update),
+ * so read, write and mmap agree. User memory is only touched with no
+ * filesystem lock held (through the cache page, or a bounce buffer): the
+ * user's buffer may itself be a mapping of a file, or swapped out, and
+ * bringing it in may need those locks.
+ */
+static bool uses_page_cache(struct inode *ip)
+{
+    return ip->sb->type == &efs_type;
+}
+
+static long put_out(void *buf, size_t done, const void *src, size_t n, bool user)
+{
+    if (user)
+        return copy_to_user((uintptr_t)buf + done, src, n);
+    memcpy((u8 *)buf + done, src, n);
+    return 0;
+}
+
 long file_read(struct file *f, void *buf, size_t n, bool user)
 {
     if (!f->readable)
@@ -34,12 +55,66 @@ long file_read(struct file *f, void *buf, size_t n, bool user)
     struct inode *ip = f->ip;
     if (ip->type == I_DIR)
         return -EISDIR;
-    ilock(ip);
-    long r = ip->sb->ops->read(ip, buf, f->off, n, user);
-    if (r > 0)
-        f->off += r;
-    iunlock(ip);
-    return r;
+    size_t done = 0;
+    long err = 0;
+    u8 *bounce = NULL;
+    while (done < n) {
+        ilock(ip);
+        u64 off = f->off;
+        size_t chunk;
+        struct page *pg = NULL;
+        if (uses_page_cache(ip)) {
+            if (off >= ip->size) {
+                iunlock(ip);
+                break;
+            }
+            chunk = MIN(MIN(n - done, (size_t)(PAGE_SIZE - off % PAGE_SIZE)), (size_t)(ip->size - off));
+            int e = 0;
+            pg = pc_get(ip, off / PAGE_SIZE, NULL, &e);
+            if (!pg) {
+                iunlock(ip);
+                err = e;
+                break;
+            }
+            f->off += chunk;
+            iunlock(ip);
+            /* (the offset moved under the lock; a fault copying out leaves it
+               moved: rolling it back unlocked could undo another reader's) */
+            long r = put_out(buf, done, (u8 *)page_to_va(pg) + off % PAGE_SIZE, chunk, user);
+            page_put(pg);
+            if (r) {
+                err = -EFAULT;
+                break;
+            }
+            done += chunk;
+            continue;
+        }
+        /* other filesystems (9p): straight from the filesystem */
+        chunk = MIN(n - done, (size_t)PAGE_SIZE);
+        if (user && !bounce && !(bounce = page_alloc())) {
+            iunlock(ip);
+            err = -ENOMEM;
+            break;
+        }
+        long r = ip->sb->ops->read(ip, user ? bounce : (u8 *)buf + done, off, chunk, false);
+        if (r > 0)
+            f->off += r;
+        iunlock(ip);
+        if (r <= 0) {
+            err = r;
+            break;
+        }
+        if (user && put_out(buf, done, bounce, r, true)) {
+            err = -EFAULT;
+            break;
+        }
+        done += r;
+        if ((size_t)r < chunk)
+            break;
+    }
+    if (bounce)
+        page_free(bounce);
+    return done ? (long)done : err;
 }
 
 long file_write(struct file *f, const void *buf, size_t n, bool user)
@@ -51,25 +126,42 @@ long file_write(struct file *f, const void *buf, size_t n, bool user)
     struct inode *ip = f->ip;
     if (!ip->sb->ops->write)
         return -EPERM;
+    u8 *bounce = user ? kmalloc(WRITE_CHUNK) : NULL;
+    if (user && !bounce)
+        return -ENOMEM;
     size_t done = 0;
+    long err = 0;
     while (done < n) {
         size_t chunk = MIN(n - done, (size_t)WRITE_CHUNK);
+        const u8 *src = (const u8 *)buf + done;
+        if (user) {
+            if (copy_from_user(bounce, (uintptr_t)src, chunk)) {
+                err = -EFAULT;
+                break;
+            }
+            src = bounce;
+        }
         fs_begin_op(ip->sb);
         ilock(ip);
         if (f->flags & O_APPEND)
             f->off = ip->size;
-        long r = ip->sb->ops->write(ip, (const u8 *)buf + done, f->off, chunk, user);
-        if (r > 0)
+        long r = ip->sb->ops->write(ip, src, f->off, chunk, false);
+        if (r > 0) {
+            pc_update(ip, f->off, src, r);
             f->off += r;
+        }
         iunlock(ip);
         fs_end_op(ip->sb);
-        if (r < 0)
-            return done ? (long)done : r;
+        if (r < 0) {
+            err = r;
+            break;
+        }
         done += r;
         if ((size_t)r < chunk)
             break;
     }
-    return done;
+    kfree(bounce);
+    return done ? (long)done : err;
 }
 
 struct file *file_dup(struct file *f)
@@ -512,7 +604,10 @@ long do_fsync(const u64 *a)
     struct file *f = fd_get((long)a[0]);
     if (!f)
         return -EBADF;
+    int r = 0;
+    if (f->ip && f->ip->type == I_FILE && !f->cops)
+        r = pc_writeback(f->ip->sb, f->ip->ino, 0, ~0ULL, true);   /* its pages written through mmap */
     if (f->ip)
         vfs_sync(f->ip->sb);
-    return 0;
+    return r;
 }

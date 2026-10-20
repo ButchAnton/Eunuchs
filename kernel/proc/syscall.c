@@ -55,58 +55,117 @@ long do_getppid(const u64 *a)
     return ppid;
 }
 
+static bool range_free(struct mm *mm, uintptr_t start, uintptr_t end)
+{
+    struct vma *v;
+    list_for_each_entry(v, &mm->vmas, node)
+        if (start < v->end && v->start < end)
+            return false;
+    return true;
+}
+
 long do_brk(const u64 *a)
 {
     struct mm *mm = current_proc()->mm;
-    uintptr_t want = a[0], old = mm->brk;
-
+    uintptr_t want = a[0];
+    mutex_lock(&mm->lock);
+    uintptr_t old = mm->brk;
     if (!want || want < mm->brk_start || want >= USER_MMAP_BASE)
-        return old;
+        goto out;
     uintptr_t old_top = PAGE_ALIGN(old), new_top = PAGE_ALIGN(want);
     if (new_top > old_top) {
         struct vma *heap = old_top > mm->brk_start ? vma_find(mm, old_top - 1) : NULL;
-        struct vma *next = vma_find(mm, new_top - 1);
-        if (next && next != heap)
-            return old;                     /* would run into another mapping */
-        if (heap && heap->prot != (VM_READ | VM_WRITE))
+        if (!range_free(mm, old_top, new_top))
+            goto out;                       /* would run into another mapping */
+        if (heap && (heap->prot != (VM_READ | VM_WRITE) || heap->kind != VMA_HEAP))
             heap = NULL;                    /* mprotect changed the top page: start a new VMA */
         if (heap) {
             unsigned long flags = spin_lock_irqsave(&mm->vma_lock);
             heap->end = new_top;
             spin_unlock_irqrestore(&mm->vma_lock, flags);
-        } else if (vma_add(mm, MAX(old_top, mm->brk_start), new_top, VM_READ | VM_WRITE, VMA_HEAP, "heap"))
-            return old;
+        } else if (vma_add(mm, MAX(old_top, mm->brk_start), new_top, VM_READ | VM_WRITE, VMA_HEAP, "heap")) {
+            goto out;
+        }
     } else if (new_top < old_top) {
-        vma_unmap(mm, new_top, old_top);
+        vma_unmap_locked(mm, new_top, old_top);
     }
     mm->brk = want;
+out:
+    want = mm->brk;
+    mutex_unlock(&mm->lock);
     return want;
 }
 
+static u32 vm_prot(u64 prot)
+{
+    return (prot & PROT_READ ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) |
+           (prot & PROT_EXEC ? VM_EXEC : 0);
+}
+
+/*
+ * mmap(addr, len, prot, flags, fd, off): anonymous memory (MAP_ANONYMOUS |
+ * MAP_PRIVATE), or a file (MAP_SHARED or MAP_PRIVATE). The address is addr
+ * if that range is free (or with MAP_FIXED, after unmapping what is there),
+ * else the lowest free range of the mmap area: unmapped ranges are reused.
+ */
 long do_mmap(const u64 *a)
 {
     struct mm *mm = current_proc()->mm;
+    uintptr_t addr = a[0];
     size_t len = PAGE_ALIGN(a[1]);
-    u64 prot = a[2], flags = a[3];
-    if (!len || !(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE))
-        return -EINVAL;
+    u64 prot = a[2], flags = a[3], off = a[5];
+    int fd = (int)a[4];
+    bool shared = flags & MAP_SHARED;
+    if (!a[1] || a[1] > USER_TOP || (prot & ~7UL) ||
+        (flags & ~(u64)(MAP_SHARED | MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS)) ||
+        shared == !!(flags & MAP_PRIVATE))
+        return -EINVAL;                     /* exactly one of SHARED, PRIVATE */
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
         return -EACCES;                     /* W^X for user memory too */
-    uintptr_t start = mm->mmap_next;
-    if (start + len > USER_STACK_TOP - USER_STACK_SIZE - PAGE_SIZE)
-        return -ENOMEM;
-    u32 vprot = (prot & PROT_READ ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) |
-                (prot & PROT_EXEC ? VM_EXEC : 0);
-    long r = vma_add(mm, start, start + len, vprot, VMA_ANON, "anon");
-    if (r)
-        return r;
-    mm->mmap_next = start + len + PAGE_SIZE;   /* leave a guard gap between mappings */
-    return start;
+    struct file *f = NULL;
+    if (!(flags & MAP_ANONYMOUS)) {
+        f = fd_get(fd);
+        if (!f)
+            return -EBADF;
+        if (f->cops || !f->ip || f->ip->type != I_FILE)
+            return -ENODEV;                 /* only regular files */
+        if (!f->readable || (shared && (prot & PROT_WRITE) && !f->writable))
+            return -EACCES;
+        if (off & (PAGE_SIZE - 1))
+            return -EINVAL;
+    } else if (shared) {
+        return -EINVAL;                     /* shared anonymous memory: not yet */
+    }
+    mutex_lock(&mm->lock);
+    uintptr_t start = 0;
+    long r = 0;
+    if (flags & MAP_FIXED) {
+        if ((addr & (PAGE_SIZE - 1)) || addr < USER_MIN_ADDR || !user_range_ok(addr, len)) {
+            r = -EINVAL;
+            goto out;
+        }
+        if ((r = vma_unmap_locked(mm, addr, addr + len)))
+            goto out;
+        start = addr;
+    } else if (addr && !(addr & (PAGE_SIZE - 1)) && addr >= USER_MIN_ADDR && user_range_ok(addr, len) &&
+               range_free(mm, addr, addr + len)) {
+        start = addr;                       /* the hint */
+    } else if (!(start = uvm_find_gap(mm, len))) {
+        r = -ENOMEM;
+        goto out;
+    }
+    r = f ? vma_add_file(mm, start, start + len, vm_prot(prot), f, off / PAGE_SIZE, shared)
+          : vma_add(mm, start, start + len, vm_prot(prot), VMA_ANON, "anon");
+out:
+    mutex_unlock(&mm->lock);
+    return r ? r : (long)start;
 }
 
 long do_munmap(const u64 *a)
 {
-    if (!user_range_ok(a[0], a[1]))
+    if ((a[0] & (PAGE_SIZE - 1)) || !user_range_ok(a[0], a[1]))
+        return -EINVAL;
+    if (!a[1])
         return -EINVAL;
     return vma_unmap(current_proc()->mm, a[0], a[0] + PAGE_ALIGN(a[1]));
 }
@@ -120,9 +179,19 @@ long do_mprotect(const u64 *a)
         return 0;                           /* as in Linux */
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
         return -EACCES;                     /* W^X */
-    u32 vprot = (prot & PROT_READ ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) |
-                (prot & PROT_EXEC ? VM_EXEC : 0);
-    return vma_protect(current_proc()->mm, a[0], a[0] + PAGE_ALIGN(a[1]), vprot);
+    return vma_protect(current_proc()->mm, a[0], a[0] + PAGE_ALIGN(a[1]), vm_prot(prot));
+}
+
+/* msync(addr, len, flags): write a shared mapping's changed pages to its file
+   (MS_ASYNC too: there is no queue to leave them in). */
+long do_msync(const u64 *a)
+{
+    if ((a[0] & (PAGE_SIZE - 1)) || !user_range_ok(a[0], a[1]) ||
+        (a[2] & ~(u64)(MS_ASYNC | MS_SYNC | MS_INVALIDATE)) || ((a[2] & MS_ASYNC) && (a[2] & MS_SYNC)))
+        return -EINVAL;
+    if (!a[1])
+        return 0;
+    return uvm_msync(current_proc()->mm, a[0], a[0] + PAGE_ALIGN(a[1]));
 }
 
 long do_sleep_ms(const u64 *a)

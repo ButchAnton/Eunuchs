@@ -2,11 +2,14 @@
  * eudisk: examine and manage Eunuchs disk images from the Mac.
  *
  * An image is a GPT disk with an efs filesystem in each partition (boot,
- * boot.old, root, home; `make` creates disk.img), or a bare efs filesystem.
+ * boot.old, root, home) and swap space (swap; `make` creates disk.img), or a
+ * bare efs filesystem.
  * Places in an image are written IMAGE:PATH (the root partition) or
  * IMAGE:PART:PATH, e.g. disk.img:/etc/passwd, disk.img:home:/guest.
  *
  *   eudisk create IMAGE NAME:MB...            a new image, empty filesystems
+ *                                             (a partition named swap: swap space)
+ *   eudisk add IMAGE NAME:MB                  a new partition at the end
  *   eudisk info [--json] IMAGE                partitions, use, kernels
  *   eudisk ls [-lR] [--json] IMAGE[:PART]:PATH
  *   eudisk cat IMAGE[:PART]:PATH
@@ -59,6 +62,7 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage: eudisk create IMAGE NAME:MB...\n"
+            "       eudisk add IMAGE NAME:MB\n"
             "       eudisk info [--json] IMAGE\n"
             "       eudisk ls [-lR] [--json] IMAGE[:PART]:PATH\n"
             "       eudisk cat IMAGE[:PART]:PATH\n"
@@ -177,7 +181,8 @@ static struct part *find_part(struct image *im, const char *name)
     if (!p)
         fail("%s: no partition %s", im->path, name[0] ? name : "(efs)");
     else if (!p->is_efs) {
-        fail("%s: partition %s holds no efs filesystem", im->path, p->name);
+        fail("%s: partition %s %s", im->path, p->name, p->is_swap ? "is swap space, not a filesystem"
+                                                                     : "holds no efs filesystem");
         p = NULL;
     }
     return p;
@@ -214,6 +219,25 @@ static int cmd_create(int argc, char **argv)
     for (int i = 0; i < n; i++)
         printf(" %s (%u MiB)", parts[i].name, parts[i].mb);
     printf("\n");
+    return 0;
+}
+
+static int cmd_add(int argc, char **argv)
+{
+    char *c = argc == 2 ? strchr(argv[1], ':') : NULL;
+    if (!c)
+        usage();
+    *c = 0;
+    uint32_t mb = (uint32_t)atoi(c + 1);
+    if (!mb)
+        return fail("%s: a size in MiB", argv[1]);
+    struct image im;
+    if (load(&im, argv[0], true))
+        return 1;
+    if (image_add(&im, argv[1], mb) || image_save(&im))
+        return 1;
+    printf("%s: added %s (%u MiB%s); now %llu MiB\n", argv[0], argv[1], mb,
+           strcmp(argv[1], SWAP_NAME) ? "" : ", swap space", (unsigned long long)(im.size >> 20));
     return 0;
 }
 
@@ -463,8 +487,11 @@ static int cmd_info(int argc, char **argv)
         if (json) {
             printf("%s{\"name\":", i ? "," : "");
             json_str(p->name);
-            printf(",\"start\":%llu,\"sectors\":%llu,\"efs\":%s", (unsigned long long)p->first,
-                   (unsigned long long)(p->last - p->first + 1), p->is_efs ? "true" : "false");
+            printf(",\"start\":%llu,\"sectors\":%llu,\"efs\":%s,\"swap\":%s", (unsigned long long)p->first,
+                   (unsigned long long)(p->last - p->first + 1), p->is_efs ? "true" : "false",
+                   p->is_swap ? "true" : "false");
+            if (p->is_swap)
+                printf(",\"swap_pages\":%u", p->swap_pages);
             if (p->is_efs) {
                 printf(",\"label\":");
                 char lab[17];
@@ -475,6 +502,10 @@ static int cmd_info(int argc, char **argv)
                        p->fs.replayed);
             }
             printf("}");
+            continue;
+        }
+        if (p->is_swap) {
+            printf("  %-9s %5llu MiB  swap space, %u pages\n", p->name, (unsigned long long)mb, p->swap_pages - 1);
             continue;
         }
         if (!p->is_efs) {
@@ -1021,7 +1052,7 @@ static int cmd_fsck(int argc, char **argv)
         if (pl.part[0] && strcmp(p->name, pl.part))
             continue;
         if (!p->is_efs) {
-            printf("%s %s: not efs\n", pl.image, p->name);
+            printf("%s %s: %s\n", pl.image, p->name, p->is_swap ? "swap space (nothing to check)" : "not efs");
             continue;
         }
         printf("%s %s:\n", pl.image, p->name);
@@ -1386,6 +1417,8 @@ int main(int argc, char **argv)
     }
     if (!strcmp(cmd, "create"))
         return cmd_create(argc, argv);
+    if (!strcmp(cmd, "add"))
+        return cmd_add(argc, argv);
     if (!strcmp(cmd, "info"))
         return cmd_info(argc, argv);
     if (!strcmp(cmd, "ls"))

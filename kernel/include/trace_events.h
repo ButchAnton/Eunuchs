@@ -44,4 +44,9 @@
     X(net_tx,          NET,   "proto", "len", "dst_ip")                    \
     X(net_drop,        NET,   "str", "len", "")                            \
     X(tcp_state,       NET,   "conn", "tcp_from", "tcp_to")                \
-    X(tcp_rexmit,      NET,   "conn", "seq", "len")
+    X(tcp_rexmit,      NET,   "conn", "seq", "len")                        \
+    X(pagecache_fill,  MM,    "ino", "index", "bytes")                     \
+    X(writeback,       MM,    "ino", "index", "bytes")                     \
+    X(swap_out,        MM,    "slot", "pa", "err")                         \
+    X(swap_in,         MM,    "slot", "pa", "err")                         \
+    X(reclaim,         MM,    "want", "freed", "unmapped")

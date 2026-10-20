@@ -175,6 +175,7 @@ int efs_label(int disk, char out[17]);         /* -1 if the disk holds no efs */
 struct inode *iget(struct super_block *sb, u32 ino);
 struct inode *idup(struct inode *ip);
 void ilock(struct inode *ip);
+bool ilock_try(struct inode *ip);        /* without waiting (reclaim's writeback) */
 void iunlock(struct inode *ip);
 void iput(struct inode *ip);
 void iunlockput(struct inode *ip);

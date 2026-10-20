@@ -33,7 +33,7 @@ static int do_check(const char *path)
         struct part *p = &im.parts[i];
         if (!p->is_efs) {
             if (im.gpt)
-                printf("fsck %s partition %s: not efs, skipped\n", path, p->name);
+                printf("fsck %s partition %s: %s, skipped\n", path, p->name, p->is_swap ? "swap space" : "not efs");
             continue;
         }
         if (im.gpt)

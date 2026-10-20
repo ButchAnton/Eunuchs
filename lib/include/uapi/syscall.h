@@ -81,6 +81,7 @@
     X(221, execve,      3, "sap")            \
     X(222, mmap,        6, "puxxdx")         \
     X(226, mprotect,    3, "pux")            \
+    X(227, msync,       3, "pux")            \
     X(242, accept4,     4, "dppx")           \
     X(260, wait4,       4, "dpxp")           \
     X(142, reboot,      1, "x")              \
@@ -115,9 +116,14 @@ enum {
 #define PROT_READ   1
 #define PROT_WRITE  2
 #define PROT_EXEC   4
-#define MAP_PRIVATE   0x02
-#define MAP_ANONYMOUS 0x20
+#define MAP_SHARED    0x01      /* writes go to the file, and other mappings see them */
+#define MAP_PRIVATE   0x02      /* writes make private copies */
+#define MAP_FIXED     0x10      /* exactly at addr (replacing what is there) */
+#define MAP_ANONYMOUS 0x20      /* zero-filled memory, no file */
 #define MAP_FAILED  ((void *)-1)
+#define MS_ASYNC      1         /* msync: (written at once anyway) */
+#define MS_INVALIDATE 2
+#define MS_SYNC       4
 
 /* wait4 */
 #define WNOHANG 1

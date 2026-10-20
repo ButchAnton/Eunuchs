@@ -198,8 +198,9 @@ static void user_exception(struct trap_frame *tf, u64 code)
         trace(user_fault, tf->stval, access, r);
         if (r)
             user_fault(tf, r == -ENOMEM ? "out of memory" : r == -EACCES ? "permission denied"
-                                                                       : "no mapping",
-                       r == -ENOMEM ? SIGBUS : SIGSEGV);
+                         : r == -ENXIO ? "past the end of the mapped file"
+                         : r == -EIO ? "I/O error reading the page (swap or file)" : "no mapping",
+                       r == -ENOMEM || r == -ENXIO || r == -EIO ? SIGBUS : SIGSEGV);
         break;
     }
     case EXC_BREAKPOINT:
@@ -291,10 +292,16 @@ void trap_handler(struct trap_frame *tf)
          */
         struct proc *p = current_proc();
         if (p && p->mm && tf->stval < USER_TOP && extable_lookup(tf->sepc) &&
-            (code == EXC_LOAD_PAGE_FAULT || code == EXC_STORE_PAGE_FAULT) &&
-            uvm_fault(p->mm, tf->stval,
-                      code == EXC_LOAD_PAGE_FAULT ? FAULT_READ : FAULT_WRITE) == 0)
-            return;
+            (code == EXC_LOAD_PAGE_FAULT || code == EXC_STORE_PAGE_FAULT)) {
+            /* resolving it may sleep (the mm lock, reclaim, reading swap or
+               a file): with interrupts on, if the faulting code had them */
+            if (tf->sstatus & SSTATUS_SPIE)
+                intr_on();
+            int r = uvm_fault(p->mm, tf->stval, code == EXC_LOAD_PAGE_FAULT ? FAULT_READ : FAULT_WRITE);
+            intr_off();
+            if (r == 0)
+                return;
+        }
         uintptr_t fixup = extable_lookup(tf->sepc);
         if (fixup) {
             pr_trace("fault at %#lx (addr %#lx) fixed up -> %#lx\n",

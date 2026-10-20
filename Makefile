@@ -73,7 +73,8 @@ UPROGS  += $(addprefix $(BUILD)/user/bin/,$(UMULTI))
 UMULTI_OBJS := $(patsubst user/bin/%.c,$(BUILD)/user/multi/%.o,$(wildcard user/bin/*/*.c))
 # --- Disk image: a GPT disk with an efs filesystem in each partition, made by
 # eudisk (tools/eudisk): boot and boot.old (a kernel each, mounted on /boot
-# and /boot.old), root (user programs, sources, a few directories) and home.
+# and /boot.old), root (user programs, sources, a few directories), home, and
+# swap space, where the kernel puts user pages when memory runs short.
 # build/fs.img is made afresh for the tests; disk.img, which make run uses, is
 # made once and then updated in place (your files stay: see eudisk install).
 MKFS    := $(BUILD)/tools/mkfs
@@ -87,7 +88,8 @@ DISK_IMG ?= disk.img
 BOOT_MB ?= 16
 FS_MB   ?= 64
 HOME_MB ?= 64
-DISK_LAYOUT = boot:$(BOOT_MB) boot.old:$(BOOT_MB) root:$(FS_MB) home:$(HOME_MB)
+SWAP_MB ?= 128
+DISK_LAYOUT = boot:$(BOOT_MB) boot.old:$(BOOT_MB) root:$(FS_MB) home:$(HOME_MB) swap:$(SWAP_MB)
 HOME_FILES  = /guest/:0755:1000:1000
 EUTILS_LINKS = echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile \
                true false yes kill date dmesg free sleep strace su dbg uname clear \
@@ -367,6 +369,7 @@ $(DISK_IMG): $(DISK_DEPS)
 		fi; \
 	else \
 		echo "  DISK    $@ (update)"; \
+		$(EUDISK) info --json $@ | grep -q '"swap":true' || $(EUDISK) add $@ swap:$(SWAP_MB) || exit 1; \
 		$(EUDISK) install $@ root $(FS_FILES) && \
 		$(EUDISK) install $@ home $(HOME_FILES) > /dev/null && \
 		$(EUDISK) kernel install $@ $(BUILD)/kernel.boot || exit 1; \

@@ -241,7 +241,7 @@ The order matters; each step relies on the ones before it.
 | 12 | `cmdline_check()` | Warns about unknown options and bad values; prints the table for `help`. |
 | 13 | `lockdep_init()` | |
 | 14 | `break` → `monitor_enter("boot option 'break' (before memory management init)", NULL, true)` | |
-| 15 | `pmm_init`, `vm_init`, `slab_init`, `trace_init`, `sched_init`, `proc_init`, `plic_init`, `tty_init` | Other subsystems. `vm_init` switches to the real page table; `sched_init` turns the boot context into thread `idle/0` on `boot_stack`. |
+| 15 | `pmm_init`, `vm_init`, `asid_init`, `slab_init`, `trace_init`, `sched_init`, `proc_init`, `plic_init`, `tty_init` | Other subsystems. `vm_init` switches to the real page table; `asid_init` probes the ASID bits of `satp` ([02](02-memory.md#asids-vmmc-asid_init-vm_switch)); `sched_init` turns the boot context into thread `idle/0` on `boot_stack`. |
 | 16 | `console_enable_irq()` | Needs `plic_init` (to register the IRQ) and `tty_init` (to receive input). |
 | 17 | `timer_init()`, `smp_init()`, `profile_boot_option()` | |
 | 18 | `kthread_create("kinit", kinit, NULL)`, `kthread_detach` | Panics if creation fails. |
@@ -256,7 +256,7 @@ The order matters; each step relies on the ones before it.
 ### 3. `kinit` (first kernel thread)
 
 1. `blk_init()`; if it fails: `panic("no disk: the root filesystem lives on a virtio block device (make run attaches build/fs.img)")`.
-2. `vfs_init()`, `net_init()`.
+2. `p9_init()`, `vfs_init()`, then `reclaim_init()` (swap on the volume named `swap`, which `vfs_init`'s partition scan found, the free-memory marks, and the kswapd thread), then `net_init()`.
 3. If `ktest[=prefix]`: `ktest_run(prefix)`. If `utest[=arg]`: spawn `/bin/init -1 /bin/utests [arg]` and wait for it with `proc_wait_kernel`.
 4. If either ran: optionally `trace_dump_file(tracedump)` through semihosting, then `platform_exit(failed ? 1 : 0)`.
 5. Otherwise spawn `init=` (default `/bin/init`) after logging `boot complete; starting ... (Ctrl-] enters the debug monitor)`, or panic `cannot start %s`.

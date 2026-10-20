@@ -134,6 +134,31 @@ static void resume(struct proc *c, int sig)
     wake_up(&c->stop_wq);
 }
 
+/*
+ * The stopped tracee's address space, locked (its lock keeps it alive: exit
+ * takes it before freeing). The lock is a mutex and proc_lock a spinlock, so
+ * it is only tried under proc_lock, and we come back if it is busy.
+ */
+static struct mm *lock_tracee_mm(int pid, long *r)
+{
+    for (;;) {
+        unsigned long flags = spin_lock_irqsave(&proc_lock);
+        struct proc *c = stopped_tracee(pid, r);
+        if (!c || !c->mm) {
+            spin_unlock_irqrestore(&proc_lock, flags);
+            if (c)
+                *r = -ESRCH;
+            return NULL;
+        }
+        struct mm *mm = c->mm;
+        bool got = mutex_trylock(&mm->lock);
+        spin_unlock_irqrestore(&proc_lock, flags);
+        if (got)
+            return mm;
+        sleep_ms(1);                    /* reclaim is looking at it */
+    }
+}
+
 /* PTRACE_READ / PTRACE_WRITE: copy through a kernel page, a page at a time. */
 static long ptrace_io(int pid, uintptr_t udesc, bool write)
 {
@@ -152,12 +177,12 @@ static long ptrace_io(int pid, uintptr_t udesc, bool write)
             r = -EFAULT;
             break;
         }
-        unsigned long flags = spin_lock_irqsave(&proc_lock);
-        struct proc *c = stopped_tracee(pid, &r);
-        if (c)
-            r = write ? uvm_poke(c->mm, io.addr + done, bounce, chunk)
-                      : uvm_peek(c->mm, io.addr + done, bounce, chunk);
-        spin_unlock_irqrestore(&proc_lock, flags);
+        struct mm *mm = lock_tracee_mm(pid, &r);
+        if (mm) {
+            r = write ? uvm_poke_locked(mm, io.addr + done, bounce, chunk)
+                      : uvm_peek_locked(mm, io.addr + done, bounce, chunk);
+            mutex_unlock(&mm->lock);
+        }
         if (r)
             break;
         if (!write && copy_to_user(io.buf + done, bounce, chunk)) {
@@ -235,8 +260,22 @@ long do_ptrace(const u64 *a)
     if ((req == PTRACE_CONT || req == PTRACE_DETACH) && data >= NSIG)
         return -EIO;
 
-    u64 word = 0;
     struct ptrace_siginfo si;
+    if (req == PTRACE_PEEKTEXT || req == PTRACE_PEEKDATA || req == PTRACE_POKETEXT ||
+        req == PTRACE_POKEDATA) {
+        u64 word = 0;
+        struct mm *mm = lock_tracee_mm(pid, &r);
+        if (!mm)
+            return r;
+        if (req == PTRACE_PEEKTEXT || req == PTRACE_PEEKDATA)
+            r = uvm_peek_locked(mm, addr, &word, sizeof(word)) ? -EIO : 0;
+        else
+            r = uvm_poke_locked(mm, addr, &data, sizeof(data)) ? -EIO : 0;
+        mutex_unlock(&mm->lock);
+        if (r || req == PTRACE_POKETEXT || req == PTRACE_POKEDATA)
+            return r;
+        return copy_to_user(data, &word, sizeof(word)) ? -EFAULT : 0;
+    }
     flags = spin_lock_irqsave(&proc_lock);
     struct proc *c = stopped_tracee(pid, &r);
     if (!c) {
@@ -246,14 +285,6 @@ long do_ptrace(const u64 *a)
     struct thread *t = c->thread;
     struct trap_frame *tf = thread_user_tf(t);
     switch (req) {
-    case PTRACE_PEEKTEXT:
-    case PTRACE_PEEKDATA:
-        r = uvm_peek(c->mm, addr, &word, sizeof(word)) ? -EIO : 0;
-        break;
-    case PTRACE_POKETEXT:
-    case PTRACE_POKEDATA:
-        r = uvm_poke(c->mm, addr, &data, sizeof(data)) ? -EIO : 0;
-        break;
     case PTRACE_GETREGS:
         regs.r[0] = tf->sepc;
         for (int i = 1; i < 32; i++)
@@ -298,8 +329,6 @@ long do_ptrace(const u64 *a)
     spin_unlock_irqrestore(&proc_lock, flags);
     if (r)
         return r;
-    if ((req == PTRACE_PEEKTEXT || req == PTRACE_PEEKDATA) && copy_to_user(data, &word, sizeof(word)))
-        return -EFAULT;
     if (req == PTRACE_GETREGS && copy_to_user(data, &regs, sizeof(regs)))
         return -EFAULT;
     if (req == PTRACE_GETFPREGS && copy_to_user(data, &fpregs, sizeof(fpregs)))

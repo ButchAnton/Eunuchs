@@ -3,8 +3,8 @@
  * opened (reads see one consistent snapshot). Uses the same print functions
  * as the debug monitor.
  *
- *   /proc/{meminfo,slabinfo,interrupts,threads,sched,procs,mounts,bcache,
- *          blk,icache,trace,virtio,uptime,pipes,tty,cpus,lockdep}
+ *   /proc/{meminfo,vmstat,swaps,pagecache,asids,slabinfo,interrupts,threads,sched,
+ *          procs,mounts,bcache,blk,icache,trace,virtio,uptime,pipes,tty,cpus,lockdep}
  *   /proc/<pid>/{status,maps,fds,stack,ustack}      /proc/self -> current
  *   /proc/net/{dev,arp,tcp,udp,stats}
  *
@@ -88,6 +88,10 @@ static const struct {
     { "cpus", cpus_print },
     { "lockdep", lockdep_print },
     { "profile", profile_report },
+    { "vmstat", vm_counters_print },
+    { "swaps", swap_print },
+    { "pagecache", pc_print },
+    { "asids", asid_print },
 };
 #define NROOT ARRAY_SIZE(root_files)
 

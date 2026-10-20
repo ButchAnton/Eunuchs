@@ -120,12 +120,12 @@ Where the stops come from:
 
 The tracee sits in `ptrace_stop` with its user registers in its trap frame (`thread_user_tf`) and its FP registers in `thread->fp`: `ptrace_stop` saves them there before it announces the stop and loads them back as it returns, so the tracer never sees stale values and `SETFPREGS` takes effect even if the tracee never sleeps. `GETREGS`/`SETREGS` copy the trap frame (`r[0]` ↔ `sepc`); `GETFPREGS`/`SETFPREGS` copy `thread->fp`. They happen under `proc_lock`, which keeps the tracee and its `mm` alive; the copies to and from the tracer's memory happen with the lock dropped, since they can fault.
 
-Memory goes through `uvm_peek` and `uvm_poke` ([02](02-memory.md#user-address-spaces-uvmc)):
+Memory goes through `uvm_peek_locked` and `uvm_poke_locked` ([02](02-memory.md#user-address-spaces-uvmc)) with the tracee's `mm->lock` held. `lock_tracee_mm` finds the stopped tracee under `proc_lock` and takes its `mm->lock` with `mutex_trylock` (a mutex cannot be waited for under a spinlock); if reclaim has it, it drops `proc_lock`, sleeps 1 ms and tries again. The lock also keeps the mm alive, since `exit` takes it before freeing.
 
-- The page is faulted in if a VMA covers it, so untouched pages can be read.
+- The page is faulted in if a VMA covers it (a swapped-out page is read back), so untouched pages can be read.
 - `uvm_poke` ignores the VMA's protection (breakpoints go into r-x text), but first breaks sharing: a page whose frame has other users (text after `fork` is shared without COW marks) is copied, so a breakpoint never appears in another process.
 - Writing an executable page runs `fence.i` on this hart and on every hart through SBI, so the instruction fetch sees the new code wherever the tracee runs next.
-- `PTRACE_READ`/`WRITE` work a page at a time through a kernel bounce page, taking `proc_lock` for each page. A read error is reported as `EIO`.
+- `PTRACE_READ`/`WRITE` work a page at a time through a kernel bounce page, locking the tracee's mm for each page. A read error is reported as `EIO`.
 
 ### Attaching, detaching, exits
 
@@ -138,7 +138,7 @@ Memory goes through `uvm_peek` and `uvm_poke` ([02](02-memory.md#user-address-sp
 
 - **No single-step** (`PTRACE_SINGLESTEP` is `EIO`), no hardware breakpoints or watchpoints, no `PTRACE_O_*` options: no fork, vfork, clone or exec events, and a traced process's children are not traced.
 - **No `PTRACE_SYSCALL`** (stops at system call entry and exit) and no `PTRACE_PEEKUSER`/`POKEUSER`, `GETEVENTMSG`, `SEIZE`, `INTERRUPT` or `LISTEN`.
-- **Memory access holds `proc_lock` with interrupts off**: each `uvm_peek`/`uvm_poke` (and each page of `PTRACE_READ`/`WRITE`) runs under the global spinlock, including page allocation and a 4 KiB copy when a shared page has to be made private, and the remote `fence.i` through SBI. This is a latency cost for every CPU, not a correctness problem.
+- **Memory access can allocate under `mm->lock`**: `debug_page` makes untouched pages resident (and a breakpoint's private copy) with the tracee's `mm->lock` held, the one place a user page is allocated under that lock (faults drop it first). Reclaim only ever trylocks other mms, so this cannot deadlock, but direct reclaim may run from there.
 - **`uvm_peek` allocates**: reading an untouched page of the tracee makes it resident (a zeroed page).
 
 ## How it works: db
@@ -250,4 +250,3 @@ The kernel side's rules are in `ptrace.c`'s header comment: `tracer`, `ptrace_st
 4. **CFI unwinding** — Read `.debug_frame` (GCC) and synthesize rules for tcc's fixed prologue, so backtraces are exact in prologues, epilogues and leaf functions, and callee-saved registers (and the variables in them) are known in outer frames. Impact: medium. Effort: medium.
 5. **Richer expressions** — Casts to struct, union and typedef types, function calls in the inferior (set up the registers and a return breakpoint), `$N` history and convenience variables, and `handle`/`signal` to control signal delivery. Impact: low. Effort: medium.
 6. **`PTRACE_SYSCALL`** — Stops at system call entry and exit, which would let `strace` be a user program and db `catch syscall`. Impact: low. Effort: small.
-7. **Do ptrace memory copies outside `proc_lock`** — Pin the tracee (a reference that keeps its `mm`) and copy with interrupts on, instead of holding the global spinlock across page allocation, copying and remote `fence.i`. Impact: medium. Effort: small.

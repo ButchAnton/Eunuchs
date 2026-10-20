@@ -1,6 +1,6 @@
 # Memory management
 
-Eunuchs manages memory in five layers. A buddy allocator hands out physical page frames, each described by a `struct page`. A slab allocator built on it provides `kmalloc` and fixed-size object caches. An Sv39 page-table layer maps the kernel image (W^X), the direct map, MMIO and kernel stacks. On top of all that, per-process address spaces (`struct mm`) are built from VMAs with demand paging and copy-on-write `fork`. Every layer is instrumented for debugging: memory is poisoned, slab objects have redzones, every allocation and free records its call site, and corruption is reported with backtraces and hexdumps.
+Eunuchs manages memory in five layers. A buddy allocator hands out physical page frames, each described by a `struct page`. A slab allocator built on it provides `kmalloc` and fixed-size object caches. An Sv39 page-table layer maps the kernel image (W^X), the direct map, MMIO and kernel stacks. On top of all that, per-process address spaces (`struct mm`) are built from VMAs with demand paging, copy-on-write `fork` and file mappings; a page cache holds file pages, a swap partition takes anonymous pages when memory is short, and kswapd reclaims in the background. Address spaces are tagged with ASIDs, so switching between them need not flush the TLB. Every layer is instrumented for debugging: memory is poisoned, slab objects have redzones, every allocation and free records its call site, and corruption is reported with backtraces and hexdumps.
 
 ## Responsibilities and scope
 
@@ -11,7 +11,9 @@ Eunuchs manages memory in five layers. A buddy allocator hands out physical page
 - Kernel heap: `kmalloc`, `kzalloc`, `kfree`, `ksize`, and named caches (`kmem_cache_create`, `kmem_cache_alloc`, `kmem_cache_free`).
 - The kernel page table: building it in `vm_init`, `vm_map`/`vm_unmap`, `ioremap`, lookups (`vm_translate`, `vm_walk`), and lazily propagating new kernel top-level entries into process page tables.
 - Guarded kernel thread stacks in a dedicated virtual area (`kstack_alloc`, `kstack_free`), including the TLB shootdown needed to unmap them.
-- User address spaces: creation, VMA list, changing protections (`vma_protect`, behind `mprotect`), demand-zero paging, COW fork, teardown, cross-address-space reads and writes, activation on context switch.
+- User address spaces: creation, VMA list (with reuse of freed ranges), changing protections (`vma_protect`, behind `mprotect`), demand-zero paging, COW fork, file mappings (`MAP_SHARED`, `MAP_PRIVATE`, `msync`), teardown with page-table pruning, cross-address-space reads and writes, activation on context switch with ASIDs.
+- The page cache (`pagecache.c`): file pages and the swap cache in one hash table and LRU.
+- Swap (`swap.c`) on the disk's `swap` partition, and reclaim (`reclaim.c`): free-memory marks, kswapd, direct reclaim, `user_page_alloc`.
 - Safe kernel access to user memory (`copy_from_user`, `copy_to_user`, `strncpy_from_user`) and fault-tolerant debug accessors (`safe_read_*`, `safe_write_*`), both through the exception table.
 - Corruption detection and reporting (`mm_corruption`, `heapcheck`, `slab leaks`, fault hints).
 
@@ -21,7 +23,7 @@ Eunuchs manages memory in five layers. A buddy allocator hands out physical page
 - ELF loading (`kernel/proc/elf.c: elf_load`, which uses `vma_add` and `uvm_populate`) and building the initial user stack (`kernel/proc/proc.c`, which uses `uvm_write`).
 - Signal delivery and the crash report for a failed user fault (`user_fault` in `kernel/proc`).
 - The IPI transport. TLB shootdown (`kernel/arch/riscv/smp.c: tlb_shootdown`) is documented here, but IPIs, `ipi_poll` and stop-the-world belong to the SMP subsystem.
-- Swapping, file-backed mappings, page cache. None of these exist (see Limitations).
+- The filesystems' own reads and writes (`kernel/fs/`), which the page cache sits beside: efs file reads go through it, writes go to the filesystem and then update it.
 
 **Boundaries:**
 
@@ -40,6 +42,9 @@ Eunuchs manages memory in five layers. A buddy allocator hands out physical page
 | `kernel/mm/vmm.c` | Sv39 page tables: `vm_init`, `walk`, `vm_map`/`vm_unmap`, `ioremap`, `vm_kernel_fault_fixup`, page-table dumps, `vm_fault_hint` |
 | `kernel/mm/kstack.c` | Kernel stacks in `KSTACK_AREA` with guards, a cache of freed but still-mapped stacks, `addr_in_stack_guard` |
 | `kernel/mm/uvm.c` | User address spaces: `mm_create`/`mm_destroy`/`mm_fork`, VMAs, `uvm_fault`, `uvm_populate`, `uvm_read`/`uvm_write`, `vm_activate`, `mm_print` |
+| `kernel/mm/pagecache.c` | The page cache and swap cache: `pc_get`, `pc_find`, `pc_insert`, `pc_update`, `pc_truncate`, `pc_drop_inode`, `pc_writeback`, `pc_shrink`, `/proc/pagecache` |
+| `kernel/mm/swap.c`, `kernel/include/swap_format.h` | Swap space: the partition, slot counts, `swap_read`/`swap_write`, `swap_dup`, `/proc/swaps` |
+| `kernel/mm/reclaim.c` | Free-memory marks, kswapd, `reclaim`, `user_page_alloc`, the `vmc` counters (`/proc/vmstat`) |
 | `kernel/include/proc.h` | `struct mm`, `struct vma`, user layout constants, `PTE_COW`, `VM_*`, `FAULT_*`, uaccess prototypes, `user_range_ok` |
 | `kernel/arch/riscv/uaccess.S` | `__copy_user`, `__strncpy_user`: byte loops with `SUM` set and `__ex_table` entries |
 | `kernel/proc/uaccess.c` | `copy_from_user`, `copy_to_user`, `strncpy_from_user`: range checks around the assembly |
@@ -60,7 +65,7 @@ Eunuchs manages memory in five layers. A buddy allocator hands out physical page
 |---|---|---|
 | `0x0` – `0xffff` | Unmapped. `USER_MIN_ADDR` is `0x10000`; `vma_add` refuses anything below `PAGE_SIZE` | `proc.h` |
 | `0x10000` – … | ELF `PT_LOAD` segments, then the heap (`brk_start` = page-aligned end of the image) | `proc.c`, `elf.c` |
-| `0x2000000000` (`USER_MMAP_BASE`) | Anonymous `mmap` area. A bump pointer (`mm->mmap_next`) leaves a 1-page gap after each mapping | `syscall.c: do_mmap` |
+| `0x2000000000` (`USER_MMAP_BASE`) | `mmap` area (anonymous and file mappings): the lowest free range with a guard page on each side (`uvm_find_gap`), so freed ranges are reused | `syscall.c: do_mmap` |
 | `0x3ffff00000 - 8 MiB` – `0x3ffff00000` (`USER_STACK_TOP`) | User stack VMA, `USER_STACK_SIZE` = 8 MiB, demand-paged | `proc.h` |
 | `0x4000000000` (`USER_TOP`) | End of user space (the lower half of Sv39) | `proc.h` |
 | `0xffffffc000000000` (`KERNEL_BASE`) + PA | Direct map of RAM (from `__kernel_end`) and of `ioremap`ped MMIO | `mm.h`, `vmm.c: vm_init` |
@@ -96,6 +101,13 @@ Page flags:
 | `PG_LARGE` | `slab.c: kmalloc_site` | Head of a >2 KiB kmalloc |
 | `PG_PGTABLE` | `vmm.c: alloc_table`, `uvm.c: mm_create` | Page-table page. `vm_activate` checks it on the root |
 | `PG_TAIL` | `buddy_alloc` | Non-head page of an *allocated* multi-page block |
+| `PG_CACHE` | `pagecache.c: pc_insert` | In the page cache: a file's page (`cache.owner` = the super_block, `cache.ino`, `cache.index`) |
+| `PG_SWAPCACHE` | `pc_insert` with `&swap_owner` | In the swap cache: an anonymous page with a swap slot (`cache.index`) |
+| `PG_DIRTY` | write faults on shared file pages, reclaim | Newer than its copy in the file or the swap slot |
+| `PG_REFERENCED` | readers, reclaim | Used since reclaim last looked (second chance on the LRU) |
+| `PG_USER` | `user_page_alloc` | User memory, anonymous or cache (statistics, `page`) |
+
+User-memory flags change under several locks, so they are set and cleared atomically (`page_set_flag`, `page_clear_flag`). A cache page uses the `cache` member of the page's union (`owner`, `ino`, `wmap`: writable shared mappings of it, `index`, `hnext`: hash chain) and its `list` links it into the reclaim LRU.
 
 Invariants:
 
@@ -182,7 +194,7 @@ The only custom cache created in the tree is in the tests (`test-widget` in `ker
 
 ### Page-table entries (`kernel/include/mm.h`, `proc.h`)
 
-The PTE bits used are `PTE_V R W X U G A D` (bits 0 to 7), plus `PTE_COW` (bit 8, one of the RSW bits) for user COW pages.
+The PTE bits used are `PTE_V R W X U G A D` (bits 0 to 7), plus `PTE_COW` (bit 8, one of the RSW bits) for user COW pages. A **swap PTE** has `V` clear, `PTE_SWAP` (bit 9) set, and the swap slot in bits 10 and up (`PTE_IS_SWAP`).
 
 Kernel permission sets preset `A` and `D`, so the hardware never needs to update them:
 
@@ -192,7 +204,7 @@ Kernel permission sets preset `A` and `D`, so the hardware never needs to update
 | `PROT_KERNEL_RO` | R G A |
 | `PROT_KERNEL_RW` | R W G A D |
 
-User PTEs come from `uvm.c: prot_to_pte`: `U|A|D`, plus R/W/X from the VMA's `VM_READ/VM_WRITE/VM_EXEC`. User mappings are always 4 KiB leaves. The kernel direct map uses the largest level (1 GiB, 2 MiB or 4 KiB) that alignment and size allow (`vmm.c: do_map`).
+User PTEs come from `uvm.c: prot_to_pte`: `U|A|D`, plus R/W/X from the VMA's `VM_READ/VM_WRITE/VM_EXEC`. Reclaim clears `A` to see which pages are used; if the hardware does not set it again (no Svadu, as on QEMU), the next access faults and `uvm_fault` sets it. `D` is always set: dirtiness of shared file pages is tracked by write faults instead. User mappings are always 4 KiB leaves. The kernel direct map uses the largest level (1 GiB, 2 MiB or 4 KiB) that alignment and size allow (`vmm.c: do_map`).
 
 ### Kernel page table and the kernel half of process tables
 
@@ -224,14 +236,18 @@ KSTACK_AREA + idx*32K:  [ guard 16 KiB, unmapped ][ stack 16 KiB, mapped RW ]
 ### User address spaces (`kernel/include/proc.h`)
 
 ```c
-struct vma { struct list_head node; uintptr_t start, end; u32 prot; enum vma_kind kind; char name[16]; };
-struct mm  { pagetable_t pt; spinlock_t vma_lock; struct list_head vmas;
-             uintptr_t brk_start, brk, mmap_next; u64 rss, faults, cow_copies; u32 kernel_gen; };
+struct vma { struct list_head node; uintptr_t start, end; u32 prot; enum vma_kind kind; char name[16];
+             struct file *file; u64 pgoff; bool shared; };            /* VMA_FILE */
+struct mm  { pagetable_t pt; struct mutex lock; spinlock_t vma_lock; struct list_head vmas;
+             uintptr_t brk_start, brk; u64 rss, swapped, faults, cow_copies, major_faults;
+             u32 kernel_gen; u64 id, tlb_gen; uintptr_t scan_va; };
 ```
 
 - `vmas` is a doubly linked list sorted by `start`, with non-overlapping `[start, end)` page-aligned ranges.
-- `kind` is `VMA_ELF`, `VMA_HEAP`, `VMA_STACK` or `VMA_ANON`. It is only used for display.
+- `kind` is `VMA_ELF`, `VMA_HEAP`, `VMA_STACK`, `VMA_ANON` or `VMA_FILE`. A file VMA holds a reference to the open file, the file page at `start` (`pgoff`), and whether writes go to the file (`shared`).
 - `prot` is a mask of `VM_READ`, `VM_WRITE` and `VM_EXEC`.
+- `lock` (a mutex) is held while the page table or the VMA list changes: by the owner (faults, mmap, munmap, brk, mprotect, fork, exit), by a debugger (ptrace), and by reclaim (`mutex_trylock`). `vma_lock` additionally serializes VMA list changes against readers that cannot sleep (`/proc/<pid>/maps` under `proc_lock`, the monitor).
+- `swapped` counts the mm's pages out in swap; `major_faults` the faults that read a file or swap; `id` (unique for the life of the system) and `tlb_gen` (bumped by every PTE change other CPUs may cache) drive the ASIDs; `scan_va` is where reclaim continues next time.
 - `rss` counts mapped pages. A shared COW page counts once in each mm.
 
 ## How it works
@@ -398,7 +414,7 @@ Only kernel mappings need shootdowns. A user page table is live on at most one C
 
 ### User address spaces (`uvm.c`)
 
-**Creation:** `mm_create` allocates the `mm` (`kzalloc`) and a zeroed root (`PG_PGTABLE`). It copies the kernel half (`vm_sync_kernel`), records `kernel_gen`, and sets `mmap_next = USER_MMAP_BASE`.
+**Creation:** `mm_create` allocates the `mm` (`kzalloc`) and a zeroed root (`PG_PGTABLE`). It copies the kernel half (`vm_sync_kernel`), records `kernel_gen`, and takes a new `id`.
 
 **`exec`** (`proc.c`) builds a complete new mm before giving up the old one:
 
@@ -411,7 +427,8 @@ Only kernel mappings need shootdowns. A user page table is live on at most one C
 
 - `vma_add` validates its arguments (`-EINVAL`) and rejects overlaps (`-EEXIST`). It allocates the VMA with `kzalloc` and inserts it in sorted position under `vma_lock`.
 - `vma_find` is a linear search.
-- `vma_unmap(start, end)` handles each overlapping VMA in turn. It first unmaps the pages, then, under `vma_lock`, removes the VMA, trims it at either end, or splits it (the tail is re-added with `vma_add`).
+- `vma_unmap(start, end)` (`vma_unmap_locked` with `mm->lock` held) handles each overlapping VMA in turn: it unmaps the pages, then removes the VMA, trims it, or splits it. It is failure-atomic: the VMA a split needs is allocated before anything changes, so `-ENOMEM` leaves the address space as it was. A file VMA's last piece drops its file reference.
+- `uvm_find_gap(mm, len)` returns the lowest free range of `len` bytes from `USER_MMAP_BASE` up, with a guard page on each side, below the stack's gap; `mmap` without `MAP_FIXED` uses it (after trying the address hint), so ranges freed by `munmap` are reused. (`mmap_next`, the old bump pointer, is gone.)
 - `vma_protect(mm, start, end, prot)` (behind `mprotect`) changes the protection of a page-aligned range:
   1. The whole range must be covered by VMAs without holes (`-ENOMEM` otherwise), as on Linux.
   2. Each overlapping VMA whose protection differs is split at `start` and `end` (the outside parts are re-added with `vma_add` and keep the old protection), and the inside part gets the new `prot`.
@@ -423,25 +440,26 @@ Only kernel mappings need shootdowns. A user page table is live on at most one C
 
 **Page-table walks:**
 
-- `next_present` finds the next valid level-0 PTE. It skips whole 1 GiB or 2 MiB ranges whose level-2 or level-1 entry is invalid, which makes tearing down the mostly empty 8 MiB stack cheap.
-- `for_each_present` wraps it.
-- `unmap_range` clears each PTE, decrements `rss`, and calls `page_put` on the frame. It flushes the TLB if the mm is active.
+- `next_used` finds the next non-zero level-0 PTE (present, or a swap PTE). It skips whole 1 GiB or 2 MiB ranges whose level-2 or level-1 entry is invalid, which makes tearing down the mostly empty 8 MiB stack cheap.
+- `for_each_used` wraps it.
+- `unmap_range` clears each PTE and drops what it held (`drop_pte`): a page reference (and, for a writable shared file page, its `cache.wmap` count), or a swap slot (`swap_free`, `swapped--`). Each present PTE gets `tlb_changed` (a local flush if the mm is active, and `tlb_gen++`) before its page can be freed. Then `prune_tables` frees page-table pages left empty, clearing the parent entry and flushing before each table is freed.
+- Every PTE change goes through `tlb_changed`, so other CPUs flush this mm's ASID when they next run it.
 
-**Demand paging and COW (`uvm_fault(mm, addr, access)`):**
+**Faults (`uvm_fault(mm, addr, access)`).** `uvm_fault` takes `mm->lock` and calls `fault_relock`, which loops on `fault_locked`. The rule is that **a fault never allocates memory or reads swap while holding `mm->lock`** (allocation may reclaim, and reclaim takes other processes' `mm->lock`): when `fault_locked` needs a page it returns `-EAGAIN`, and `fault_relock` drops the lock, allocates a spare page (`user_page_alloc`) or reads the swap slot into the swap cache (`read_swap_slot`), takes the lock again and retries, since anything may have changed meanwhile (`struct fault_ctx` carries the spare and the held page; more than 100 rounds gives `-ENOMEM`). `fault_locked`:
 
-1. No VMA → `-EFAULT`. Access not allowed by `v->prot` → `-EACCES`.
-2. `vm_walk(..., alloc=true)` gets the level-0 PTE, creating tables as needed (`-ENOMEM` on failure). `faults++`.
-3. PTE not valid: `uvm_populate` maps a zeroed page with the VMA's protections. `rss++`.
-4. Write to a `PTE_COW` page:
-   - If the frame's `refcount == 1`, this is the last user, so it just sets `W` and clears `COW`.
-   - Otherwise it copies into a new page, installs it with the VMA's protections, calls `page_put` on the old frame, and increments `cow_copies`.
-5. Write to a present non-writable, non-COW page → `-EACCES`. This should not happen, given step 1.
-6. If the mm is active, `sfence.vma va`.
+1. No VMA → `-EFAULT`. Access not allowed by `v->prot` → `-EACCES` (ptrace's `force` skips this).
+2. `vm_walk(..., alloc=true)` gets the level-0 PTE, creating tables as needed (`-ENOMEM` on failure).
+3. **Empty PTE**: for a file VMA, `file_fault` (below); otherwise a zeroed spare page mapped with the VMA's protections, `rss++`.
+4. **Swap PTE**: `swap_in` takes the page from the swap cache (the slot was read into it unlocked). If nothing else needs the slot, the page leaves the swap cache and becomes this process's private page (the slot is freed); otherwise (the slot is shared after `fork`, or the page is in the cache for others) it is mapped read-only + `COW`. An I/O error gives `-EIO` (SIGBUS).
+5. **Present PTE**: sets `A` if reclaim cleared it. A write to a non-writable page: a shared file page (`VMA_FILE`, `shared`) gets `PG_DIRTY`, `cache.wmap++` and `W` (the first write to it); a `COW` page goes to `cow_break`, which takes the page if this mm is its only user (sets `W`, clears `COW`) or copies it into the spare page (`cow_copies++`); anything else is `-EACCES`.
+6. `faults++` (and `vmc.faults`); `sfence.vma va` if the mm is active.
+
+**File faults (`file_fault`).** The page is `pgoff + (va - start) / PAGE_SIZE` of the VMA's file. A page wholly past the end of the file gives `-ENXIO`, which `user_exception` turns into SIGBUS "past the end of the mapped file". Otherwise the page comes from the page cache (`pc_get_spare`, under the file's inode lock, with the spare page supplied for a miss; a miss counts as a major fault). `MAP_SHARED` maps the cache page itself, read-only until the first write (step 5); `MAP_PRIVATE` maps it read-only + `COW`, so a write copies it.
 
 **`mm_fork(parent)`:**
 
-1. Creates a new mm and copies `brk_start`, `brk` and `mmap_next`.
-2. For each parent VMA it adds a matching VMA. For each present page, any PTE that is writable or already COW becomes `(pte & ~W) | COW` in the parent. The PTE is copied into the child, the frame gets `page_get`, and the child's `rss++`.
+1. Creates a new mm and copies `brk_start` and `brk`, under the parent's `mm->lock`.
+2. For each parent VMA it adds a matching VMA (a file VMA takes another reference to the file). For each used PTE: a swap PTE is copied and its slot's count raised (`swap_dup`, `swapped++`); in a shared file VMA the PTE is copied as it is, `W` included (both processes write the same cache page, `cache.wmap` counting both); otherwise a writable or COW PTE becomes `(pte & ~W) | COW` in the parent. The PTE is copied into the child, the frame gets `page_get`, and the child's `rss++`.
 3. Read-only pages (such as text) are shared without `COW`.
 4. Flushes the parent's TLB if it is active.
 5. On failure it calls `mm_destroy` on the child. The parent's pages stay marked COW and simply regain write access on their next write fault, because their refcount is back to 1.
@@ -449,20 +467,65 @@ Only kernel mappings need shootdowns. A user page table is live on at most one C
 **Teardown (`mm_destroy`):**
 
 - It panics with "mm_destroy of the active address space" if called on the active mm. `exit` first calls `vm_activate(NULL)`.
-- It unmaps and frees every VMA and warns "mm_destroy: N pages still counted resident (accounting bug)" if `rss` is not 0.
+- It unmaps and frees every VMA (dropping pages, swap slots and file references) and warns "mm_destroy: N pages still counted resident (accounting bug)" if `rss` is not 0.
 - `free_tables` recursively frees the lower-half tables (root entries 0 to 255) and the root.
+
+**`uvm_msync(mm, start, end)`** (behind `msync`): for shared file pages in the range, it write-protects the PTEs (so the next write marks the page dirty again), then writes dirty pages back to the file (`pc_writeback`).
 
 **Cross-address-space access:**
 
 - `uvm_write(mm, dst, src, n)` faults each destination page in for writing, so it works on an inactive mm and resolves COW. It copies through the direct map.
+- ptrace uses `uvm_peek_locked`/`uvm_poke_locked` with the tracee's `mm->lock`, taken with `mutex_trylock` under `proc_lock` (`lock_tracee_mm`), so the tracee's mm cannot go away.
 - `uvm_read(mm, src, dst, n)` only translates and copies. It never allocates, and returns `-EFAULT` for unmapped pages. The profiler and user backtraces (`proc.c`, `profile.c`) use it.
 
 **Activation (`vm_activate(mm)`)** runs on every context switch, plus in `exec` and `exit`.
 
 - It panics if the root page is not a live `PG_PGTABLE` page ("vm_activate: page table … is not a live page table (… freed while still in use?)").
 - It re-syncs the kernel half if `kernel_gen` is stale.
-- If the table differs from the current `satp`, it writes `satp` and runs `sfence.vma zero, zero`.
+- It switches `satp` through `vm_switch` (`vmm.c`), which tags the address space with an ASID (below) and flushes only when needed.
 - `NULL` selects `kernel_pagetable`, which kernel threads and idle threads use.
+
+### The page cache (`pagecache.c`)
+
+File pages and the swap cache share one hash table (4096 buckets) keyed by **(owner, ino, index)** and one LRU list:
+
+- **File pages**: `owner` is the file's `super_block`, `ino` its inode number, `index` the page number in the file. Keying by (sb, ino) rather than by the in-memory inode means cached pages outlive the inode, which the VFS frees as soon as its last reference goes, so a file read again is still cached.
+- **Swap-cache pages**: `owner` is `&swap_owner`, `index` the swap slot.
+
+The cache holds one reference on every page in it, and anyone using a page (a PTE, a reader) holds another; a page with only the cache's reference is unmapped and may be freed (after it is written, if dirty). `pc_lock` (a spinlock) covers the hash table, the LRU and the `PG_CACHE`/`PG_SWAPCACHE` flags; filling a file page happens under the file's inode lock, which also orders fills against writes and truncation.
+
+- **Reads**: efs's file `read()` copies from cached pages (`pc_get` fills a missing page from the file; `cache_hits`/`cache_misses`). User copies are done with no filesystem lock held, from the cache page (or through a kernel bounce buffer in `file.c`), so a fault on the user buffer can take `mm->lock` without inverting the lock order.
+- **Writes**: `write()` goes to the filesystem and its log as before, then `pc_update` copies the new bytes into any cached pages they cover, so `read`, `write` and `mmap` see the same bytes.
+- **Truncation and deletion**: `O_TRUNC` calls `pc_truncate` (forget pages past the end, zero the tail of the last); the final `iput` of an unlinked file calls `pc_drop_inode`.
+- **Dirty pages** come only from writes through shared mappings. They go back to the file (`pc_writeback`) at `msync`, `fsync`, `sync` (`vfs_sync_all` writes them before waiting for the log), every 5 s from kswapd, and before reclaim frees them. `ilock_try` (new in `vfs.c`) lets writeback skip files whose lock is busy.
+- **Shrinking**: `pc_shrink(want, may_write)` walks the LRU from the cold end, giving a page with `PG_REFERENCED` a second chance, and frees unmapped pages, writing dirty ones first when allowed (swap-cache pages to their slot; file pages only when `may_write`).
+
+### Swap (`swap.c`, `swap_format.h`)
+
+Swap space is the partition named `swap` (`SWAP_MB`, 128 MiB by default; GPT type `GPT_TYPE_SWAP`, GUID `57535545-5041-4e55-8000-45554e554348`). Page 0 is a header (magic `EUSWAP01`, version 1, `npages`, a label); pages 1..`npages`−1 are page-sized slots. `swap_init` finds the volume by name, checks the header, and logs `swap: disk0p5, 128 MiB (N slots)`; `noswap` on the command line turns swap off.
+
+Nothing about slots is on disk: swap starts empty every boot. In memory each slot has a `u16` count: the PTEs holding it (a page swapped out after `fork` keeps one slot shared by both processes) plus one while its page is in the swap cache. A slot is free at 0. `swap_alloc`, `swap_dup` and `swap_free` maintain the counts; `swap_write`/`swap_read` do the I/O through `blk_rw`.
+
+### Reclaim and kswapd (`reclaim.c`)
+
+Free memory has three marks, in pages: **min** = RAM/128 (a reserve user allocations leave for the kernel), **low** = RAM/64 (below it kswapd wakes) and **high** = RAM/32 (where kswapd stops). Every user page (anonymous, page cache, swap cache) comes from `user_page_alloc(zero)`:
+
+- below **low** it wakes kswapd;
+- below **min** it reclaims itself (direct reclaim); if kswapd holds the reclaim lock, it waits 2 ms and retries instead;
+- after 8 rounds in a row with no progress anywhere, it logs `out of memory for user pages: N pages free, nothing left to reclaim` and returns NULL: the fault fails with `-ENOMEM` and the process gets SIGBUS ("out of memory").
+
+Kernel allocations (`alloc_pages`, `kmalloc`) do not reclaim; they rely on the reserve.
+
+`reclaim(want, direct)` runs under `reclaim_lock`, one reclaimer at a time, and repeats:
+
+1. `pc_shrink`: free cold unmapped page-cache and swap-cache pages, writing dirty ones first. kswapd may write file pages; direct reclaim may not, since its caller may hold filesystem locks.
+2. If that was not enough, `uvm_reclaim` visits the processes in turn (taking each `mm->lock` with `mutex_trylock`, under `proc_lock` so the mm cannot go away) from where it left off (`scan_va`). A PTE with `A` set loses it (a second chance). Otherwise the page is unmapped: a file page just goes (the file has it); an anonymous page gets a swap slot, goes into the swap cache dirty, and its PTE becomes a swap PTE (`swapped++`). Page references are dropped only after `tlb_shootdown`, since the process may be running on another CPU. Pages unmapped from their last process are freed by the next `pc_shrink`.
+
+kswapd (a kernel thread, visible in `ps`) wakes when an allocation sees free memory below low, and at least once a second; it reclaims up to high, and every 5 s writes dirty file pages back.
+
+### ASIDs (`vmm.c: asid_init`, `vm_switch`)
+
+`asid_init` probes how many ASID bits `satp` keeps (16 on QEMU) by writing all ones and reading back; with too few, or with the boot option `noasid`, ASIDs are not used and every switch flushes the TLB. Otherwise each CPU has `ASID_SLOTS` = 15 slots, each remembering `(mm id, tlb_gen)`. `vm_switch` gives the incoming mm the slot that already has its id, or takes the next slot round-robin; it flushes that ASID (`sfence.vma zero, asid`) only when a new mm takes over the slot or the mm's `tlb_gen` changed since this CPU last ran it, and otherwise switches with no flush at all. Every PTE change bumps `tlb_gen` (`tlb_changed`). `/proc/asids` shows per-CPU switches with and without a flush.
 
 ### Faults (`trap.c`)
 
@@ -500,18 +563,16 @@ The range check matters because `SUM` would otherwise let the copy loop touch an
 | `c->lock` (named after the cache, e.g. "kmalloc-64") | spinlock, irqsave | a cache's slab lists, per-slab free lists, `inuse`, counters | Held across `new_slab`, which calls `alloc_pages_site` and formats the slab |
 | `kpt_lock` ("kernel-pt") | spinlock, irqsave | `kernel_pagetable` updates after `vm_ready` | Held across `walk`, which may allocate tables (taking `zone_lock`) |
 | `kstack_lock` ("kstack") | spinlock, irqsave | `slot_used`, `cache[]`, counters | Dropped before mapping, unmapping or shootdown |
-| `mm->vma_lock` ("vma") | spinlock, irqsave | VMA list *changes* against readers from other processes | Writers are the owning thread only. Readers (`mm_print`, used by `/proc/<pid>/maps` and the monitor) also rely on `proc_lock` to keep the mm alive |
+| `mm->lock` | mutex | the page table, `rss`/`swapped`, the VMA list | Held by faults, mmap, munmap, brk, mprotect, msync, fork, exit, ptrace (`mutex_trylock` under `proc_lock`) and reclaim (`mutex_trylock`). Never held while allocating a user page or reading swap (faults drop it and retry) |
+| `mm->vma_lock` ("vma") | spinlock, irqsave | VMA list *changes* against readers that cannot sleep | Readers (`mm_print`, used by `/proc/<pid>/maps` and the monitor) also rely on `proc_lock` to keep the mm alive |
+| `pc_lock` | spinlock | the page cache's hash table, LRU, and the `PG_CACHE`/`PG_SWAPCACHE` flags | A file page is filled under its inode lock |
+| `reclaim_lock` | mutex | one reclaimer at a time (kswapd or a direct reclaimer) | A direct reclaimer that finds it held waits 2 ms and retries |
 
-**Lock order** (from the code paths above): `c->lock` → `zone_lock`, and `kpt_lock` → `zone_lock`. `zone_lock` is a leaf. lockdep (`kernel/debug/lockdep.c`) checks the order at run time.
+**Lock order** (from the code paths above): `c->lock` → `zone_lock`, and `kpt_lock` → `zone_lock`. `zone_lock` is a leaf. For user memory: `mm->lock`, then the filesystem (a file fault takes the inode lock; closing a mapped file), then `pc_lock`. User copies in `read`/`write` are made with no filesystem lock held, so a fault on the user buffer (which takes `mm->lock`) cannot invert this order. lockdep (`kernel/debug/lockdep.c`) checks the order at run time.
 
 **Interrupt context.** All allocator locks disable interrupts, and nothing in pmm or slab sleeps, so `kmalloc`, `kfree`, `page_alloc` and `page_free` are usable from interrupt handlers. `kstack_free` and `kstack_alloc` may call `tlb_shootdown`, which must not run from an interrupt handler that interrupted a shootdown (comment in `smp.c: tlb_shootdown`).
 
-**User mm.** `uvm.c` takes no lock for page tables or `rss`/`faults`. The design assumes that an mm is only modified by its single owning thread: during system calls, during its own page faults, and in fork/exec/exit run by that thread. Concurrent readers can therefore see a page table mid-update:
-
-- `mm_print` walks page tables while holding `vma_lock`.
-- `uvm_read` is used by the profiler and by user backtraces.
-
-These readers only read through the direct map, and page tables are freed only by `mm_destroy`, after `exit` has detached the mm under `proc_lock`. COW refcounts are atomic (`page_get`/`page_put`). The `refcount == 1` test in `uvm_fault` is a plain read, but a stale "2" only causes an extra copy.
+**User mm.** Every change to a page table or VMA list happens under `mm->lock` (see the table). Faults allocate and read swap with it dropped and re-check afterwards. Readers that cannot sleep (`mm_print` for `/proc/<pid>/maps` and the monitor's `vm`, which uses `mutex_trylock`) take `vma_lock` and rely on `proc_lock`; `uvm_read` (profiler, user backtraces) only translates and reads through the direct map. Page references are atomic (`page_get`/`page_put`), and user-memory page flags are set and cleared atomically.
 
 **TLB coherence:**
 
@@ -519,11 +580,11 @@ These readers only read through the direct map, and page tables are freed only b
 |---|---|
 | Kernel mappings that are added | Local `sfence.vma` only. Other harts are assumed not to cache invalid entries. Missing *top-level* entries in process tables are fixed lazily in the fault path |
 | Kernel mappings that are removed | `tlb_shootdown()`. Today the only callers are `kstack.c: unmap_pages` and the SMP test |
-| User page tables | Live on one CPU. Every `satp` switch flushes, and changes to the active mm flush locally (`unmap_range`, `uvm_fault`, `mm_fork`) |
+| User page tables | Every PTE change bumps `mm->tlb_gen` and flushes locally if the mm is active; another CPU flushes the mm's ASID when it next runs it (`vm_switch`). Reclaim, which changes processes that may be running elsewhere, also calls `tlb_shootdown()` before dropping page references |
 
 **SUM.** The scheduler clears `SSTATUS_SUM` before every context switch (`sched.c`), so user access cannot leak into another thread. `SUM` is part of the saved `sstatus` in the trap frame, so a copy interrupted by preemption resumes with `SUM` set.
 
-**Counters.** Statistics such as `tlb_shootdowns`, `large_allocs`, `large_frees` and `large_active_bytes` are updated without locks or atomics. They may be slightly off under SMP.
+**Counters.** Statistics such as `tlb_shootdowns`, `large_allocs`, `large_frees`, `large_active_bytes` and the `vmc` paging counters (`/proc/vmstat`) are updated without locks or atomics. They may be slightly off under SMP.
 
 ## Interfaces
 
@@ -557,7 +618,11 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 
 ### User memory (`proc.h`)
 
-`mm_create`, `mm_destroy`, `mm_fork`, `vma_find`, `vma_add`, `vma_unmap`, `vma_protect`, `uvm_peek`, `uvm_poke`, `uvm_fault`, `uvm_populate`, `uvm_write`, `uvm_read`, `vm_activate`, `mm_print`, `vma_kind_name`, `copy_from_user`, `copy_to_user`, `strncpy_from_user`, `user_range_ok`.
+`mm_create`, `mm_destroy`, `mm_fork`, `vma_find`, `vma_add`, `vma_add_file`, `vma_unmap`, `vma_unmap_locked`, `vma_protect`, `uvm_find_gap`, `uvm_msync`, `uvm_reclaim`, `uvm_peek`, `uvm_poke`, `uvm_peek_locked`, `uvm_poke_locked`, `uvm_fault`, `uvm_populate`, `uvm_write`, `uvm_read`, `vm_activate`, `mm_print`, `vma_kind_name`, `copy_from_user`, `copy_to_user`, `strncpy_from_user`, `user_range_ok`.
+
+### Page cache, swap and reclaim (`mm.h`)
+
+`user_page_alloc(zero)`, `reclaim(want, direct)`, `kswapd_wake`, `reclaim_init`; `pc_get`, `pc_get_spare`, `pc_find`, `pc_insert`, `pc_remove`, `pc_update`, `pc_truncate`, `pc_drop_inode`, `pc_writeback`, `pc_shrink`, `pc_stats`; `swap_init`, `swap_alloc`, `swap_dup`, `swap_free`, `swap_read`, `swap_write`; `vmc` (the counters).
 
 ### Fault-tolerant access (`safe.h`)
 
@@ -565,7 +630,7 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 
 ### System calls built on this subsystem
 
-`brk`, `mmap` (anonymous private only, W^X enforced), `munmap` and `mprotect` (W^X enforced) are in `kernel/proc/syscall.c`. `fork` and `execve` (`kernel/proc/proc.c`) use `mm_fork`, `mm_create`, `uvm_write`, `vm_activate` and `mm_destroy`.
+`brk`, `mmap`, `munmap`, `mprotect` and `msync` are in `kernel/proc/syscall.c`, all under `mm->lock`. `mmap` maps anonymous memory (`MAP_PRIVATE` only: shared anonymous memory is `EINVAL`) or a file (`MAP_SHARED` or `MAP_PRIVATE`): a non-regular file is `ENODEV`, a shared writable mapping of a file not open for writing `EACCES`, an unaligned offset `EINVAL`; W^X is enforced. `MAP_FIXED` replaces what is at the address; otherwise the address is a hint, used if the range is free, else `uvm_find_gap` chooses. `msync(227)` takes `MS_ASYNC`, `MS_SYNC` and `MS_INVALIDATE` (`uvm_msync` writes dirty shared pages back in every case). `fork` and `execve` (`kernel/proc/proc.c`) use `mm_fork`, `mm_create`, `uvm_write`, `vm_activate` and `mm_destroy`.
 
 ### Boot options
 
@@ -575,14 +640,20 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 | `log=mm:trace` | Logs every page allocation with its site (`pr_trace` in `alloc_pages_site`) |
 | `log=trap:trace` | Logs extable fixups ("fault at … fixed up -> …") |
 | `smp=<n>` | With `smp=1`, `tlb_shootdown` only flushes locally |
+| `noswap` | Do not use the swap partition |
+| `noasid` | Do not use ASIDs: every address-space switch flushes the TLB |
 
 ### /proc files
 
 | File | Source |
 |---|---|
-| `/proc/meminfo` | `pmm_print`: RAM, total/reserved/in-use/free pages, alloc/free/failure/corruption counts, free blocks by order, kernel stack counts, reserved regions |
+| `/proc/meminfo` | `pmm_print` and `vm_memory_print`: page-cache, swap-cache and swap lines (the `free` command shows them too); RAM, total/reserved/in-use/free pages, alloc/free/failure/corruption counts, free blocks by order, kernel stack counts, reserved regions |
 | `/proc/slabinfo` | `slab_print`: per-cache object size, slot size, objects per slab, active, total, slabs, allocs, frees, peak; large-kmalloc totals |
-| `/proc/<pid>/maps` | `mm_print`: VMAs with prot, kind, resident pages, shared COW pages; rss, faults, COW copies, brk |
+| `/proc/<pid>/maps` | `mm_print`: VMAs with prot, kind, resident and swapped pages, shared COW pages, `(N dirty)`, and `shared+0xOFF /path` or `private+0xOFF /path` for file mappings; a footer with rss, swapped and major faults, plus faults, COW copies and brk |
+| `/proc/vmstat` | `vm_counters_print`: `faults`, `major_faults`, `cache_hits`, `cache_misses`, `swap_outs`, `swap_ins`, `swap_out_skipped`, `writebacks`, `scanned`, `unmapped`, `freed`, `kswapd_runs`, `direct_reclaims`, `alloc_stalls`, `oom`, and the free-memory marks |
+| `/proc/swaps` | the swap volume, size, used and peak |
+| `/proc/pagecache` | cached pages by file (and the swap cache), dirty and mapped counts |
+| `/proc/asids` | per CPU: ASID switches with and without a flush |
 
 ### Monitor commands (`kernel/debug/monitor.c`)
 
@@ -595,7 +666,8 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 | `page <pa\|va>` | `page_print`: flags, order, refcount, block head, alloc/free sites, slab cache, kmalloc size |
 | `slab` / `slab leaks [prefix]` | `slab_print` / `slab_leak_report`. The `large` prefix selects page-backed kmallocs |
 | `heapcheck` | `pmm_verify_free` and `slab_verify` with panics suppressed |
-| `vm <pid> [va]` | `mm_print` or `vm_walk_print` on that process's table |
+| `vm <pid> [va]` | `mm_print` or `vm_walk_print` on that process's table (takes `mm->lock` with `mutex_trylock`) |
+| `vmstat`, `swap`, `pagecache` | The paging counters, the swap space, the page cache |
 | `mem <addr> [len]`, `poke <addr> <val> [size]` | `hexdump_safe` / `safe_write_*` |
 | `kmalloc <size>`, `kfree <addr>` | Experiments |
 | `crash uaf\|overflow\|wx\|stack\|null\|store` | Trigger the corresponding detectors and fault paths |
@@ -609,6 +681,7 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 - `slab leaks` to see who holds the memory. It groups live objects by allocation site and cache, sorted by bytes, with at most 64 sites.
 - `page <addr>` to get a frame's history.
 - `vm <pid>` for a process's map.
+- **Paging**: `/proc/vmstat` (or `vmstat` in the monitor) for faults, major faults, cache hits, swap-outs and swap-ins, reclaim scans and `oom`; `/proc/meminfo` and `free` for page-cache, swap-cache and swap totals; `/proc/swaps`, `/proc/pagecache`, `/proc/asids`; the swap column and `(N dirty)` of `/proc/<pid>/maps`; `kswapd` and threads waiting in reclaim in `ps`. `memhog MB` (`user/bin/memhog.c`) fills that much anonymous memory, forks, checks every word in both processes, and prints the paging counters that changed: the quick way to watch swap work (boot with `MEM=64M` to force it).
 
 **GDB** (`tools/gdb/eunuchs.py`) has `eu-vm [va]`, `eu-meminfo`, `eu-page <addr>` and `eu-slab`. They read kernel memory directly, so they work even when the kernel is wedged.
 
@@ -620,6 +693,7 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 **Trace events:**
 
 - `user_fault` (group `proc`) records every user page fault: `addr`, `access`, `result`.
+- `pagecache_fill`, `writeback`, `swap_out`, `swap_in` and `reclaim` record paging activity; they are in group `mm`, which is off by default (`trace=mm` turns it on).
 - `trace_events.h` also declares `page_alloc`, `page_free`, `kmalloc` and `kfree` in group `mm` (disabled by default: `trace_groups_enabled = TG_ALL & ~TG_MM`). **No code currently emits them**, so enabling the `mm` group records nothing.
 
 **Typical messages and their meaning:**
@@ -630,6 +704,10 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 | `… double free of page pa …; previously freed at A, allocated at B` | `free_pages` on a block head that is still `PG_FREE` |
 | `free_pages of pa … which is reserved memory` / `not the head of its block` / `still has N references` / `order mismatch` | Wrong argument to `free_pages`/`page_free` |
 | `page_put: refcount of pa … went negative` | Unbalanced `page_put` |
+| `out of memory for user pages: N pages free, nothing left to reclaim` | Memory and swap are full; the faulting process gets SIGBUS (`oom` in `/proc/vmstat` counts these) |
+| `swap: disk0p5, M MiB (N slots)` / `swap: no swap partition` / `has no valid swap header; not used` / `swap: off (noswap)` | Swap at boot |
+| `reclaim: free memory marks min …, low …, high … pages; kswapd started` | Reclaim at boot |
+| `ASIDs: 16 bits; 15 per CPU` / `ASIDs off (noasid)` | ASIDs at boot |
 | `heap overflow in kmalloc-N object P (R bytes requested, allocated at S): bytes +a..+b written past the end, detected at kfree` | Overflow past the requested size (including into size-class slack) |
 | `heap underflow in … redzone byte at offset -k overwritten` | Write before the object start |
 | `use-after-free write to kmalloc-N object …` | A free object's `0x6b` fill changed. Found on reallocation or `heapcheck` |
@@ -670,17 +748,19 @@ Kernel faults land in `panic_trap` with a `vm_fault_hint` diagnosis, such as "po
 - **`ioremap` regions are matched only by exact start address.** A second, larger request with the same start, or an overlapping request, makes `vm_map` fail and `ioremap` panic. `nr_ioremaps` is not locked (all callers are init code).
 - **`vm_map` does not roll back** partial mappings on failure.
 - **Newly mapped kernel pages are not shot down.** The code relies on other harts not caching invalid PTEs. QEMU behaves this way, but the RISC-V privileged spec allows harts to cache them, so a hart could take a spurious fault that `vm_kernel_fault_fixup` does not fix (it only repairs missing root entries), followed by a panic.
-- **No ASIDs.** Every `satp` change flushes the entire TLB, and `tlb_shootdown` always flushes everything rather than a range.
+- **`tlb_shootdown` always flushes everything** rather than a range or one ASID. Kernel global mappings and user mappings share the TLB; with ASIDs, only user switches avoid flushing.
 
 **User memory:**
 
-- **No file-backed or shared mappings** (`do_mmap` accepts only `MAP_ANONYMOUS|MAP_PRIVATE`), **no swapping, no OOM killer.** A failed demand-page allocation sends `SIGBUS` to the faulting process.
-- **`mmap` uses a bump pointer.** `mmap_next` only grows, and holes left by `munmap` are never reused.
-- **User page-table pages are freed only by `mm_destroy`.** `munmap` leaves empty tables in place.
-- **No locking for the user mm.** Correctness depends on processes having exactly one thread. Adding threads would need an mm lock and user TLB shootdowns.
+- **No shared anonymous memory** (`MAP_SHARED|MAP_ANONYMOUS` is `EINVAL`), **no swap readahead** (each swap-in reads one page), **no OOM killer**: when memory and swap are exhausted, the faulting process gets SIGBUS.
+- **Swap capacity with `fork`.** A page read back from swap while another process still holds its slot takes both a page and the slot. `memhog 160` (which forks) on 128 MiB of RAM with 128 MiB of swap fills swap completely this way.
+- **Truncation and mappings.** `pc_truncate` detaches cached pages from the cache but not from the mappings that hold them, so a mapping beyond the new end of file keeps the old data instead of getting SIGBUS.
+- **exec does not use the page cache**: programs are still read whole with `vfs_read_all` into kernel memory, and text is not shared between processes running the same program.
+- **Only user memory reclaims.** Kernel allocations (`kmalloc`, page tables, kernel stacks) never trigger reclaim; they rely on the `min` reserve.
+- **The monitor's `vm`** uses `mutex_trylock` on `mm->lock` and shows nothing for an mm that is busy.
+- **One thread per mm.** `mm->lock` makes the mm safe for the debugger and reclaim, but user threads would also need per-thread TLB shootdowns (today a running mm is only on one CPU).
 - **VMA operations are linear.** VMAs are a linked list, so lookups and inserts are O(n), and `mm_fork` re-inserts each VMA with `vma_add`.
-- **`vma_unmap` can leave a hole on failure.** If `vma_add` for the tail fails while splitting a VMA, the pages are already unmapped and the original VMA has already been trimmed. The tail part of the mapping silently disappears (the error is returned).
-- **`vma_protect` is not failure-atomic.** If a split's `vma_add` fails part way through a multi-VMA range, the VMAs already processed keep their new protection.
+- **`vma_protect` is not failure-atomic across VMAs.** Each VMA's splits are allocated before it is changed, but if a later VMA's split fails, the VMAs already processed keep their new protection. `mprotect` with a length of 0 returns 0.
 - **Making memory executable is expensive.** Every `mprotect` that adds `PROT_EXEC` sends a remote `fence.i` to all harts through SBI, whether or not they ever ran the process.
 - **`uvm_write` counts as faults.** It calls `uvm_fault` for every page it writes, so `mm->faults` includes exec-time stack writes.
 
@@ -709,11 +789,13 @@ Kernel faults land in `panic_trap` with a `vm_fault_hint` diagnosis, such as "po
 7. **Allocate slab pages outside the cache lock** — In `take_slot`, drop `c->lock` before `new_slab`, format the slab, then re-take the lock and insert it. This removes a nested `zone_lock` acquisition and up to 32 KiB of `memset` with interrupts off from the critical section. Impact: medium. Effort: small.
 8. **Per-CPU page and object caches** — Add a small per-CPU free list of order-0 pages and per-CPU magazines for the busiest kmalloc classes, to cut contention on `zone_lock` and `c->lock` with several CPUs. Keep the FIFO-delay property optional for debugging. Impact: medium. Effort: large.
 9. **Handle spurious faults on new kernel mappings** — Extend `vm_kernel_fault_fixup` so that if `vm_translate(kernel_pagetable, va)` succeeds with compatible permissions, it runs a local `sfence.vma` and retries. This makes kernel stack and `ioremap` mappings safe on harts that cache invalid PTEs. Impact: medium. Effort: small.
-10. **ASIDs and ranged shootdowns** — Use Sv39 ASIDs so that `vm_activate` need not flush the whole TLB on every switch. Let `tlb_shootdown` take a VA range, so `kstack.c: unmap_pages` flushes 16 KiB instead of everything. Impact: medium. Effort: medium.
-11. **Make `vma_unmap` failure-atomic** — Allocate the tail VMA for a split *before* unmapping pages or trimming `v`, so `-ENOMEM` leaves the address space unchanged. Impact: low. Effort: small.
-12. **Free empty user page tables and reuse `mmap` holes** — In `unmap_range`, free level-0 and level-1 tables that become empty. In `do_mmap`, search the VMA list for a gap instead of only bumping `mmap_next`. Long-running programs that map and unmap repeatedly currently leak address space and table pages until exit. Impact: low. Effort: medium.
-13. **Make `ioremap` robust to overlap** — Check for containment or overlap against existing regions, map only the missing pages, and take `kpt_lock` (or a dedicated lock) around the `ioremaps[]` update. Impact: low. Effort: small.
-14. **Boot option to slim slab debugging** — For example `noslabdebug`, which drops the metadata and redzones and uses a compact slot layout. This would allow measuring and running without the 48 bytes per object of overhead, as `nopoison` already does for pages. Impact: low. Effort: medium.
-15. **Host tests for slab and uvm logic** — Only `buddy.c` is host-tested. Factoring the pure parts of `slab.c` (slot geometry, free-list handling, redzone checks) and of `uvm.c` (VMA list operations, `next_present`) so they can run under ASan would catch bugs like items 1 and 3 earlier. Impact: medium. Effort: medium.
-16. **Atomic statistics** — Use `__atomic_add_fetch` (or the relevant lock) for `tlb_shootdowns`, `large_allocs`, `large_frees` and `large_active_bytes`, so that `/proc/slabinfo` and `cpus` show exact numbers under SMP. Impact: low. Effort: small.
-17. **Failure-atomic, targeted `mprotect`** — Allocate the split VMAs before changing anything, so `vma_protect` either fully succeeds or leaves the address space untouched; and send the remote `fence.i` only to harts that have run this `mm` since its last `fence.i` (a per-mm CPU mask), instead of every hart through SBI. Impact: low. Effort: small.
+10. **Make `ioremap` robust to overlap** — Check for containment or overlap against existing regions, map only the missing pages, and take `kpt_lock` (or a dedicated lock) around the `ioremaps[]` update. Impact: low. Effort: small.
+11. **Boot option to slim slab debugging** — For example `noslabdebug`, which drops the metadata and redzones and uses a compact slot layout. This would allow measuring and running without the 48 bytes per object of overhead, as `nopoison` already does for pages. Impact: low. Effort: medium.
+12. **Host tests for slab and uvm logic** — Only `buddy.c` is host-tested. Factoring the pure parts of `slab.c` (slot geometry, free-list handling, redzone checks) and of `uvm.c` (VMA list operations, `next_present`) so they can run under ASan would catch bugs like items 1 and 3 earlier. Impact: medium. Effort: medium.
+13. **Atomic statistics** — Use `__atomic_add_fetch` (or the relevant lock) for `tlb_shootdowns`, `large_allocs`, `large_frees` and `large_active_bytes`, so that `/proc/slabinfo` and `cpus` show exact numbers under SMP. Impact: low. Effort: small.
+14. **Failure-atomic, targeted `mprotect`** — Allocate the split VMAs before changing anything, so `vma_protect` either fully succeeds or leaves the address space untouched; and send the remote `fence.i` only to harts that have run this `mm` since its last `fence.i` (a per-mm CPU mask), instead of every hart through SBI. Impact: low. Effort: small.
+15. **Swap readahead and clustering** — Read neighbouring slots on a swap-in, and write runs of cold pages to adjacent slots, so paging does large sequential I/O instead of one page at a time. Impact: medium. Effort: medium.
+16. **Shared anonymous memory** — `MAP_SHARED|MAP_ANONYMOUS` backed by an anonymous object in the page cache (owner: the object), so `fork`ed processes can share writable memory. Impact: medium. Effort: medium.
+17. **exec through the page cache** — Map program text and data from the file (private mappings) instead of reading the whole file into `kmalloc` memory; text pages are then shared by every process running the program and the 4 MiB program limit goes. Impact: high. Effort: medium.
+18. **Truncation that reaches mappings** — Unmap (or SIGBUS) the pages of a file beyond its new end in every mapping, as Linux does, instead of leaving them with the old data. Impact: low. Effort: medium.
+19. **Ranged and ASID-targeted shootdowns** — Let `tlb_shootdown` flush one ASID or one range, and only on CPUs that have run the mm. Impact: low. Effort: small.

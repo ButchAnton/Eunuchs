@@ -266,6 +266,7 @@ pid_t waitpid(pid_t pid, int *st, int opt) { return ret(__syscall(SYS_wait4, pid
 pid_t wait(int *st) { return waitpid(-1, st, 0); }
 int munmap(void *a, size_t n) { return ret(SC2(SYS_munmap, a, n)); }
 int mprotect(void *a, size_t n, int prot) { return ret(SC3(SYS_mprotect, a, n, prot)); }
+int msync(void *a, size_t n, int flags) { return ret(SC3(SYS_msync, a, n, flags)); }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
 {

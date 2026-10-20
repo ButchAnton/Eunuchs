@@ -17,6 +17,7 @@
 #include <fmt.h>
 #include <kstring.h>
 #include <mm.h>
+#include <percpu.h>
 #include <platform.h>
 #include <printk.h>
 #include <riscv.h>
@@ -249,6 +250,88 @@ void vm_sync_kernel(pagetable_t pt)
 {
     for (int i = 256; i < 512; i++)
         pt[i] = kernel_pagetable[i];
+}
+
+/* ---- ASIDs ---- */
+
+unsigned asid_bits;
+
+/* How many ASID bits satp keeps (write all ones, read back). */
+void asid_init(void)
+{
+    if (cmdline_has("noasid")) {
+        pr_info("ASIDs off (noasid): every address-space switch flushes the TLB\n");
+        return;
+    }
+    u64 old = csr_read(satp);
+    csr_write(satp, old | (0xffffUL << 44));
+    u64 got = (csr_read(satp) >> 44) & 0xffff;
+    csr_write(satp, old);
+    sfence_vma_all();
+    while (got & (1UL << asid_bits))
+        asid_bits++;
+    if (asid_bits && (1U << asid_bits) - 1 < ASID_SLOTS)
+        asid_bits = 0;                  /* too few to bother */
+    pr_info("ASIDs: %u bits; %d per CPU\n", asid_bits, asid_bits ? ASID_SLOTS : 0);
+}
+
+/*
+ * Each CPU gives ASIDs 1..ASID_SLOTS to the address spaces it runs, the
+ * least recently assigned slot going to a newcomer (and flushed). An
+ * address space keeps its slot while it is current, recorded with the
+ * mm->tlb_gen its entries match: when the mm has changed since (on this CPU
+ * or another), its entries here are flushed before it runs again.
+ */
+void vm_switch(pagetable_t pt, u64 mm_id, u64 gen)
+{
+    u64 ppn = __pa(pt) >> PAGE_SHIFT;
+    if (!asid_bits || !mm_id) {
+        if (pt != current_pagetable() || ((csr_read(satp) >> 44) & 0xffff)) {
+            csr_write(satp, SATP_MODE_SV39 | ppn);
+            if (!asid_bits)
+                sfence_vma_all();       /* (the kernel table only has global entries) */
+        }
+        return;
+    }
+    bool irqs = intr_enabled();
+    intr_off();
+    struct cpu *c = this_cpu();
+    int slot = -1;
+    for (int i = 0; i < ASID_SLOTS; i++)
+        if (c->asid[i].mm_id == mm_id)
+            slot = i;
+    bool flush = false;
+    if (slot < 0) {
+        slot = (int)(c->asid_next++ % ASID_SLOTS);
+        c->asid[slot].mm_id = mm_id;
+        flush = true;
+    } else if (c->asid[slot].gen != gen) {
+        flush = true;
+    }
+    c->asid[slot].gen = gen;
+    c->asid[slot].uses++;
+    u64 asid = (u64)slot + 1;
+    csr_write(satp, SATP_MODE_SV39 | (asid << 44) | ppn);
+    if (flush) {
+        asm volatile("sfence.vma zero, %0" :: "r"(asid) : "memory");
+        c->asid_flushes++;
+    } else {
+        c->asid_hits++;
+    }
+    if (irqs)
+        intr_on();
+}
+
+void asid_print(print_fn print)
+{
+    if (!asid_bits) {
+        print("ASIDs: not used (every switch flushes the TLB)\n");
+        return;
+    }
+    print("ASIDs: %u bits, %d per CPU\n", asid_bits, ASID_SLOTS);
+    for (int i = 0; i < ncpus_online; i++)
+        print("  cpu%d: %lu switches without a flush, %lu with\n", i, (unsigned long)cpus[i].asid_hits,
+              (unsigned long)cpus[i].asid_flushes);
 }
 
 void *ioremap(uintptr_t pa, size_t size)
