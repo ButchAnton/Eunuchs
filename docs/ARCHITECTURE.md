@@ -68,11 +68,11 @@ NULL, OpenSBI's memory and any MMIO not explicitly mapped are unmapped, so stray
 - `mprotect` changes a range's permissions (splitting VMAs, never rwx); adding execute runs `fence.i` on every hart.
 - Walks over page tables skip empty tables whole.
 - Files can be mapped (`MAP_SHARED`, `MAP_PRIVATE`, `msync`) from the **page cache** (`pagecache.c`), which also serves efs reads; freed address ranges are reused, and empty page tables are freed.
-- **Swap and reclaim** (`swap.c`, `reclaim.c`): when free memory falls below its marks, kswapd (or the allocating fault itself) frees cold cache pages and unmaps cold user pages, writing anonymous ones to the `swap` partition; the next touch reads them back.
+- **Swap and reclaim** (`swap.c`, `reclaim.c`): when free memory falls below its marks, kswapd (or the allocating fault itself) frees cold cache pages and unmaps cold user pages, writing anonymous ones to the `swap` partition; the next touch reads them back. `swapon` and `swapoff` (root) turn swap on and off at run time; `swapoff` brings every swapped page back first.
 - `mm->lock` guards each address space; faults allocate and read swap with it dropped. Each CPU tags address spaces with **ASIDs**, so most switches need no TLB flush.
 - Kernel code touches user memory only through `copy_from_user`/`copy_to_user` (`uaccess.S`). Those set `SUM` only for the copy and register their instructions in the exception table, so a bad pointer returns `EFAULT` instead of a panic.
 
-Watch: `meminfo`, `pt`, `v2p`, `page`, `slab`, `slab leaks`, `heapcheck`, `vm <pid>`, `vmstat`, `swap` and `pagecache` in the monitor; `/proc/meminfo`, `/proc/slabinfo`, `/proc/vmstat`, `/proc/swaps`, `/proc/pagecache`, `/proc/asids` and `/proc/<pid>/maps`; `memhog` to exercise swap.
+Watch: `meminfo`, `pt`, `v2p`, `page`, `slab`, `slab leaks`, `heapcheck`, `vm <pid>`, `vmstat`, `swap` and `pagecache` in the monitor; `/proc/meminfo`, `/proc/slabinfo`, `/proc/vmstat`, `/proc/swaps`, `/proc/pagecache`, `/proc/asids` and `/proc/<pid>/maps`, `/proc/stat`; the commands `top`, `vmstat`, `free`, `pmap`, `fincore` and `ps v`; `memhog` to exercise swap; GDB `eu-mm`, `eu-swap`, `eu-pagecache`.
 
 ## Traps, interrupts and system calls
 

@@ -92,10 +92,10 @@ SWAP_MB ?= 128
 DISK_LAYOUT = boot:$(BOOT_MB) boot.old:$(BOOT_MB) root:$(FS_MB) home:$(HOME_MB) swap:$(SWAP_MB)
 HOME_FILES  = /guest/:0755:1000:1000
 EUTILS_LINKS = echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile \
-               true false yes kill date dmesg free sleep strace su dbg uname clear \
+               true false yes kill date dmesg sleep strace su dbg uname clear \
                reboot poweroff
 FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(notdir $(p))) \
-           $(foreach l,$(EUTILS_LINKS),/bin/$(l)=@/bin/eutils) /bin/sh=@/bin/esh /bin/less=@/bin/more \
+           $(foreach l,$(EUTILS_LINKS),/bin/$(l)=@/bin/eutils) /bin/sh=@/bin/esh /bin/less=@/bin/more /bin/swapoff=@/bin/swapon \
            /bin/vi=@/bin/edit /bin/view=@/bin/edit /bin/emacs=@/bin/edit /bin/em=@/bin/edit \
            +/etc/motd=user/etc/motd +/etc/passwd=user/etc/passwd +/etc/group=user/etc/group \
            +/etc/hostname=user/etc/hostname +/etc/eshrc=user/etc/eshrc /dev/ /proc/ /tmp/:0777 \
@@ -214,9 +214,17 @@ $(BUILD)/user/%.o: user/%.S
 	$(call msg,UAS,$<)
 	$(Q)$(CC) $(UCFLAGS) -D__ASSEMBLY__ -c $< -o $@
 
-$(BUILD)/user/bin/%: $(BUILD)/user/bin/%.o $(ULIB) user/user.ld
+# Programs link libc as an archive: each takes only the parts it uses (a
+# program without curses doesn't carry it).
+ULIBA := $(BUILD)/user/libc.a
+ULINK  = $(BUILD)/user/lib/crt0.o -Wl,--start-group $(ULIBA) -lgcc -Wl,--end-group
+$(ULIBA): $(ULIB)
+	$(call msg,AR,$@)
+	$(Q)rm -f $@ && $(CROSS)ar rcs $@ $(filter-out %/crt0.o,$(ULIB))
+
+$(BUILD)/user/bin/%: $(BUILD)/user/bin/%.o $(ULIB) $(ULIBA) user/user.ld
 	$(call msg,ULD,$@)
-	$(Q)$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ $< $(ULIB) -lgcc
+	$(Q)$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ $< $(ULINK)
 
 $(BUILD)/user/multi/%.o: user/bin/%.c
 	@mkdir -p $(dir $@)
@@ -225,9 +233,9 @@ $(BUILD)/user/multi/%.o: user/bin/%.c
 
 # A multi-file program links every object in its directory.
 define MULTI_RULE
-$(BUILD)/user/bin/$(1): $(patsubst user/bin/$(1)/%.c,$(BUILD)/user/multi/$(1)/%.o,$(wildcard user/bin/$(1)/*.c)) $(ULIB) user/user.ld
+$(BUILD)/user/bin/$(1): $(patsubst user/bin/$(1)/%.c,$(BUILD)/user/multi/$(1)/%.o,$(wildcard user/bin/$(1)/*.c)) $(ULIB) $(ULIBA) user/user.ld
 	$$(call msg,ULD,$$@)
-	$$(Q)$$(CC) $$(UCFLAGS) -nostdlib -static -T user/user.ld -o $$@ $$(filter %.o,$$^) -lgcc
+	$$(Q)$$(CC) $$(UCFLAGS) -nostdlib -static -T user/user.ld -o $$@ $$(filter-out $$(ULIB),$$(filter %.o,$$^)) $$(ULINK)
 endef
 $(foreach p,$(UMULTI),$(eval $(call MULTI_RULE,$(p))))
 
@@ -267,9 +275,9 @@ $(BUILD)/tcc/tcc.o: $(TCC_DEPS)
 	$(call msg,UCC,$(TCC_SRC)/tcc.c)
 	$(Q)$(CC) $(UCFLAGS) -w -DONE_SOURCE=1 -Iports/tcc -c $(TCC_SRC)/tcc.c -o $@
 
-$(BUILD)/user/bin/tcc: $(BUILD)/tcc/tcc.o $(ULIB) user/user.ld
+$(BUILD)/user/bin/tcc: $(BUILD)/tcc/tcc.o $(ULIB) $(ULIBA) user/user.ld
 	$(call msg,ULD,$@)
-	$(Q)$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ $< $(ULIB) -lgcc
+	$(Q)$(CC) $(UCFLAGS) -nostdlib -static -T user/user.ld -o $@ $< $(ULINK)
 
 $(BUILD)/tcc/rt/%.o: $(TCC_SRC)/lib/%.c $(XTCC)
 	@mkdir -p $(dir $@)

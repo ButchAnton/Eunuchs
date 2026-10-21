@@ -96,6 +96,8 @@ int uvm_fault(struct mm *mm, uintptr_t addr, int access);  /* takes mm->lock */
 /* Reclaim: unmap up to `want` pages of mm that were not used since the last
    pass (caller holds mm->lock); returns pages unmapped. */
 unsigned long uvm_reclaim(struct mm *mm, unsigned long want, unsigned long *scanned);
+int uvm_mincore(struct mm *mm, uintptr_t start, size_t pages, u8 *out);   /* holding mm->lock */
+int uvm_swapin_all(struct mm *mm);                                       /* holding mm->lock */
 /* msync: write-protect and write back the shared file pages in a range. */
 int uvm_msync(struct mm *mm, uintptr_t start, uintptr_t end);
 /* mmap: a free range of len bytes in the mmap area (with a guard page). */

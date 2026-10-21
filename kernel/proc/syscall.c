@@ -194,6 +194,60 @@ long do_msync(const u64 *a)
     return uvm_msync(current_proc()->mm, a[0], a[0] + PAGE_ALIGN(a[1]));
 }
 
+/* mincore(addr, len, vec): vec[i] bit 0 set if page i is in memory. */
+long do_mincore(const u64 *a)
+{
+    uintptr_t start = a[0], uvec = a[2];
+    if ((start & (PAGE_SIZE - 1)) || !user_range_ok(start, a[1]))
+        return -EINVAL;
+    size_t pages = PAGE_ALIGN(a[1]) / PAGE_SIZE;
+    struct mm *mm = current_proc()->mm;
+    u8 vec[256];
+    for (size_t done = 0; done < pages;) {
+        size_t n = MIN(pages - done, sizeof(vec));
+        mutex_lock(&mm->lock);
+        int r = uvm_mincore(mm, start + done * PAGE_SIZE, n, vec);
+        mutex_unlock(&mm->lock);
+        if (r)
+            return r;
+        if (copy_to_user(uvec + done, vec, n))
+            return -EFAULT;
+        done += n;
+    }
+    return 0;
+}
+
+/* swapon(name, flags) / swapoff(name): a volume ("/dev/disk0p5", "disk0p5"
+   or its GPT name, "swap"). Root only. swapoff brings every swapped page
+   back first, so it fails with ENOMEM when they don't fit. */
+long do_swapon(const u64 *a)
+{
+    char name[64];
+    if (current_proc()->euid != 0)
+        return -EPERM;
+    long r = strncpy_from_user(name, a[0], sizeof(name));
+    if (r < 0)
+        return r;
+    int v = swap_find_volume(name);
+    return v < 0 ? v : swap_on(v);
+}
+
+long do_swapoff(const u64 *a)
+{
+    char name[64];
+    if (current_proc()->euid != 0)
+        return -EPERM;
+    long r = strncpy_from_user(name, a[0], sizeof(name));
+    if (r < 0)
+        return r;
+    int v = swap_find_volume(name);
+    if (v < 0)
+        return v;
+    if (v != swap_volume())
+        return -EINVAL;                     /* not the one in use */
+    return swap_off();
+}
+
 long do_sleep_ms(const u64 *a)
 {
     sleep_ms(a[0]);

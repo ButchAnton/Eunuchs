@@ -629,7 +629,7 @@ The targets:
 - `make flamegraph` and `euprof.py report|folded|svg PROFILE [OUT] [--kernel --user-dir --no-idle --cpu --pid --kernel-only]`;
 - `make debug`/`gdb`, `make record`/`replay`/`replay-debug`/`replay-gdb`/`replay-check`, `make disasm`, `make qemu-log`.
 
-**GDB commands:** `eu-help eu-dmesg eu-log eu-tf eu-platform eu-vm eu-meminfo eu-page eu-slab eu-ps eu-cpus eu-lockdep eu-bt eu-trace eu-trace-dump eu-procs eu-bcache eu-files eu-net eu-profile-dump`.
+**GDB commands:** `eu-help eu-dmesg eu-log eu-tf eu-platform eu-vm eu-meminfo eu-page eu-mm eu-swap eu-pagecache eu-slab eu-ps eu-cpus eu-lockdep eu-bt eu-trace eu-trace-dump eu-procs eu-bcache eu-files eu-net eu-profile-dump`.
 
 ## Debugging and observability
 

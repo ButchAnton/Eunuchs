@@ -504,6 +504,15 @@ The cache holds one reference on every page in it, and anyone using a page (a PT
 
 Swap space is the partition named `swap` (`SWAP_MB`, 128 MiB by default; GPT type `GPT_TYPE_SWAP`, GUID `57535545-5041-4e55-8000-45554e554348`). Page 0 is a header (magic `EUSWAP01`, version 1, `npages`, a label); pages 1..`npages`−1 are page-sized slots. `swap_init` finds the volume by name, checks the header, and logs `swap: disk0p5, 128 MiB (N slots)`; `noswap` on the command line turns swap off.
 
+**`swapon` and `swapoff`** (system calls 224 and 225, root only). `swap_find_volume` accepts `/dev/NAME`, a volume name (`disk0p5`) or a GPT name (`swap`); `swap_on` reads and validates the header and starts using the volume. `swapoff` runs `swap_off` (`reclaim.c`):
+
+1. `swap_drain(true)`: `swap_enabled()` becomes false, so no new slots are given out and `uvm_reclaim` leaves anonymous pages alone.
+2. Each process with swapped-out pages (found by `lock_next_swapped`: `mutex_trylock` of its `mm->lock` under `proc_lock`, else wait 1 ms and look again) gets `uvm_swapin_all`, which reads its pages back, allocating under the mm lock.
+3. Under `reclaim_lock`, `pc_drop_swap_cache`: swap-cache pages still mapped become ordinary anonymous pages.
+4. If no slot is in use, `swap_retire`; otherwise it tries again, up to 4 rounds, then fails with `EBUSY`.
+
+If the pages do not fit (`ENOMEM`) or a read fails (`EIO`), swap stays on and the kernel logs `swapoff: out of memory bringing pages back; swap stays on`.
+
 Nothing about slots is on disk: swap starts empty every boot. In memory each slot has a `u16` count: the PTEs holding it (a page swapped out after `fork` keeps one slot shared by both processes) plus one while its page is in the swap cache. A slot is free at 0. `swap_alloc`, `swap_dup` and `swap_free` maintain the counts; `swap_write`/`swap_read` do the I/O through `blk_rw`.
 
 ### Reclaim and kswapd (`reclaim.c`)
@@ -522,6 +531,11 @@ Kernel allocations (`alloc_pages`, `kmalloc`) do not reclaim; they rely on the r
 2. If that was not enough, `uvm_reclaim` visits the processes in turn (taking each `mm->lock` with `mutex_trylock`, under `proc_lock` so the mm cannot go away) from where it left off (`scan_va`). A PTE with `A` set loses it (a second chance). Otherwise the page is unmapped: a file page just goes (the file has it); an anonymous page gets a swap slot, goes into the swap cache dirty, and its PTE becomes a swap PTE (`swapped++`). Page references are dropped only after `tlb_shootdown`, since the process may be running on another CPU. Pages unmapped from their last process are freed by the next `pc_shrink`.
 
 kswapd (a kernel thread, visible in `ps`) wakes when an allocation sees free memory below low, and at least once a second; it reclaims up to high, and every 5 s writes dirty file pages back.
+
+### mincore and drop_caches
+
+- **`mincore(addr, len, vec)`** (system call 232, `uvm_mincore`): `vec[i]` bit 0 is set if page `i` is mapped, or, in a file mapping, if the file's page is in the page cache. An unaligned `addr` is `EINVAL`; a range with unmapped pages is `ENOMEM`. `fincore` uses it on a file it maps without touching.
+- **`/proc/drop_caches`** (mode 0644): reading it says what could be dropped; writing anything calls `pc_drop_all`, which writes dirty pages back, then clears the second-chance marks and runs `pc_shrink` under `reclaim_lock` until nothing more goes (pages still mapped stay). It is one of procfs's writable root files ([06](06-filesystems.md#procfs)).
 
 ### ASIDs (`vmm.c: asid_init`, `vm_switch`)
 
@@ -622,7 +636,7 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 
 ### Page cache, swap and reclaim (`mm.h`)
 
-`user_page_alloc(zero)`, `reclaim(want, direct)`, `kswapd_wake`, `reclaim_init`; `pc_get`, `pc_get_spare`, `pc_find`, `pc_insert`, `pc_remove`, `pc_update`, `pc_truncate`, `pc_drop_inode`, `pc_writeback`, `pc_shrink`, `pc_stats`; `swap_init`, `swap_alloc`, `swap_dup`, `swap_free`, `swap_read`, `swap_write`; `vmc` (the counters).
+`user_page_alloc(zero)`, `reclaim(want, direct)`, `swap_off`, `pc_drop_all`, `pc_drop_swap_cache`, `uvm_swapin_all`, `uvm_mincore`, `kswapd_wake`, `reclaim_init`; `pc_get`, `pc_get_spare`, `pc_find`, `pc_insert`, `pc_remove`, `pc_update`, `pc_truncate`, `pc_drop_inode`, `pc_writeback`, `pc_shrink`, `pc_stats`; `swap_init`, `swap_find_volume`, `swap_on`, `swap_drain`, `swap_retire`, `swap_enabled`, `swap_alloc`, `swap_dup`, `swap_free`, `swap_read`, `swap_write`; `vmc` (the counters).
 
 ### Fault-tolerant access (`safe.h`)
 
@@ -630,7 +644,7 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 
 ### System calls built on this subsystem
 
-`brk`, `mmap`, `munmap`, `mprotect` and `msync` are in `kernel/proc/syscall.c`, all under `mm->lock`. `mmap` maps anonymous memory (`MAP_PRIVATE` only: shared anonymous memory is `EINVAL`) or a file (`MAP_SHARED` or `MAP_PRIVATE`): a non-regular file is `ENODEV`, a shared writable mapping of a file not open for writing `EACCES`, an unaligned offset `EINVAL`; W^X is enforced. `MAP_FIXED` replaces what is at the address; otherwise the address is a hint, used if the range is free, else `uvm_find_gap` chooses. `msync(227)` takes `MS_ASYNC`, `MS_SYNC` and `MS_INVALIDATE` (`uvm_msync` writes dirty shared pages back in every case). `fork` and `execve` (`kernel/proc/proc.c`) use `mm_fork`, `mm_create`, `uvm_write`, `vm_activate` and `mm_destroy`.
+`brk`, `mmap`, `munmap`, `mprotect`, `msync`, `mincore` (232), `swapon` (224) and `swapoff` (225) are in `kernel/proc/syscall.c`; the address-space calls run under `mm->lock` (`mincore` 256 pages at a time). `mmap` maps anonymous memory (`MAP_PRIVATE` only: shared anonymous memory is `EINVAL`) or a file (`MAP_SHARED` or `MAP_PRIVATE`): a non-regular file is `ENODEV`, a shared writable mapping of a file not open for writing `EACCES`, an unaligned offset `EINVAL`; W^X is enforced. `MAP_FIXED` replaces what is at the address; otherwise the address is a hint, used if the range is free, else `uvm_find_gap` chooses. `msync(227)` takes `MS_ASYNC`, `MS_SYNC` and `MS_INVALIDATE` (`uvm_msync` writes dirty shared pages back in every case). `fork` and `execve` (`kernel/proc/proc.c`) use `mm_fork`, `mm_create`, `uvm_write`, `vm_activate` and `mm_destroy`.
 
 ### Boot options
 
@@ -650,8 +664,10 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 | `/proc/meminfo` | `pmm_print` and `vm_memory_print`: page-cache, swap-cache and swap lines (the `free` command shows them too); RAM, total/reserved/in-use/free pages, alloc/free/failure/corruption counts, free blocks by order, kernel stack counts, reserved regions |
 | `/proc/slabinfo` | `slab_print`: per-cache object size, slot size, objects per slab, active, total, slabs, allocs, frees, peak; large-kmalloc totals |
 | `/proc/<pid>/maps` | `mm_print`: VMAs with prot, kind, resident and swapped pages, shared COW pages, `(N dirty)`, and `shared+0xOFF /path` or `private+0xOFF /path` for file mappings; a footer with rss, swapped and major faults, plus faults, COW copies and brk |
-| `/proc/vmstat` | `vm_counters_print`: `faults`, `major_faults`, `cache_hits`, `cache_misses`, `swap_outs`, `swap_ins`, `swap_out_skipped`, `writebacks`, `scanned`, `unmapped`, `freed`, `kswapd_runs`, `direct_reclaims`, `alloc_stalls`, `oom`, and the free-memory marks |
+| `/proc/vmstat` | `vm_counters_print` (also `total` and `reserved` pages): `faults`, `major_faults`, `cache_hits`, `cache_misses`, `swap_outs`, `swap_ins`, `swap_out_skipped`, `writebacks`, `scanned`, `unmapped`, `freed`, `kswapd_runs`, `direct_reclaims`, `alloc_stalls`, `oom`, and the free-memory marks |
 | `/proc/swaps` | the swap volume, size, used and peak |
+| `/proc/stat` | `uptime_ms`, `cpus`, `cpuN idle_ms X switches Y` per CPU, `procs`, `procs_running`, `procs_blocked` (what `top` and `vmstat` use) |
+| `/proc/drop_caches` | Writable by root: drop the clean, unmapped page cache (see above) |
 | `/proc/pagecache` | cached pages by file (and the swap cache), dirty and mapped counts |
 | `/proc/asids` | per CPU: ASID switches with and without a flush |
 
@@ -681,9 +697,9 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 - `slab leaks` to see who holds the memory. It groups live objects by allocation site and cache, sorted by bytes, with at most 64 sites.
 - `page <addr>` to get a frame's history.
 - `vm <pid>` for a process's map.
-- **Paging**: `/proc/vmstat` (or `vmstat` in the monitor) for faults, major faults, cache hits, swap-outs and swap-ins, reclaim scans and `oom`; `/proc/meminfo` and `free` for page-cache, swap-cache and swap totals; `/proc/swaps`, `/proc/pagecache`, `/proc/asids`; the swap column and `(N dirty)` of `/proc/<pid>/maps`; `kswapd` and threads waiting in reclaim in `ps`. `memhog MB` (`user/bin/memhog.c`) fills that much anonymous memory, forks, checks every word in both processes, and prints the paging counters that changed: the quick way to watch swap work (boot with `MEM=64M` to force it).
+- **Paging**: the `top`, `vmstat`, `free`, `pmap`, `fincore` and `swapon` commands ([10](10-user-space.md#the-memory-tools-top-vmstat-free-pmap-fincore-dropcache-swapon)); `/proc/vmstat` (or `vmstat` in the monitor) for faults, major faults, cache hits, swap-outs and swap-ins, reclaim scans and `oom`; `/proc/meminfo` and `free` for page-cache, swap-cache and swap totals; `/proc/swaps`, `/proc/pagecache`, `/proc/asids`; the swap column and `(N dirty)` of `/proc/<pid>/maps`; `kswapd` and threads waiting in reclaim in `ps`. `memhog MB` (`user/bin/memhog.c`) fills that much anonymous memory, forks, checks every word in both processes, and prints the paging counters that changed: the quick way to watch swap work (boot with `MEM=64M` to force it).
 
-**GDB** (`tools/gdb/eunuchs.py`) has `eu-vm [va]`, `eu-meminfo`, `eu-page <addr>` and `eu-slab`. They read kernel memory directly, so they work even when the kernel is wedged.
+**GDB** (`tools/gdb/eunuchs.py`) has `eu-vm [va]`, `eu-meminfo`, `eu-page <addr>` (with the cache flags, the cache owner, inode and index, or the swap slot), `eu-slab`, `eu-mm PID` (VMAs with resident, swapped and COW pages, file mappings, the mm's counters, id, `tlb_gen` and lock holder), `eu-swap` (the volume, slots used and peak, draining, and slots by reference count) and `eu-pagecache` (file and swap-cache pages, dirty and in use, the top 20 files, all the `vmc` counters). The static names they read are `pc_lru`, `swap_vol`, `slot_counts`, `swap_nslots`, `swap_nused`, `swap_peak` and `swap_draining`. They read kernel memory directly, so they work even when the kernel is wedged.
 
 **Tests:**
 
@@ -705,7 +721,9 @@ Use the `*_site` variants in wrapper functions and pass `__builtin_return_addres
 | `free_pages of pa … which is reserved memory` / `not the head of its block` / `still has N references` / `order mismatch` | Wrong argument to `free_pages`/`page_free` |
 | `page_put: refcount of pa … went negative` | Unbalanced `page_put` |
 | `out of memory for user pages: N pages free, nothing left to reclaim` | Memory and swap are full; the faulting process gets SIGBUS (`oom` in `/proc/vmstat` counts these) |
-| `swap: disk0p5, M MiB (N slots)` / `swap: no swap partition` / `has no valid swap header; not used` / `swap: off (noswap)` | Swap at boot |
+| `swap: disk0p5, M MiB (N slots)` / `swap: no swap partition` / `has no valid swap header; not used` / `swap: off (noswap)` | Swap at boot (also from `swapon`) |
+| `swapoff: out of memory bringing pages back; swap stays on` | `swapoff` failed with `ENOMEM` or `EIO` |
+| `drop_caches: freed N pages (N KiB)` (debug level) | A write to `/proc/drop_caches` |
 | `reclaim: free memory marks min …, low …, high … pages; kswapd started` | Reclaim at boot |
 | `ASIDs: 16 bits; 15 per CPU` / `ASIDs off (noasid)` | ASIDs at boot |
 | `heap overflow in kmalloc-N object P (R bytes requested, allocated at S): bytes +a..+b written past the end, detected at kfree` | Overflow past the requested size (including into size-class slack) |
@@ -753,6 +771,7 @@ Kernel faults land in `panic_trap` with a `vm_fault_hint` diagnosis, such as "po
 **User memory:**
 
 - **No shared anonymous memory** (`MAP_SHARED|MAP_ANONYMOUS` is `EINVAL`), **no swap readahead** (each swap-in reads one page), **no OOM killer**: when memory and swap are exhausted, the faulting process gets SIGBUS.
+- **One swap volume, and `swapoff` needs room.** Only one volume is used at a time (`swapon` of a second is `EBUSY`). `swapoff` must bring every swapped page back into memory, so with more swapped out than fits it fails (`ENOMEM`) and swap stays on: on a 64 MiB machine, 80 MiB in use fails cleanly, 30 MiB comes back. Paging in for `swapoff` runs one page at a time, in the caller's thread.
 - **Swap capacity with `fork`.** A page read back from swap while another process still holds its slot takes both a page and the slot. `memhog 160` (which forks) on 128 MiB of RAM with 128 MiB of swap fills swap completely this way.
 - **Truncation and mappings.** `pc_truncate` detaches cached pages from the cache but not from the mappings that hold them, so a mapping beyond the new end of file keeps the old data instead of getting SIGBUS.
 - **exec does not use the page cache**: programs are still read whole with `vfs_read_all` into kernel memory, and text is not shared between processes running the same program.

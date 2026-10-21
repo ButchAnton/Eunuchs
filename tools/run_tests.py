@@ -329,7 +329,31 @@ def main():
         ("memhog 80", "memhog: ok", True, 180),
         ("cat /proc/swaps", "disk0p5"),
         ("grep oom /proc/vmstat", "oom 0"),
+        # swapoff: refused while the pages in swap can't fit; then, with
+        # them gone, swap off and on again
+        ("memhog -q -h 10 70 &", "checking in 10 s", False, 60),
+        ("swapoff", "Out of memory"),
+        (None, "memhog: ok", False, 180),
+        ("swapoff; echo rc=$?", "rc=0"),
+        ("swapon", "no swap space in use"),
+        ("swapon -a", "disk0p5"),
     ], extra=["-m", "64M"])
+
+    # The memory tools (curses top too: q quits it)
+    interactive("vm tools", [
+        ("top -b -n 1", "COMMAND"),
+        ("top", "COMMAND", False),
+        (b"q", None),
+        ("free -h", "Swap:"),
+        ("vmstat 1 2", "swpd"),
+        ("vmstat -s", "asid_bits"),
+        ("ps v", "MAJFLT"),
+        ("pmap 1", "total KiB"),
+        ("cat /bin/tcc > /dev/null; fincore /bin/tcc", "/bin/tcc"),
+        ("dropcache", "dropped"),
+        ("fincore -v /bin/tcc", "[....."),
+        ("swapon", "disk0p5"),
+    ])
 
     # The shell, driven like a user at the console.
     interactive("interactive shell", [

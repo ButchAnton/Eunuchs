@@ -566,15 +566,17 @@ Reads (`proc_read`) and seeks then work on this snapshot, so a reader always see
 
 **Generators:**
 
-- **Global files**: the same print functions the monitor uses (`pmm_print`, `bcache_print`, `vfs_mounts_print`, ...). `uptime` and `trace` (the last 200 events) are local.
+- **Global files**: the same print functions the monitor uses (`pmm_print`, `bcache_print`, `vfs_mounts_print`, ...). `uptime`, `trace` (the last 200 events), `stat` (`uptime_ms`, `cpus`, a `cpuN idle_ms X switches Y` line per CPU, `procs`, `procs_running`, `procs_blocked`) and `drop_caches` are local.
 - **`/proc/net/*`**: generated with the network mutex `net_lock` held (`NET_GEN`).
 - **`/proc/<pid>/*`** (`gen_pid`): generated with `proc_lock` held, so the process cannot be freed meanwhile.
-  - `status`: pid, ppid, name, state, tid, waiting, switches, syscalls, RSS, ids, umask, process group, session, and signal masks plus caught and ignored signals; then the fields `ps` needs: `ustate` (the Unix state letter: R, S, D for an uninterruptible sleep, T, t for a tracing stop, Z), `start_ms` (start time, ms since boot), `cpu_ms` (CPU time including the current slice, `thread_cpu_ticks`), `vsz_kib` (sum of the VMAs), `tty` (`console` or `-`), `tpgid` (the terminal's foreground group), `psr` (the CPU it last ran on).
+  - `status`: pid, ppid, name, state, tid, waiting, switches, syscalls, RSS, ids, umask, process group, session, and signal masks plus caught and ignored signals; then the fields `ps` needs: `ustate` (the Unix state letter: R, S, D for an uninterruptible sleep, T, t for a tracing stop, Z), `start_ms` (start time, ms since boot), `cpu_ms` (CPU time including the current slice, `thread_cpu_ticks`), `vsz_kib` (sum of the VMAs), `tty` (`console` or `-`), `tpgid` (the terminal's foreground group), `psr` (the CPU it last ran on), and the memory fields `swap_kib`, `min_flt`, `maj_flt` and `cow` (pages copied on write).
   - `maps`: `mm_print`.
   - `fds`: first a `cwd <path>` line, then `files_print_fds`. The cwd path needs sleeping I/O, so it is resolved *before* taking `proc_lock`, using a reference taken with `idup`.
   - `stack`: the kernel backtrace (`thread_backtrace`).
   - `ustack`: the user backtrace from the saved trap frame.
   - `cmdline`: the arguments, NUL-separated (`proc.cmdline`, set by `do_exec`).
+
+**Writable files.** A root file named in the `root_writers` table gets mode 0644 and `proc_rw_ops` (which adds `proc_write`); the others are 0444 with `proc_file_ops`, and a write is `EACCES`. `proc_write` copies at most 63 bytes and calls the file's writer; permission is the usual mode check, so only root can write. The one writable file is `drop_caches`: reading says what could be dropped, writing anything drops the clean, unused page cache (`pc_drop_all`, [02](02-memory.md#mincore-and-drop_caches)) and logs the count at debug level.
 
 **Names** (`pr_lookup`):
 - `self` maps to the caller's pid directory.
@@ -784,7 +786,7 @@ Numbers are Linux RISC-V (`lib/include/uapi/syscall.h`).
 
 - **`/mnt/host`**: the Mac's directory under `make run` (9pfs).
 - **`/dev`**: `console`, `tty`, `tty0`, `null`, `zero`, `kmsg`, `disk0`, and `disk1` when a second disk is attached.
-- **`/proc`**: `meminfo`, `slabinfo`, `interrupts`, `threads`, `sched`, `procs`, `mounts`, `bcache`, `blk`, `icache`, `trace`, `virtio`, `uptime`, `pipes`, `tty`, `cpus`, `lockdep`, `profile`, `9p`.
+- **`/proc`**: `meminfo`, `slabinfo`, `interrupts`, `threads`, `sched`, `procs`, `mounts`, `bcache`, `blk`, `icache`, `trace`, `virtio`, `uptime`, `pipes`, `tty`, `cpus`, `lockdep`, `profile`, `9p`, `vmstat`, `swaps`, `pagecache`, `asids`, `stat`, `drop_caches` (the only writable one).
 - **`/proc/net`**: `dev`, `arp`, `tcp`, `udp`, `stats`.
 - **Per process**: `/proc/<pid>/{status,maps,fds,stack,ustack,cmdline}` and `/proc/self`.
 

@@ -281,7 +281,8 @@ class EuPage(EuCommand):
     def __init__(self):
         super().__init__("eu-page", "struct page for a pa or va")
 
-    FLAGS = ["free", "reserved", "slab", "large", "pagetable", "tail"]
+    FLAGS = ["free", "reserved", "slab", "large", "pagetable", "tail", "cache", "swapcache", "dirty",
+             "referenced", "user"]
 
     def invoke(self, arg, from_tty):
         addr = _addr(arg)
@@ -299,6 +300,13 @@ class EuPage(EuCommand):
         for f in ("alloc_site", "free_site"):
             site = int(pg[f])
             gdb.write("  %-10s %s\n" % (f, _symbolize(site) if site else "-"))
+        if flags & (1 << 6):
+            c = pg["cache"]
+            sb = c["owner"].cast(gdb.lookup_type("struct super_block").pointer())
+            gdb.write("  file page: %s inode %d index %d, %d writable mappings\n" % (
+                sb["path"].string(), int(c["ino"]), int(c["index"]), int(c["wmap"])))
+        elif flags & (1 << 7):
+            gdb.write("  swap cache: slot %d\n" % int(pg["cache"]["index"]))
 
 
 class EuSlab(EuCommand):
@@ -627,6 +635,149 @@ def _ip(v):
     return "%d.%d.%d.%d" % (v >> 24, (v >> 16) & 255, (v >> 8) & 255, v & 255)
 
 
+PTE_V, PTE_W, PTE_SWAP, PTE_COW = 1, 4, 1 << 9, 1 << 8
+
+
+def _user_ptes(root, start, end):
+    """(va, pte) for every PTE in use (present or swapped) in [start, end)."""
+    va = start
+    while va < end:
+        l2 = _u64(root + ((va >> 30) & 0x1ff) * 8)
+        if not l2 & PTE_V:
+            va = (va & ~((1 << 30) - 1)) + (1 << 30)
+            continue
+        t1 = KERNEL_BASE + ((l2 >> 10) << 12)
+        l1 = _u64(t1 + ((va >> 21) & 0x1ff) * 8)
+        if not l1 & PTE_V:
+            va = (va & ~((1 << 21) - 1)) + (1 << 21)
+            continue
+        t0 = KERNEL_BASE + ((l1 >> 10) << 12)
+        table = _read(t0, 4096)
+        i = (va >> 12) & 0x1ff
+        while i < 512 and va < end:
+            pte = int.from_bytes(table[i * 8:i * 8 + 8], "little")
+            if pte:
+                yield va, pte
+            i += 1
+            va += 4096
+
+
+def _proc(pid):
+    for p in _list_entries("all_procs", "struct proc", "all_node"):
+        if int(p["pid"]) == pid:
+            return p
+    return None
+
+
+VMA_KINDS = ["elf", "heap", "stack", "anon", "file"]
+
+
+class EuMm(EuCommand):
+    """eu-mm PID: a process's address space: VMAs with resident, swapped and
+    COW pages (walking its page table), and the mm's counters and lock."""
+
+    def __init__(self):
+        super().__init__("eu-mm", "address space of a process (VMAs, pages, swap)")
+
+    def invoke(self, arg, from_tty):
+        p = _proc(int(arg))
+        if p is None or not int(p["mm"]):
+            gdb.write("no process %s with an address space\n" % arg)
+            return
+        mm = p["mm"].dereference()
+        root = int(mm["pt"])
+        vt = gdb.lookup_type("struct vma")
+        off = [f.bitpos // 8 for f in vt.fields() if f.name == "node"][0]
+        head = mm["vmas"]
+        node, head_addr = head["next"], int(head.address)
+        gdb.write("  %-33s %-4s %-6s %6s %6s %5s  %s\n" % ("range", "prot", "kind", "res", "swap",
+                                                         "cow", "name"))
+        while int(node) != head_addr:
+            v = gdb.Value(int(node) - off).cast(vt.pointer()).dereference()
+            node = node["next"]
+            start, end = int(v["start"]), int(v["end"])
+            res = swp = cow = 0
+            for _, pte in _user_ptes(root, start, end):
+                if pte & PTE_V:
+                    res += 1
+                    cow += bool(pte & PTE_COW)
+                elif pte & PTE_SWAP:
+                    swp += 1
+            prot = int(v["prot"])
+            name = v["name"].string()
+            if int(v["file"]):
+                name += "  %s+%#x %s" % ("shared" if int(v["shared"]) else "private",
+                                         int(v["pgoff"]) * 4096, v["file"]["path"].string())
+            gdb.write("  %016x-%016x %s%s%s  %-6s %6d %6d %5d  %s\n" % (
+                start, end, "r" if prot & 1 else "-", "w" if prot & 2 else "-",
+                "x" if prot & 4 else "-", VMA_KINDS[int(v["kind"])], res, swp, cow, name))
+        owner = mm["lock"]["owner"]
+        gdb.write("  rss %d, swapped %d, faults %d (%d major), COW copies %d; id %d tlb_gen %d; "
+                  "lock %s\n" % (int(mm["rss"]), int(mm["swapped"]), int(mm["faults"]),
+                                 int(mm["major_faults"]), int(mm["cow_copies"]), int(mm["id"]),
+                                 int(mm["tlb_gen"]),
+                                 ("held by %d (%s)" % (int(owner["tid"]), owner["name"].string()))
+                                 if int(owner) else "free"))
+
+
+class EuSwap(EuCommand):
+    """eu-swap: the swap space: volume, slots used, and how the slot counts are spread."""
+
+    def __init__(self):
+        super().__init__("eu-swap", "swap slots in use")
+
+    def invoke(self, arg, from_tty):
+        vol = int(_static("swap_vol"))
+        if vol < 0:
+            gdb.write("  no swap space in use\n")
+            return
+        n = int(_static("swap_nslots"))
+        counts = int(_static("slot_counts"))
+        raw = _read(counts, n * 2)
+        hist = {}
+        for i in range(1, n):
+            c = int.from_bytes(raw[i * 2:i * 2 + 2], "little")
+            if c:
+                hist[c] = hist.get(c, 0) + 1
+        gdb.write("  volume %d, %d slots, %d used (peak %d)%s\n" % (
+            vol, n - 1, int(_static("swap_nused")), int(_static("swap_peak")),
+            ", draining (swapoff)" if int(_static("swap_draining")) else ""))
+        gdb.write("  slots by reference count: %s\n" % (
+            "  ".join("%d: %d" % kv for kv in sorted(hist.items())) or "none"))
+
+
+class EuPagecache(EuCommand):
+    """eu-pagecache: the page cache and swap cache: totals, and pages per file."""
+
+    def __init__(self):
+        super().__init__("eu-pagecache", "page cache and swap cache contents")
+
+    def invoke(self, arg, from_tty):
+        swap_owner = int(_static("swap_owner").address)
+        files, swap, dirty, mapped = {}, 0, 0, 0
+        for pg in _list_entries("pc_lru", "struct page", "list"):
+            flags = int(pg["flags"])
+            dirty += bool(flags & (1 << 8))
+            mapped += int(pg["refcount"]) > 1
+            owner = int(pg["cache"]["owner"])
+            if owner == swap_owner:
+                swap += 1
+                continue
+            key = (owner, int(pg["cache"]["ino"]))
+            f = files.setdefault(key, [0, 0])
+            f[0] += 1
+            f[1] += bool(flags & (1 << 8))
+        gdb.write("  %d file pages, %d swap-cache pages; %d dirty, %d in use\n" % (
+            sum(f[0] for f in files.values()), swap, dirty, mapped))
+        sbt = gdb.lookup_type("struct super_block").pointer()
+        for (owner, ino), (n, d) in sorted(files.items(), key=lambda kv: -kv[1][0])[:20]:
+            sb = gdb.Value(owner).cast(sbt)
+            gdb.write("    %-10s inode %6d  %5d pages  %4d dirty\n" % (sb["path"].string(), ino, n, d))
+        vmc = _static("vmc")
+        gdb.write("  counters: " + ", ".join("%s %d" % (f.name, int(vmc[f.name]))
+                                             for f in vmc.type.fields()) + "\n")
+
+
 def _list_entries(head_name, type_name, field):
     head = _static(head_name)
     t = gdb.lookup_type(type_name)
@@ -673,7 +824,7 @@ class EuNet(EuCommand):
 
 for cls in (EuHelp, EuDmesg, EuLog, EuTrapFrame, EuPlatform, EuVm, EuMeminfo, EuPage, EuSlab,
             EuPs, EuCpus, EuLockdep, EuBt, EuTrace, EuTraceDump, EuProcs, EuBcache, EuFiles,
-            EuNet, EuProfileDump):
+            EuNet, EuProfileDump, EuMm, EuSwap, EuPagecache):
     cls()
 
 # Stop in the debugger whenever the kernel panics or enters its monitor.

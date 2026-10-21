@@ -484,8 +484,11 @@ ABI: `ecall` with `a7` = number, `a0`–`a5` = arguments; result in `a0`, `-errn
 | 220 | `fork` | `kernel/proc/syscall.c: do_fork` → `proc.c: sys_fork` | No arguments (Linux 220 is `clone`). Child gets `a0 = 0`. |
 | 221 | `execve` | `kernel/proc/syscall.c: do_execve` → `proc.c: sys_execve` | On success returns `argc` into the new image's `a0`. |
 | 222 | `mmap` | `kernel/proc/syscall.c: do_mmap` | Anonymous (`MAP_PRIVATE`) or file (`MAP_SHARED`/`MAP_PRIVATE`) mappings; `MAP_FIXED`, or the address as a hint, else the lowest free range; `PROT_WRITE\|PROT_EXEC` → `EACCES`; non-regular file → `ENODEV`; shared writable on a read-only fd → `EACCES`; unaligned offset or shared anonymous → `EINVAL`. See [02](02-memory.md). |
+| 224 | `swapon` | `kernel/proc/syscall.c: do_swapon` → `swap.c: swap_find_volume`, `swap_on` | Linux's number; the argument names a volume, not a swap file (`sys/swap.h`). Root only (`EPERM`). The volume is `/dev/NAME`, a volume name or a GPT name; unknown → `ENODEV`, swap already on → `EBUSY`, no valid header → `EINVAL`. See [02](02-memory.md). |
+| 225 | `swapoff` | `kernel/proc/syscall.c: do_swapoff` → `reclaim.c: swap_off` | Root only. Not the volume in use → `EINVAL`. Brings every swapped page back first: `ENOMEM` or `EIO` if they cannot be (swap stays on), `EBUSY` if slots stay in use after 4 rounds. |
 | 226 | `mprotect` | `kernel/proc/syscall.c: do_mprotect` → `uvm.c: vma_protect` | Page-aligned start; the whole range must be mapped (`ENOMEM`); `PROT_WRITE\|PROT_EXEC` → `EACCES`; splits VMAs; `fence.i` on every hart when execute is added. |
 | 227 | `msync` | `kernel/proc/syscall.c: do_msync` → `uvm.c: uvm_msync` | Writes dirty shared file pages in the range back (`MS_ASYNC`, `MS_SYNC`, `MS_INVALIDATE`). |
+| 232 | `mincore` | `kernel/proc/syscall.c: do_mincore` → `uvm.c: uvm_mincore` | `vec[i]` bit 0: page mapped, or (file mapping) the file page cached. Unaligned or bad range → `EINVAL`; unmapped pages → `ENOMEM`. Done 256 pages at a time under `mm->lock`. |
 | 242 | `accept4` | `kernel/net/socket.c: do_accept4` | |
 | 260 | `wait4` | `kernel/proc/syscall.c: do_wait4` → `proc.c: sys_wait4` | `rusage` ignored; `-ERESTARTSYS` when interrupted. |
 | 500 | `sleep_ms` | `kernel/proc/syscall.c: do_sleep_ms` | Eunuchs-specific. `EINTR` if a signal is pending afterwards (not restarted). |

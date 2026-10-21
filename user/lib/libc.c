@@ -267,6 +267,9 @@ pid_t wait(int *st) { return waitpid(-1, st, 0); }
 int munmap(void *a, size_t n) { return ret(SC2(SYS_munmap, a, n)); }
 int mprotect(void *a, size_t n, int prot) { return ret(SC3(SYS_mprotect, a, n, prot)); }
 int msync(void *a, size_t n, int flags) { return ret(SC3(SYS_msync, a, n, flags)); }
+int mincore(void *a, size_t n, unsigned char *vec) { return ret(SC3(SYS_mincore, a, n, vec)); }
+int swapon(const char *vol, int flags) { return ret(SC2(SYS_swapon, vol, flags)); }
+int swapoff(const char *vol) { return ret(SC1(SYS_swapoff, vol)); }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
 {

@@ -95,6 +95,13 @@ def main():
     run("kernel", "rollback", img)
     check("rollback swaps them", slot("boot") == kern1 and slot("boot.old") == kern1 + b"x")
 
+    # a name that was installed as a hard link, now a file of its own: the
+    # file it linked to keeps its contents
+    run("install", img, "root", "/bin/", "/bin/base=" + v1, "/bin/other=@/bin/base")
+    run("install", img, "root", "/bin/", "/bin/base=" + v1, "/bin/other=" + v2)
+    check("a link that becomes a file leaves its target alone",
+          cat("/bin/base") == "version 1\n" and cat("/bin/other") == "version 2\n")
+
     # swap space: made by create, added to an existing image, left alone by fsck
     img3 = os.path.join(tmp, "s.img")
     run("create", img3, "root:8", "swap:4")

@@ -960,6 +960,66 @@ int uvm_poke(struct mm *mm, uintptr_t addr, const void *src, size_t n)
     return r;
 }
 
+/* ---- mincore, swapoff ---- */
+
+/*
+ * mincore: for each page of [start, start + pages pages), whether it is in
+ * memory: mapped here, or (for a file mapping) in the page cache. Caller
+ * holds mm->lock; the range must be mapped.
+ */
+int uvm_mincore(struct mm *mm, uintptr_t start, size_t pages, u8 *out)
+{
+    for (size_t i = 0; i < pages; i++) {
+        uintptr_t va = start + i * PAGE_SIZE;
+        struct vma *v = vma_find(mm, va);
+        if (!v)
+            return -ENOMEM;
+        pte_t *pte = vm_walk(mm->pt, va, false);
+        out[i] = 0;
+        if (pte && (*pte & PTE_V)) {
+            out[i] = 1;
+        } else if ((!pte || !*pte) && v->kind == VMA_FILE) {
+            struct inode *ip = v->file->ip;
+            struct page *pg = pc_find(ip->sb, ip->ino, v->pgoff + (va - v->start) / PAGE_SIZE);
+            if (pg) {
+                out[i] = 1;
+                page_put(pg);
+            }
+        }
+    }
+    return 0;
+}
+
+/* swapoff: bring every swapped-out page of mm back (caller holds mm->lock;
+   memory is allocated with it held: other processes give way). */
+int uvm_swapin_all(struct mm *mm)
+{
+    struct vma *v;
+    list_for_each_entry(v, &mm->vmas, node) {
+        pte_t *pte;
+        for_each_used(mm->pt, va, v->start, v->end, pte) {
+            if (!PTE_IS_SWAP(*pte))
+                continue;
+            struct fault_ctx ctx = { 0 };
+            int r;
+            while ((r = swap_in(mm, v, pte, va, FAULT_READ, &ctx.spare)) == -EAGAIN && ctx.read_slot) {
+                u32 slot = ctx.read_slot;
+                ctx.read_slot = 0;
+                if (ctx.held)
+                    page_put(ctx.held);
+                if (!(ctx.held = read_swap_slot(mm, slot, &r)))
+                    break;
+            }
+            if (ctx.held)
+                page_put(ctx.held);
+            if (r)
+                return r == -EAGAIN ? -ENOMEM : r;
+        }
+    }
+    __atomic_add_fetch(&mm->tlb_gen, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
 /* ---- reclaim, msync, mmap's address search ---- */
 
 /*

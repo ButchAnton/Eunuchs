@@ -3,8 +3,9 @@
  * opened (reads see one consistent snapshot). Uses the same print functions
  * as the debug monitor.
  *
- *   /proc/{meminfo,vmstat,swaps,pagecache,asids,slabinfo,interrupts,threads,sched,
+ *   /proc/{meminfo,vmstat,swaps,pagecache,asids,stat,slabinfo,interrupts,threads,sched,
  *          procs,mounts,bcache,blk,icache,trace,virtio,uptime,pipes,tty,cpus,lockdep}
+ *   /proc/drop_caches (root may write: drop unused cached pages)
  *   /proc/<pid>/{status,maps,fds,stack,ustack}      /proc/self -> current
  *   /proc/net/{dev,arp,tcp,udp,stats}
  *
@@ -65,6 +66,52 @@ static void gen_uptime(print_fn print)
 
 static void gen_trace(print_fn print) { trace_print(print, 200); }
 
+/* For top and vmstat: times in ms since boot, per CPU busy and idle, and
+   process counts (running: runnable or on a CPU; blocked: uninterruptible). */
+static void gen_stat(print_fn print)
+{
+    u64 tb = platform.timebase ? platform.timebase : 1;
+    print("uptime_ms %lu\ncpus %d\n", (unsigned long)(rdtime() * 1000 / tb), ncpus_online);
+    for (int i = 0; i < ncpus_online; i++) {
+        u64 idle = thread_cpu_ticks(cpus[i].idle) * 1000 / tb;
+        print("cpu%d idle_ms %lu switches %lu\n", i, (unsigned long)idle, (unsigned long)cpus[i].switches);
+    }
+    int procs = 0, running = 0, blocked = 0;
+    unsigned long flags = spin_lock_irqsave(&proc_lock);
+    struct proc *p;
+    list_for_each_entry(p, &all_procs, all_node) {
+        procs++;
+        struct thread *t = p->thread;
+        if (p->state == P_ZOMBIE || !t)
+            continue;
+        if (t->state == T_RUNNING || t->state == T_RUNNABLE)
+            running++;
+        else if (t->state == T_SLEEPING && !t->interruptible)
+            blocked++;
+    }
+    spin_unlock_irqrestore(&proc_lock, flags);
+    print("procs %d\nprocs_running %d\nprocs_blocked %d\n", procs, running, blocked);
+}
+
+/* /proc/drop_caches: reading says what could go; writing anything (root:
+   the file is 0644) writes dirty file pages back and frees every cached
+   page nobody maps. For measuring with a cold cache. */
+static void gen_drop_caches(print_fn print)
+{
+    u64 f, s, d, m;
+    pc_stats(&f, &s, &d, &m);
+    print("%lu cached pages (%lu dirty, %lu in use); write 1 here to drop the unused ones\n",
+          (unsigned long)(f + s), (unsigned long)d, (unsigned long)m);
+}
+
+static long write_drop_caches(const char *buf, size_t n)
+{
+    (void)buf;
+    unsigned long freed = pc_drop_all();
+    pr_debug("drop_caches: freed %lu pages (%lu KiB)\n", freed, freed * 4);
+    return (long)n;
+}
+
 static const struct {
     const char *name;
     void (*gen)(print_fn print);
@@ -92,6 +139,8 @@ static const struct {
     { "swaps", swap_print },
     { "pagecache", pc_print },
     { "asids", asid_print },
+    { "stat", gen_stat },
+    { "drop_caches", gen_drop_caches },
 };
 #define NROOT ARRAY_SIZE(root_files)
 
@@ -136,6 +185,10 @@ static void gen_pid_locked(struct proc *p, int which, print_fn print)
                   (unsigned long)t->switches);
         print("syscalls %lu\nrss_kib %lu\nstrace %d\n", (unsigned long)p->syscalls,
               (unsigned long)(p->mm ? p->mm->rss * 4 : 0), p->strace);
+        if (p->mm)
+            print("swap_kib %lu\nmin_flt %lu\nmaj_flt %lu\ncow %lu\n", (unsigned long)p->mm->swapped * 4,
+                  (unsigned long)(p->mm->faults - p->mm->major_faults), (unsigned long)p->mm->major_faults,
+                  (unsigned long)p->mm->cow_copies);
         print("uid %u euid %u gid %u egid %u umask %03o\n", p->uid, p->euid, p->gid, p->egid,
               p->umask);
         print("pgid %d\nsid %d\nstopped %d\nsig_pending %08x\nsig_blocked %08x\n", p->pgid,
@@ -255,7 +308,40 @@ static void proc_close(struct file *f)
     kfree(f->priv);
 }
 
+/* Root files that may also be written (mode 0644: by root). */
+static const struct {
+    const char *name;
+    long (*write)(const char *buf, size_t n);
+} root_writers[] = {
+    { "drop_caches", write_drop_caches },
+};
+
+static long (*writer(u32 ino))(const char *, size_t)
+{
+    if (ino < 2 || ino >= 2 + NROOT)
+        return NULL;
+    for (size_t i = 0; i < ARRAY_SIZE(root_writers); i++)
+        if (!strcmp(root_writers[i].name, root_files[ino - 2].name))
+            return root_writers[i].write;
+    return NULL;
+}
+
+static long proc_write(struct file *f, const void *buf, size_t n, bool user)
+{
+    long (*w)(const char *, size_t) = writer(f->ip->ino);
+    if (!w)
+        return -EACCES;
+    char k[64];
+    size_t c = MIN(n, sizeof(k) - 1);
+    if (user ? copy_from_user(k, (uintptr_t)buf, c) : (memcpy(k, buf, c), 0))
+        return -EFAULT;
+    k[c] = 0;
+    return w(k, n);
+}
+
 static const struct chr_ops proc_file_ops = { .open = proc_open, .read = proc_read, .close = proc_close };
+static const struct chr_ops proc_rw_ops = { .open = proc_open, .read = proc_read, .write = proc_write,
+                                            .close = proc_close };
 
 /* ---- the filesystem ---- */
 
@@ -273,8 +359,9 @@ static int pr_read_inode(struct inode *ip)
     }
     ip->type = I_FILE;
     ip->nlink = 1;
-    ip->mode = 0444;
-    ip->cops = &proc_file_ops;
+    bool rw = writer(ino) != NULL;
+    ip->mode = rw ? 0644 : 0444;
+    ip->cops = rw ? &proc_rw_ops : &proc_file_ops;
     return 0;
 }
 

@@ -2,7 +2,7 @@
  * eutils: one binary, many small tools, chosen by argv[0] (the disk image
  * has /bin/<tool> as hard links to it):
  *   echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env
- *   id true false yes kill date dmesg free sleep strace su dbg uname clear reboot poweroff
+ *   id true false yes kill date dmesg sleep strace su dbg uname clear reboot poweroff
  */
 #include <dirent.h>
 #include <errno.h>
@@ -518,8 +518,8 @@ int main(int argc, char **argv)
         printf("\033[H\033[2J");
         return 0;
     }
-    if (!strcmp(prog, "dmesg") || !strcmp(prog, "free")) {
-        const char *path = prog[0] == 'd' ? "/dev/kmsg" : "/proc/meminfo";
+    if (!strcmp(prog, "dmesg")) {
+        const char *path = "/dev/kmsg";
         int fd = open(path, O_RDONLY);
         char buf[1024];
         long n;

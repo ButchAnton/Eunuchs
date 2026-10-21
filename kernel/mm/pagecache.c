@@ -40,7 +40,7 @@ const char swap_owner;
 #define PC_HASH 4096
 static struct page *hash[PC_HASH];
 static spinlock_t pc_lock = SPINLOCK_INIT("pagecache");
-static LIST_HEAD(lru);                  /* coldest first */
+static LIST_HEAD(pc_lru);                  /* coldest first */
 static u64 nr_file, nr_swap;
 
 static unsigned hfn(const void *owner, u32 ino, u64 index)
@@ -110,7 +110,7 @@ struct page *pc_insert(struct page *pg, const void *owner, u32 ino, u64 index)
     unsigned h = hfn(owner, ino, index);
     pg->cache.hnext = hash[h];
     hash[h] = pg;
-    list_add_tail(&pg->list, &lru);
+    list_add_tail(&pg->list, &pc_lru);
     page_set_flag(pg, owner == &swap_owner ? PG_SWAPCACHE : PG_CACHE);
     if (owner == &swap_owner)
         nr_swap++;
@@ -201,7 +201,7 @@ static void drop_from(struct super_block *sb, u32 ino, u64 first)
         int n = 0;
         unsigned long flags = spin_lock_irqsave(&pc_lock);
         struct page *pg, *tmp;
-        list_for_each_entry_safe(pg, tmp, &lru, list) {
+        list_for_each_entry_safe(pg, tmp, &pc_lru, list) {
             if (pg->cache.owner != sb || pg->cache.ino != ino || pg->cache.index < first)
                 continue;
             unhash_locked(pg);
@@ -289,7 +289,7 @@ int pc_writeback(struct super_block *sb, u32 ino, u64 first, u64 last, bool lock
     size_t n = 0;
     unsigned long flags = spin_lock_irqsave(&pc_lock);
     struct page *pg;
-    list_for_each_entry(pg, &lru, list) {
+    list_for_each_entry(pg, &pc_lru, list) {
         if (n == cap)
             break;
         if (!(pg->flags & PG_CACHE) || !(pg->flags & PG_DIRTY))
@@ -323,10 +323,10 @@ unsigned long pc_shrink(unsigned long want, bool may_write)
         u32 dslot[BATCH];
         int nd = 0, nw = 0;
         unsigned long flags = spin_lock_irqsave(&pc_lock);
-        while (budget && nd < BATCH && nw < BATCH && freed + nd < want && !list_empty(&lru)) {
-            struct page *pg = list_first_entry(&lru, struct page, list);
+        while (budget && nd < BATCH && nw < BATCH && freed + nd < want && !list_empty(&pc_lru)) {
+            struct page *pg = list_first_entry(&pc_lru, struct page, list);
             budget--;
-            list_move_tail(&pg->list, &lru);        /* the clock hand moves on */
+            list_move_tail(&pg->list, &pc_lru);        /* the clock hand moves on */
             if (pg->flags & PG_REFERENCED) {
                 page_clear_flag(pg, PG_REFERENCED);
                 continue;
@@ -378,10 +378,52 @@ unsigned long pc_shrink(unsigned long want, bool may_write)
                 freed++;
             }
         }
-        if (!nd && !nw && budget && list_empty(&lru))
+        if (!nd && !nw && budget && list_empty(&pc_lru))
             break;
     }
     return freed;
+}
+
+/* swapoff: the swap cache goes; pages still mapped stay as ordinary
+   anonymous pages (copied on write if shared). */
+void pc_drop_swap_cache(void)
+{
+    for (;;) {
+        struct page *batch[32];
+        u32 slots[32];
+        int n = 0;
+        unsigned long flags = spin_lock_irqsave(&pc_lock);
+        struct page *pg, *tmp;
+        list_for_each_entry_safe(pg, tmp, &pc_lru, list) {
+            if (!(pg->flags & PG_SWAPCACHE))
+                continue;
+            slots[n] = (u32)pg->cache.index;
+            unhash_locked(pg);
+            batch[n++] = pg;
+            if (n == 32)
+                break;
+        }
+        spin_unlock_irqrestore(&pc_lock, flags);
+        for (int i = 0; i < n; i++)
+            release(batch[i], true, slots[i]);
+        if (n < 32)
+            return;
+    }
+}
+
+/* Forget every second chance (dropping caches: everything unused goes). */
+void pc_clear_referenced(void)
+{
+    unsigned long flags = spin_lock_irqsave(&pc_lock);
+    struct page *pg;
+    list_for_each_entry(pg, &pc_lru, list)
+        page_clear_flag(pg, PG_REFERENCED);
+    spin_unlock_irqrestore(&pc_lock, flags);
+}
+
+u64 pc_count(void)
+{
+    return __atomic_load_n(&nr_file, __ATOMIC_RELAXED) + __atomic_load_n(&nr_swap, __ATOMIC_RELAXED);
 }
 
 void pc_stats(u64 *file_pages, u64 *swap_pages, u64 *dirty, u64 *mapped)
@@ -390,7 +432,7 @@ void pc_stats(u64 *file_pages, u64 *swap_pages, u64 *dirty, u64 *mapped)
     unsigned long flags;
     bool locked = spin_lock_debug(&pc_lock, &flags);
     struct page *pg;
-    list_for_each_entry(pg, &lru, list) {
+    list_for_each_entry(pg, &pc_lru, list) {
         if (pg->flags & PG_DIRTY)
             d++;
         if (pg->refcount > 1)
@@ -419,7 +461,7 @@ void pc_print(print_fn print)
     unsigned long flags;
     bool locked = spin_lock_debug(&pc_lock, &flags);
     struct page *pg;
-    list_for_each_entry(pg, &lru, list) {
+    list_for_each_entry(pg, &pc_lru, list) {
         if (!(pg->flags & PG_CACHE))
             continue;
         int i = 0;

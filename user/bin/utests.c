@@ -247,6 +247,33 @@ static void t_mmap_file(void)
     CHECK(unlink(p) == 0);
 }
 
+static int read_file(const char *path, char *buf, size_t size);
+
+static void t_mincore(void)
+{
+    unsigned char vec[4];
+    char *a = mmap(0, 4 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(a != MAP_FAILED);
+    a[4096] = 1;                                /* only page 1 in memory */
+    CHECK(mincore(a, 4 * 4096, vec) == 0);
+    CHECK(!(vec[0] & 1) && (vec[1] & 1) && !(vec[2] & 1) && !(vec[3] & 1));
+    CHECK(mincore(a + 1, 4096, vec) == -1 && errno == EINVAL);     /* unaligned */
+    CHECK(munmap(a, 4 * 4096) == 0);
+    CHECK(mincore(a, 4096, vec) == -1 && errno == ENOMEM);          /* unmapped */
+    /* a file mapping: pages in the page cache count, touched or not */
+    int fd = open("/bin/hello", O_RDONLY);
+    char c;
+    CHECK(fd >= 0 && read(fd, &c, 1) == 1);     /* page 0 into the cache */
+    char *m = mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    CHECK(m != MAP_FAILED && mincore(m, 4096, vec) == 0 && (vec[0] & 1));
+    munmap(m, 4096);
+    close(fd);
+    /* /proc/stat and the per-process paging fields */
+    char buf[512];
+    CHECK(read_file("/proc/stat", buf, sizeof(buf)) > 0 && strstr(buf, "cpu0 idle_ms "));
+    CHECK(read_file("/proc/self/status", buf, sizeof(buf)) > 0 && strstr(buf, "maj_flt "));
+}
+
 static void t_mmap_reuse(void)
 {
     size_t len = 1 << 20;
@@ -1691,6 +1718,7 @@ static const struct {
     { "mmap", t_mmap },
     { "mmap_file", t_mmap_file },
     { "mmap_reuse", t_mmap_reuse },
+    { "mincore", t_mincore },
     { "bad_pointers_rejected", t_bad_pointers_rejected },
     { "kill", t_kill },
     { "sleep_and_ids", t_sleep_and_ids },

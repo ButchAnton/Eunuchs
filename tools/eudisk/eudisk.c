@@ -1209,6 +1209,21 @@ static int install_file(struct efs *fs, const char *path, const char *host, bool
         free(data);
         return -1;
     }
+    /* A name that is another file's hard link (the last install made it one,
+       or you did): replacing it in place would change that file too. It
+       goes (yours backed up first), and the file is made afresh. */
+    struct mrec *was = man_find(path);
+    if (ino >= 0 && efs_inode(fs, (uint32_t)ino)->nlink > 1 && (!was || was->link)) {
+        if (!was && (r = backup(fs, path, (uint32_t)ino)) < 0) {
+            free(data);
+            return r;
+        }
+        if ((r = efs_unlink(fs, path)) < 0) {
+            free(data);
+            return r;
+        }
+        ino = -ENOENT;
+    }
     if (ino >= 0) {
         size_t clen;
         uint8_t *cur = efs_slurp(fs, (uint32_t)ino, &clen);

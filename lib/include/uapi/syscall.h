@@ -80,8 +80,11 @@
     X(220, fork,        0, "")               \
     X(221, execve,      3, "sap")            \
     X(222, mmap,        6, "puxxdx")         \
+    X(224, swapon,      2, "sx")             \
+    X(225, swapoff,     1, "s")              \
     X(226, mprotect,    3, "pux")            \
     X(227, msync,       3, "pux")            \
+    X(232, mincore,     3, "pup")            \
     X(242, accept4,     4, "dppx")           \
     X(260, wait4,       4, "dpxp")           \
     X(142, reboot,      1, "x")              \

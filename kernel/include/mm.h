@@ -205,6 +205,11 @@ int pc_writeback(struct super_block *sb, u32 ino, u64 first, u64 last, bool lock
    swap-cache pages first when allowed). Returns pages freed. */
 unsigned long pc_shrink(unsigned long want, bool may_write);
 void pc_stats(u64 *file_pages, u64 *swap_pages, u64 *dirty, u64 *mapped);
+void pc_clear_referenced(void);
+void pc_drop_swap_cache(void);          /* swapoff */
+u64 pc_count(void);                     /* pages in the cache (file + swap) */
+/* /proc/drop_caches: write back, then free every cached page nobody uses. */
+unsigned long pc_drop_all(void);
 void pc_print(int (*print)(const char *fmt, ...));
 
 /* ---- swap space (swap.c) ---- */
@@ -216,7 +221,14 @@ void pc_print(int (*print)(const char *fmt, ...));
 #define SWAP_SLOT(pte)     ((u32)((pte) >> 10))
 
 void swap_init(void);                   /* finds the swap partition */
-bool swap_enabled(void);
+bool swap_enabled(void);                /* on, and not being turned off */
+int swap_volume(void);                  /* the volume in use, or -1 */
+int swap_find_volume(const char *name); /* disk0p5, /dev/disk0p5, or a GPT name */
+int swap_on(int vol);
+int swap_off(void);                     /* reclaim.c: everything back in first */
+void swap_drain(bool on);
+u32 swap_used(void);
+void swap_retire(void);
 u32 swap_alloc(void);                   /* a free slot, count 1; 0 if full */
 void swap_dup(u32 slot);                /* another reference (a PTE) */
 void swap_free(u32 slot);               /* drop one; the slot is free at 0 */

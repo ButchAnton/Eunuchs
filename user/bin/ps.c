@@ -44,6 +44,7 @@ struct pinfo {
     char args[512];
     char wchan[32];
     unsigned long start_ms, cpu_ms, rss_kib, vsz_kib, syscalls, switches;
+    unsigned long swap_kib, min_flt, maj_flt, cow;
     unsigned sig_pending, sig_blocked, sig_caught, sig_ignored;
     int selected;
     int depth;                  /* forest */
@@ -150,6 +151,10 @@ static int load(const char *pidstr, struct pinfo *p)
     p->vsz_kib = num(buf, "vsz_kib", 0);
     p->syscalls = num(buf, "syscalls", 0);
     p->switches = num(buf, "switches", 0);
+    p->swap_kib = num(buf, "swap_kib", 0);
+    p->min_flt = num(buf, "min_flt", 0);
+    p->maj_flt = num(buf, "maj_flt", 0);
+    p->cow = num(buf, "cow", 0);
     p->sig_pending = num(buf, "sig_pending", 0) & 0xffffffff;
     /* status shows bit (sig) set; Linux masks use bit (sig - 1) */
     p->sig_pending >>= 1;
@@ -400,6 +405,10 @@ static const struct colspec specs[] = {
     { "pmem %mem", "%MEM", 4, AR, "resident memory as a percentage of RAM" },
     { "rss rssize rsz", "RSS", 5, AR, "resident memory, KiB" },
     { "vsz vsize", "VSZ", 6, AR, "virtual memory, KiB" },
+    { "swap", "SWAP", 5, AR, "memory out in swap, KiB" },
+    { "majflt maj_flt", "MAJFLT", 6, AR, "faults that read a file or swap" },
+    { "minflt min_flt", "MINFLT", 6, AR, "faults without disk reads" },
+    { "cow", "COW", 5, AR, "pages copied on write (Eunuchs)" },
     { "sz", "SZ", 5, AR, "virtual memory, pages" },
     { "psr cpu", "PSR", 3, AR, "processor it last ran on" },
     { "wchan", "WCHAN", 6, AL, "what a sleeping process waits for" },
@@ -512,6 +521,10 @@ static void cell(struct pinfo *p, const struct colspec *s, char *b, size_t n)
         snprintf(b, n, "%lu.%lu", m / 10, m % 10);
     } else if (is(s, "rss")) snprintf(b, n, "%lu", p->rss_kib);
     else if (is(s, "vsz")) snprintf(b, n, "%lu", p->vsz_kib);
+    else if (is(s, "swap")) snprintf(b, n, "%lu", p->swap_kib);
+    else if (is(s, "majflt")) snprintf(b, n, "%lu", p->maj_flt);
+    else if (is(s, "minflt")) snprintf(b, n, "%lu", p->min_flt);
+    else if (is(s, "cow")) snprintf(b, n, "%lu", p->cow);
     else if (is(s, "sz")) snprintf(b, n, "%lu", p->vsz_kib / 4);
     else if (is(s, "psr")) snprintf(b, n, "%d", p->psr);
     else if (is(s, "wchan")) snprintf(b, n, "%s", p->wchan);
@@ -879,7 +892,7 @@ static void build_format(void)
     else if (bsd_fmt == 'l')
         f = "f,uid,pid,ppid,pri,ni,vsz,rss,wchan,stat,tname,bsdtime,args";
     else if (bsd_fmt == 'v')
-        f = "pid,tname,stat,bsdtime,vsz,rss,%mem,args";
+        f = "pid,tname,stat,bsdtime,majflt,minflt,swap,vsz,rss,%mem,args";
     else if (bsd_fmt == 's')
         f = "uid,pid,pending,blocked,ignored,caught,stat,tname,bsdtime,args";
     else if (fmt_long && fmt_full)

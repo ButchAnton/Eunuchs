@@ -32,6 +32,7 @@
 #include <riscv.h>
 #include <sched.h>
 #include <trace.h>
+#include <uapi/errno.h>
 
 struct vm_counters vmc;
 
@@ -127,6 +128,85 @@ unsigned long reclaim(unsigned long want, bool direct)
     return freed;
 }
 
+/*
+ * The process after pid *last with swapped-out pages, its mm locked. Waits
+ * for a busy lock (outside proc_lock, which only guards the lookup and the
+ * try). NULL when there is none.
+ */
+static struct mm *lock_next_swapped(int *last)
+{
+    for (;;) {
+        unsigned long flags = spin_lock_irqsave(&proc_lock);
+        struct proc *p, *best = NULL;
+        list_for_each_entry(p, &all_procs, all_node)
+            if (p->mm && p->mm->swapped && p->pid > *last && (!best || p->pid < best->pid))
+                best = p;
+        if (!best) {
+            spin_unlock_irqrestore(&proc_lock, flags);
+            return NULL;
+        }
+        struct mm *mm = best->mm;
+        bool got = mutex_trylock(&mm->lock);
+        if (got)
+            *last = best->pid;
+        spin_unlock_irqrestore(&proc_lock, flags);
+        if (got)
+            return mm;
+        sleep_ms(1);
+    }
+}
+
+/*
+ * swapoff: no new swap slots; every process's swapped pages come back
+ * (memory permitting); then the swap cache goes and, with no slot in use,
+ * the volume. On failure swap stays on, as it was.
+ */
+int swap_off(void)
+{
+    if (swap_volume() < 0)
+        return -EINVAL;
+    swap_drain(true);
+    for (int round = 0; round < 4; round++) {
+        int last = 0;
+        struct mm *mm;
+        while ((mm = lock_next_swapped(&last)) != NULL) {
+            int r = uvm_swapin_all(mm);
+            mutex_unlock(&mm->lock);
+            if (r) {
+                swap_drain(false);
+                pr_warn("swapoff: %s bringing pages back; swap stays on\n",
+                        r == -ENOMEM ? "out of memory" : "I/O error");
+                return r;
+            }
+        }
+        mutex_lock(&reclaim_lock);          /* (nobody may be writing swap-cache pages) */
+        pc_drop_swap_cache();
+        if (!swap_used()) {
+            swap_retire();
+            mutex_unlock(&reclaim_lock);
+            return 0;
+        }
+        mutex_unlock(&reclaim_lock);        /* (a fork copied swapped PTEs: again) */
+    }
+    swap_drain(false);
+    return -EBUSY;
+}
+
+unsigned long pc_drop_all(void)
+{
+    pc_writeback(NULL, 0, 0, ~0ULL, true);
+    unsigned long freed = 0, n;
+    mutex_lock(&reclaim_lock);
+    do {
+        pc_clear_referenced();
+        n = pc_shrink(pc_count() + 1, true);
+        freed += n;
+    } while (n);
+    mutex_unlock(&reclaim_lock);
+    vmc.freed += freed;
+    return freed;
+}
+
 static void kswapd_main(void *arg)
 {
     (void)arg;
@@ -210,6 +290,9 @@ void vm_counters_print(print_fn print)
     u64 f, s, d, m, st, su;
     pc_stats(&f, &s, &d, &m);
     swap_stats(&st, &su);
+    struct pmm_stats ps;
+    pmm_get_stats(&ps);
+    print("total %lu\nreserved %lu\n", (unsigned long)ps.total_pages, (unsigned long)ps.reserved_pages);
     print("free %lu\nmin %lu\nlow %lu\nhigh %lu\n", (unsigned long)pmm_free_pages(),
           (unsigned long)min_wm, (unsigned long)low_wm, (unsigned long)high_wm);
     print("file_pages %lu\nswapcache_pages %lu\ndirty %lu\nmapped_cache %lu\n", (unsigned long)f,

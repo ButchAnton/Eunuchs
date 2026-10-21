@@ -4,14 +4,16 @@
  * a 64 MiB machine) and a way to watch it: `vmstat` in the monitor, /proc/vmstat,
  * /proc/swaps, /proc/<pid>/maps (the swap column).
  *
- *   memhog [-q] MB
+ *   memhog [-q] [-h SECONDS] MB
  *
  * Maps MB MiB of anonymous memory, writes a pattern that depends on each
  * word's address into all of it, then checks it all. Then forks: the child
  * checks everything again and rewrites a quarter of the pages (copies on
  * write, possibly of swapped-out pages shared with the parent); the parent
  * waits and checks that its own pages are unchanged. Prints the paging
- * counters that changed. Exit status 0 if every word was right.
+ * counters that changed. Exit status 0 if every word was right. -h waits
+ * that long after filling, before checking (to try swapoff meanwhile);
+ * -q says less.
  */
 #include <fcntl.h>
 #include <stdio.h>
@@ -71,12 +73,20 @@ static long counter(const char *name)
 
 int main(int argc, char **argv)
 {
-    int quiet = argc > 1 && !strcmp(argv[1], "-q");
-    if (argc != 2 + quiet || atoi(argv[1 + quiet]) <= 0) {
-        fprintf(stderr, "usage: memhog [-q] MB\n");
+    int quiet = 0, hold = 0, i = 1;
+    for (; i < argc && argv[i][0] == '-'; i++) {
+        if (!strcmp(argv[i], "-q"))
+            quiet = 1;
+        else if (!strcmp(argv[i], "-h") && i + 1 < argc)
+            hold = atoi(argv[++i]);
+        else
+            break;
+    }
+    if (i != argc - 1 || atoi(argv[i]) <= 0) {
+        fprintf(stderr, "usage: memhog [-q] [-h SECONDS] MB\n");
         return 2;
     }
-    unsigned long mb = atoi(argv[1 + quiet]), pages = mb * 256;
+    unsigned long mb = atoi(argv[i]), pages = mb * 256;
     static const char *names[] = { "swap_outs", "swap_ins", "major_faults", "unmapped", "direct_reclaims" };
     long before[5];
     for (int i = 0; i < 5; i++)
@@ -90,6 +100,11 @@ int main(int argc, char **argv)
     if (!quiet)
         printf("memhog: filling %lu MiB\n", mb);
     fill(mem, pages, 1, 1);
+    if (hold) {
+        printf("memhog: %lu MiB filled; checking in %d s\n", mb, hold);
+        fflush(stdout);
+        sleep_ms((unsigned long)hold * 1000);
+    }
     unsigned long bad = check("parent", mem, pages, 1, 0, 0);
 
     pid_t pid = fork();

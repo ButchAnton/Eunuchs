@@ -52,7 +52,9 @@ What it does not do:
 | `user/bin/init.c` | pid 1: prints `/etc/motd`, runs and restarts `/bin/esh -l`, reaps orphans; `-1` mode for tests. |
 | `user/bin/esh/*.c` | The shell (one program from several files; see [12-shell.md](12-shell.md)). |
 | `user/bin/eutils.c` | Multi-call binary: 32 small tools chosen by `argv[0]`. |
-| `user/bin/{ls,cat,grep,more,ps,top}.c` | Standalone file, text and process tools. |
+| `user/bin/{ls,cat,grep,more,ps,top}.c` | Standalone file, text and process tools (`top` uses curses). |
+| `user/bin/{free,vmstat,pmap,fincore,dropcache,swapon,memhog}.c` | Memory and paging tools ([The memory tools](#the-memory-tools-top-vmstat-free-pmap-fincore-dropcache-swapon)). |
+| `user/lib/curses.c`, `user/include/curses.h` | A curses subset for full-screen programs ([curses](#curses-cursesh)). |
 | `user/bin/db/*.c` | `db`, the debugger ([14](14-debugger.md)). |
 | `user/bin/edit/*.c` | The text editor, one program with a `vi` and an `emacs` personality (see [The editor](#the-editor-vi-and-emacs)). |
 | `user/bin/{ping,nc,ifconfig,netstat}.c` | Network clients and configuration. |
@@ -186,7 +188,7 @@ The kernel's `proc_spawn` gives the first process `PATH=/bin`, `HOME=/`, `TERM=v
 - `-fno-builtin` and `-fno-tree-loop-distribute-patterns` keep GCC from turning loops into calls to functions libc lacks.
 - `-march=rv64gc -mabi=lp64d` is the hard-float ABI: `double` arguments travel in FP registers, and the compiler may use FP registers anywhere. `-DFMT_FLOAT` turns on the floating-point conversions in the shared `lib/printf.c`.
 
-`ULIB` is a list of objects, not an archive: `crt0.o` first, then one object for every `user/lib/*.c` and `user/lib/*.S` (a `wildcard`, so a new libc file needs no Makefile change), then `printf.o` and `string.o`. Every program links all of them, so each binary carries the whole libc (`hello` has about 70 KiB of text) (`-nostdlib -static -T user/user.ld ... -lgcc`). `UPROGS` is `$(wildcard user/bin/*.c)`, so every C file in `user/bin` becomes a program. Each program is then copied with `objcopy --strip-debug` into `build/user/stripped/`; the stripped copy (symbol table kept for kernel backtraces) goes into the disk image, and the full one in `build/user/bin/` is for GDB and the profiler.
+`ULIB` is the list of libc objects: `crt0.o` first, then one object for every `user/lib/*.c` and `user/lib/*.S` (a `wildcard`, so a new libc file needs no Makefile change), then `printf.o` and `string.o`. Everything but `crt0.o` is archived into `build/user/libc.a` (`ULIBA`), and programs link `crt0.o` plus `-Wl,--start-group libc.a -lgcc -Wl,--end-group` (`ULINK`, with `-nostdlib -static -T user/user.ld`), so each program takes only the libc members it uses: only curses programs carry curses, and programs shrank (`cat` from 498 KB to 266 KB). In-guest tcc builds already linked the sysroot's `libc.a`. `UPROGS` is `$(wildcard user/bin/*.c)`, so every C file in `user/bin` becomes a program. Each program is then copied with `objcopy --strip-debug` into `build/user/stripped/`; the stripped copy (symbol table kept for kernel backtraces) goes into the disk image, and the full one in `build/user/bin/` is for GDB and the profiler.
 
 ### Startup: `_start` to `main`
 
@@ -443,7 +445,7 @@ Lists are comma-separated. A process that matches any of the lists given is sele
 | `u` | `USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND` |
 | `j` | `PPID PID PGID SID TTY TPGID STAT UID TIME COMMAND` |
 | `l` | `F UID PID PPID PRI NI VSZ RSS WCHAN STAT TTY TIME COMMAND` |
-| `v` | `PID TTY STAT TIME VSZ RSS %MEM COMMAND` |
+| `v` | `PID TTY STAT TIME MAJFLT MINFLT SWAP VSZ RSS %MEM COMMAND` (`pid,tname,stat,bsdtime,majflt,minflt,swap,vsz,rss,%mem,args`) |
 | `s` | `UID PID PENDING BLOCKED IGNORED CAUGHT STAT TTY TIME COMMAND` |
 | `-o`, `o`, `--format LIST` | Your own columns: `ps -o pid,ppid,stat,wchan,args`. `name=HEADER` renames a column (the header runs to the end of the list unless a known column name follows a comma), and `name=` alone hides it. If every header is empty, no header line is printed. |
 | `-O`, `O LIST` | `PID`, then `LIST`, then the rest of the default. |
@@ -468,7 +470,7 @@ Lists are comma-separated. A process that matches any of the lists given is sele
   - since the start: `etime`, `etimes`;
   - start time: `stime`, `start`, `lstart`, all in UTC;
   - CPU use: `%cpu`, the CPU time divided by the time since start, as in procps, and `c`, its integer form.
-- **Memory:** `%mem`, `rss`, `vsz`, `sz`.
+- **Memory:** `%mem`, `rss`, `vsz`, `sz`, `swap` (KiB in swap), and the fault counts `majflt` (faults that read a file or swap), `minflt` and `cow` (copy-on-write copies), from the `swap_kib`, `maj_flt`, `min_flt` and `cow` fields of `/proc/<pid>/status`.
 - **Scheduling:** `psr` (the CPU it last ran on) and `wchan` (the kernel's wait reason: `wait4`, `tty read`, `socket`, `pipe-read`...).
 - **Signals and mask:** `pending`, `blocked`, `ignored` and `caught` (Linux-style hex masks), and `umask`.
 - **Eunuchs only:** `syscalls` (system calls made) and `switches` (times scheduled).
@@ -530,6 +532,49 @@ Only processes are listed. Kernel threads are in `/proc/threads` and the monitor
 **Under QEMU.** With `-nographic`, as `make run` uses, QEMU multiplexes the serial console and its own monitor. The escape is `Ctrl-^` (`-echr 30`): `Ctrl-^ X` quits QEMU, so `C-a` is beginning-of-line in emacs. `Ctrl-]` still enters the kernel monitor: the console takes it before the terminal line discipline, whatever mode the editor has set.
 
 **Not available.** One window per screen (no `C-x 2`, `:split`), no visual block mode, no `fill-paragraph` (`M-q` says so), no keyboard macros in emacs, no syntax highlighting beyond C, shell, make and Python, no wide-character display widths (every UTF-8 character counts as one column), no `SIGWINCH` (the size is re-read only after a suspend), no auto-save, backup files or detection of changes made by others, and undo granularity of a whole command (or a run of typed characters, backspaces included).
+
+### curses (`curses.h`)
+
+`user/lib/curses.c` (about 770 lines) is a subset of the usual curses API over ANSI escape sequences, for full-screen programs (`top`). Only programs that call it link it in (libc is an archive).
+
+- **One virtual screen.** `refresh` compares it with what the terminal shows and sends only the changed cells, in runs (small gaps between changes are merged), in a single `write`. Windows (`newwin`) are rectangles of the one screen. The program runs on the alternate screen; `endwin` (also run at exit) restores the terminal.
+- **Characters.** `chtype` is an `unsigned long`: the Unicode code point in the low 32 bits, attributes above (`A_BOLD`, `A_DIM`, `A_UNDERLINE`, `A_REVERSE`, `A_BLINK`, `A_ITALIC`) and `COLOR_PAIR(n)` in bits 40–47 (64 pairs). `addstr` takes UTF-8. `init_pair` accepts -1 for the terminal's default color; colors 8–15 are the bright ones. The `ACS_*` line-drawing characters are Unicode box drawing (ASCII when `$CURSES_ASCII` is set); `ACS_BLOCK` and `ACS_CKBOARD` are for bars.
+- **Keys.** With `keypad`, `getch` decodes arrows, Home, End, PgUp, PgDn, Ins, Del and F1–F12 (CSI and SS3 forms), waiting 60 ms after an ESC to tell a lone ESC from a sequence.
+- **Size.** From `TIOCGWINSZ` (the shell measures the serial console), else `$LINES`/`$COLUMNS`, else 24×80. `getch` checks it again every 500 ms and returns `KEY_RESIZE` when it changed.
+- **Job control.** `Ctrl-Z` (SIGTSTP) restores the terminal before stopping; on SIGCONT the screen is redrawn and `KEY_RESIZE` is pushed.
+
+The supported calls are listed in `curses.h`.
+
+### The memory tools: top, vmstat, free, pmap, fincore, dropcache, swapon
+
+**`top`** (curses). The header shows uptime, process counts (running and blocked) and the CPUs; then a bar per CPU (busy % since the last refresh: green, yellow above 50, red above 85, with smooth eighth-block ends); a **Mem** bar (programs in green, page cache plus swap cache in blue, of total memory less reserved) and a **Swp** bar (magenta); a **Paging** line (faults/s, major faults/s, swap-ins and swap-outs per second, dirty pages); then the process table: PID, USER, S, CPU%, MEM%, RES, SWAP, MAJ/s, TIME+, COMMAND, with the sort column underlined, the selected row reversed, running processes bold, and swap and high-CPU cells colored; a key bar at the bottom.
+
+| Key | Does |
+|---|---|
+| `P` `M` `S` `T` `N` | Sort by CPU, memory, swap, time or pid (the same key again reverses) |
+| arrows, PgUp/PgDn, Home/End | Move the selection |
+| `k` | Kill the selected process (asks for a signal; default 15) |
+| `/` | Filter commands by a substring |
+| `c` | Command lines or names |
+| `t` | Kernel threads too (`/proc/threads`) |
+| `+` `-` | Change the delay; space refreshes now |
+| `h`, `?`, F1 | A help box |
+| `^L` | Redraw |
+| `q`, Esc, `^C` | Quit |
+
+Options: `-d SECONDS`, `-o cpu|mem|swap|time|pid`, `-b` (batch: plain-text frames on standard output, no terminal needed), `-n FRAMES`. It reads `/proc/stat`, `/proc/vmstat`, `/proc/<pid>/status` and `cmdline`, and `/etc/passwd`.
+
+**`vmstat [-w] [DELAY [COUNT]]`** prints a line per interval (the first one since boot) with: procs `r` `b`; memory `free`, `cache`, `swpcache`, `swpd` (KiB); swap `si` `so` (pages/s); faults `minor` `major` (/s); reclaim `scan` `free` (/s); cpu `us` `id` (% of all CPUs). The header repeats every 20 lines. `vmstat -s` lists every `/proc/vmstat` counter with what it means.
+
+**`free [-k|-m|-g|-h] [-w] [-s SECONDS [-c COUNT]]`**: a `Mem:` line with total (RAM less reserved), used (total − free − cache), free, cache (file cache plus swap cache) and available (free plus clean cache), and a `Swap:` line with total, used and free. `-w` splits the file cache from the swap cache.
+
+**`pmap [-q] PID...`** shows `/proc/PID/maps` as a table: Address, Kbytes, RSS, Swap, Dirty, Mode, Kind, Mapping (`[ text ]`, `[ heap ]`, or `shared+0x0 /path` for a file), then totals, overall and by kind.
+
+**`fincore [-v] FILE...`** maps each file without touching its pages and asks `mincore` which are in the page cache: RES, PAGES, OF, SIZE, FILE. `-v` draws a 64-cell strip of the file (`#` that part all cached, `+` some, `.` none).
+
+**`dropcache`** (root) writes `/proc/drop_caches` and reports how many KiB were dropped and how many are still cached.
+
+**`swapon` / `swapoff`**: `swapon` alone shows the swap in use (VOLUME, LABEL, SIZE, USED, PEAK, USE%); `swapon VOLUME` or `swapon -a` turns swap on; `swapoff [VOLUME]` turns it off, bringing every swapped-out page back first. `VOLUME` is `swap`, `disk0p5` or `/dev/disk0p5`, by default `swap`. Errors are explained: `ENOMEM` means the swapped-out pages do not fit in memory (swap stays on); `EPERM`, root only.
 
 ### eutils
 
@@ -599,9 +644,11 @@ Fork and exec interactions:
 | `math.h` | See [Mathematics](#mathematics-mathh). |
 | `setjmp.h` | `jmp_buf sigjmp_buf setjmp longjmp _setjmp _longjmp sigsetjmp siglongjmp`. |
 | `regex.h` | `regex_t regmatch_t regoff_t`, `regcomp regexec regerror regfree`, `REG_*` flags and errors. |
+| `curses.h` | The curses subset (see [curses](#curses-cursesh)); every supported call is listed in the header. |
+| `sys/swap.h` | `swapon(volume, flags)`, `swapoff(volume)`: root only; the volume is `/dev/disk0p5`, `disk0p5` or its GPT name (`swap`). |
 | `sys/reboot.h` | `reboot(how)`, `RB_AUTOBOOT`, `RB_POWER_OFF` (from `uapi/reboot.h`, Linux's values). |
 | `sys/ptrace.h` | `ptrace(request, pid, addr, data)` and, from `uapi/ptrace.h`, the `PTRACE_*` requests, `struct user_regs`, `struct user_fpregs`, `struct ptrace_siginfo`, `struct ptrace_io`, `SI_USER`/`TRAP_*`/`SEGV_*` codes. As in glibc, `PTRACE_PEEKTEXT`/`PEEKDATA` return the word (set `errno` to 0 first to tell a word of -1 from an error); the kernel itself stores it at `*data`. See [14](14-debugger.md). |
-| `sys/mman.h` | `mmap munmap mprotect msync`, `PROT_*`, `MAP_SHARED`, `MAP_PRIVATE`, `MAP_FIXED`, `MAP_ANONYMOUS`, `MAP_FAILED`, `MS_ASYNC`, `MS_SYNC`, `MS_INVALIDATE`. |
+| `sys/mman.h` | `mmap munmap mprotect msync mincore`, `PROT_*`, `MAP_SHARED`, `MAP_PRIVATE`, `MAP_FIXED`, `MAP_ANONYMOUS`, `MAP_FAILED`, `MS_ASYNC`, `MS_SYNC`, `MS_INVALIDATE`. |
 | `poll.h` | `poll(fds, n, timeout_ms)`. |
 | `sys/select.h` | `select`, `fd_set` (`FD_SETSIZE` 64), `FD_*` macros. |
 | `sys/socket.h` | `socket bind listen accept accept4 connect getsockname getpeername send recv sendto recvfrom setsockopt getsockopt shutdown`, `MSG_NOSIGNAL` (defined here, but not in `uapi/net.h`'s list). |
@@ -629,7 +676,13 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `db` | `db PROG [ARGS]`, `db --args PROG ARGS...`, `db -p PID [PROG]`, with `-ex CMD` and `-batch` | gdb-like source-level debugger on `ptrace`; see [14](14-debugger.md). |
 | `kinstall` | `kinstall`, `kinstall [-r] KERNEL`, `kinstall --rollback` | Root only. Shows the two kernel slots; installs `KERNEL` as `/boot/kernel.elf` after moving the current one to `/boot.old/kernel.elf` (each copy written as `.new`, `fsync`ed, renamed; nothing if it is already installed; `-r` reboots); or swaps the slots (`--rollback`; with an empty `/boot`, it moves the old kernel there). Refuses a file that is not a Eunuchs kernel. On a bare image the slots are `/boot/kernel.elf` and `/boot/kernel.old.elf`. See [01](01-boot-and-platform.md#0-the-boot-loader-bootebootc). |
 | `make` | `make [-f FILE] [-C DIR] [-nsikBpqd] [VAR=value] [TARGET...]` | POSIX-style make with GNU functions and built-in rules for tcc; see [13](13-toolchain.md#binmake-userbinmakec). |
-| `top` | `top` | Raw mode with `VMIN=0`; shows `/proc/uptime`, 10 lines of `/proc/cpus` and 20 of `/proc/threads` every second; `q` or `^C` quits. |
+| `top` | `top [-d SECONDS] [-o cpu\|mem\|swap\|time\|pid] [-b] [-n FRAMES]` | Full-screen process and memory monitor (curses); `-b` prints plain-text frames without a terminal. See [The memory tools](#the-memory-tools-top-vmstat-free-pmap-fincore-dropcache-swapon). |
+| `vmstat` | `vmstat [-w] [DELAY [COUNT]]`, `vmstat -s` | Paging and CPU activity per interval; `-s` lists every `/proc/vmstat` counter with its meaning. |
+| `free` | `free [-k\|-m\|-g\|-h] [-w] [-s SECONDS [-c COUNT]]` | Memory and swap totals (its own program now, no longer an eutils applet). |
+| `pmap` | `pmap [-q] PID...` | A process's mappings from `/proc/PID/maps`, with RSS, swap and dirty sizes. |
+| `fincore` | `fincore [-v] FILE...` | How much of each file is in the page cache (`mincore`); `-v` draws a strip. |
+| `dropcache` | `dropcache` | Root: write `/proc/drop_caches` and report what was dropped. |
+| `swapon`, `swapoff` | `swapon [VOLUME\|-a]`, `swapoff [VOLUME]` | Show, enable or disable swap (root); `swapoff` is a hard link to `swapon`. |
 | `ping` | `ping [-c N] [-i MS] [-s SIZE] [-W MS] HOST` | Raw ICMP, root only. |
 | `nc` | `nc [-uv] HOST PORT`, `nc -l [-ukv] PORT` | TCP or UDP netcat. |
 | `ifconfig` | `ifconfig`, `ifconfig IFACE [ADDR] [netmask M] [gw G] [up\|down]` | Configuring needs root. |
@@ -641,7 +694,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `stress` | `stress [-j WORKERS] [-t SECS] [-n ITERS] [-v]` | Defaults: 8 workers, 10 s. Each iteration: an `echo \| cat` pipeline, file I/O in `/tmp`, a COW fork with `mmap`, and 16 KiB over loopback TCP. Prints `STRESS RESULT: PASS\|FAIL`. |
 | `segv` | `segv [null\|text\|stack\|illegal\|kernel]` | Crashes on purpose to show the kernel's fault report. |
 | `spin` | `spin [MS]` | Busy loop in user mode (default 2000 ms). |
-| `memhog` | `memhog [-q] MB` | Fills MB MiB of anonymous memory with a pattern derived from each word's address and checks it; forks; the child checks again and rewrites a quarter of the pages; the parent re-checks its own; prints the paging counters that changed (`-q`: less output). Exit 0 if every word was right. A test of swap. |
+| `memhog` | `memhog [-q] [-h SECONDS] MB` | Fills MB MiB of anonymous memory with a pattern derived from each word's address and checks it; forks; the child checks again and rewrites a quarter of the pages; the parent re-checks its own; prints the paging counters that changed (`-q`: less output; `-h SECONDS` holds after filling, before checking, so another program can watch or `swapoff` meanwhile). Exit 0 if every word was right. A test of swap. |
 | `exitcode` | `exitcode N [check-args A B]`, `exitcode fdopen FD`, `exitcode env NAME VALUE` | Test helper used by `utests`. |
 | `hello` | `hello [ARGS...]` | Prints its pid, parent and arguments. |
 | `eutils` | (through the links below) | Multi-call binary. |
@@ -674,7 +727,6 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `kill` | `kill [-SIG\|-N] PID...`, `kill -l` | Negative pid = process group. Names: `HUP INT QUIT KILL USR1 SEGV USR2 PIPE ALRM TERM CHLD CONT STOP TSTP`. Job specs need the shell's `kill`. |
 | `date` | `date` | UTC from `CLOCK_REALTIME` via `gmtime_r`. |
 | `dmesg` | `dmesg` | Copies `/dev/kmsg`. |
-| `free` | `free` | Copies `/proc/meminfo` (including page cache, swap cache and swap). |
 | `sleep` | `sleep SECS[.FRACTION]` | Millisecond resolution (three fraction digits). |
 | `strace` | `strace CMD [ARGS...]` | `dbg_strace(1)` then `execvp`; the trace goes to the kernel log/console. |
 | `su` | `su [USER]` | `setgid`+`setuid` from `/etc/passwd` (only root can switch), `chdir` home, sets `HOME`, `USER`, `LOGNAME` and `SHELL`, execs the user's shell from `/etc/passwd`. No password check. |
@@ -692,6 +744,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `/bin/<prog>` for every `user/bin/*.c` and every directory `user/bin/<prog>/` (so also `/bin/db`, `/bin/edit`, `/bin/esh`, `/bin/make`), and `/bin/tcc` | `build/user/stripped/<prog>` (DWARF stripped, symbols kept) |
 | `/bin/sh` | hard link to `/bin/esh` |
 | `/bin/less` | hard link to `/bin/more` |
+| `/bin/swapoff` | hard link to `/bin/swapon` |
 | `/bin/vi`, `/bin/view`, `/bin/emacs`, `/bin/em` | hard links to `/bin/edit` |
 | `/mnt/`, `/mnt/host/` | empty; the Mac's shared directory is mounted on `/mnt/host` under `make run` ([06](06-filesystems.md#9pfs-host-directories)) |
 | `/usr/include/` | `user/include/` and `lib/include/` (the headers tcc compiles against) |
