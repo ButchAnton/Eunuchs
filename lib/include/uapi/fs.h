@@ -43,6 +43,15 @@
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
 #define S_ISCHR(m) (((m) & S_IFMT) == S_IFCHR)
+/* Not made by efs (no block devices, symbolic links or sockets in the
+   filesystem), but programs test for them. */
+#define S_IFBLK  0060000
+#define S_IFLNK  0120000
+#define S_IFSOCK 0140000
+#define S_ISVTX  01000
+#define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
+#define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
+#define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
 struct timespec {
     int64_t tv_sec;

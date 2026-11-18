@@ -94,8 +94,17 @@ HOME_FILES  = /guest/:0755:1000:1000
 EUTILS_LINKS = echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env id crc32 profile \
                true false yes kill date dmesg sleep strace su dbg uname clear \
                reboot poweroff halt
+# Other multi-call programs: user/bin/NAME.c, with /bin/<link> -> /bin/NAME
+TEXTUTILS_LINKS = sort uniq cut tr nl tac rev paste comm cmp fold expand od xxd strings \
+                  cksum md5sum sha256sum
+FILEUTILS_LINKS = du dd basename dirname realpath mktemp chgrp file sync seq expr test [ printf
+SYSUTILS_LINKS  = timeout nohup time whoami groups hostname tty printenv uptime cal \
+                  pgrep pkill pidof killall watch
+MULTI_LINKS = $(foreach l,$(TEXTUTILS_LINKS),/bin/$(l)=@/bin/textutils) \
+              $(foreach l,$(FILEUTILS_LINKS),/bin/$(l)=@/bin/fileutils) \
+              $(foreach l,$(SYSUTILS_LINKS),/bin/$(l)=@/bin/sysutils)
 FS_FILES = $(foreach p,$(UPROGS),/bin/$(notdir $(p))=$(BUILD)/user/stripped/$(notdir $(p))) \
-           $(foreach l,$(EUTILS_LINKS),/bin/$(l)=@/bin/eutils) /bin/sh=@/bin/esh /bin/less=@/bin/more /bin/swapoff=@/bin/swapon \
+           $(foreach l,$(EUTILS_LINKS),/bin/$(l)=@/bin/eutils) $(MULTI_LINKS) /bin/sh=@/bin/esh /bin/less=@/bin/more /bin/swapoff=@/bin/swapon \
            /bin/vi=@/bin/edit /bin/view=@/bin/edit /bin/emacs=@/bin/edit /bin/em=@/bin/edit \
            +/etc/motd=user/etc/motd +/etc/passwd=user/etc/passwd +/etc/group=user/etc/group \
            +/etc/hostname=user/etc/hostname +/etc/eshrc=user/etc/eshrc /dev/ /proc/ /tmp/:0777 \

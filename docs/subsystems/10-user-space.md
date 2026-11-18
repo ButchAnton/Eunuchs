@@ -1,6 +1,6 @@
 # User space: libc, shell and commands
 
-Everything that runs in U-mode: a small static C library (`user/lib/`), the headers programs compile against (`user/include/` plus the shared ABI in `lib/include/uapi/`), the shell (`esh`, also `/bin/sh`; it has [its own document](12-shell.md)), `init`, the multi-call `eutils` binary, a text editor (`edit`, also `vi` and `emacs`) and about twenty other programs. Every program is a static ELF linked at `0x10000` with the same startup code and the whole libc, and is copied into the efs disk image at build time. The libc is small and debugging-oriented, but covers most of what ordinary C programs expect: system call wrappers that set `errno`, buffered `FILE` stdio, `printf`/`scanf` with floating point, `strto*`, `qsort`, `getopt`, `math.h`, `time.h` with `strftime`, `setjmp`/`sigsetjmp`, POSIX regular expressions, a first-fit `malloc` with magic numbers and poisoning, and thin wrappers for signals, sockets and termios.
+Everything that runs in U-mode: a small static C library (`user/lib/`), the headers programs compile against (`user/include/` plus the shared ABI in `lib/include/uapi/`), the shell (`esh`, also `/bin/sh`; it has [its own document](12-shell.md)), `init`, the multi-call binaries `eutils`, `textutils`, `fileutils` and `sysutils`, `sed`, `find`, `xargs`, a text editor (`edit`, also `vi` and `emacs`) and about twenty other programs. Every program is a static ELF linked at `0x10000` with the same startup code and the whole libc, and is copied into the efs disk image at build time. The libc is small and debugging-oriented, but covers most of what ordinary C programs expect: system call wrappers that set `errno`, buffered `FILE` stdio, `printf`/`scanf` with floating point, `strto*`, `qsort`, `getopt`, `math.h`, `time.h` with `strftime`, `setjmp`/`sigsetjmp`, POSIX regular expressions, `fnmatch`, `/etc/passwd` and `/etc/group` lookups, a first-fit `malloc` with magic numbers and poisoning, and thin wrappers for signals, sockets and termios.
 
 ## Responsibilities and scope
 
@@ -47,11 +47,16 @@ What it does not do:
 | `lib/include/uapi/fs.h` | `O_*`, `F_*`, `S_*`, `struct stat`, `struct dirent`, `struct timespec`/`timeval`, `PATH_MAX`, `NAME_MAX`. |
 | `lib/include/uapi/net.h` | Socket constants, `struct sockaddr_in`, `struct pollfd`, `POLL*`, `struct netif_req` and the `NET_IOC_*` ioctls. |
 | `lib/include/uapi/termios.h` | `struct termios` (Linux layout), flags, `TCGETS`/`TIOC*` ioctl numbers, `struct winsize`. |
-| `user/include/*.h` | POSIX-style headers: `unistd.h`, `stdio.h`, `stdlib.h`, `string.h`, `errno.h`, `fcntl.h`, `signal.h`, `dirent.h`, `termios.h`, `time.h`, `poll.h`, `netdb.h`, `eunuchs.h`, `stdint.h`, `inttypes.h`, `limits.h`, `ctype.h`, `assert.h`, `math.h`, `regex.h`, `setjmp.h`, `sys/{mman,select,socket,stat,types,time,wait}.h`, `netinet/in.h`, `arpa/inet.h`. |
+| `user/include/*.h` | POSIX-style headers: `unistd.h`, `stdio.h`, `stdlib.h`, `string.h`, `errno.h`, `fcntl.h`, `signal.h`, `dirent.h`, `termios.h`, `time.h`, `poll.h`, `netdb.h`, `eunuchs.h`, `stdint.h`, `inttypes.h`, `limits.h`, `ctype.h`, `assert.h`, `math.h`, `regex.h`, `fnmatch.h`, `pwd.h`, `grp.h`, `setjmp.h`, `sys/{mman,select,socket,stat,types,time,wait}.h`, `netinet/in.h`, `arpa/inet.h`. |
 | `user/user.ld` | Linker script: text at `0x10000`, page-aligned r-x / r-- / rw- segments. |
 | `user/bin/init.c` | pid 1: prints `/etc/motd`, runs and restarts `/bin/esh -l`, reaps orphans; `-1` mode for tests. |
 | `user/bin/esh/*.c` | The shell (one program from several files; see [12-shell.md](12-shell.md)). |
 | `user/bin/eutils.c` | Multi-call binary: 32 small tools chosen by `argv[0]`. |
+| `user/bin/textutils.c` | Multi-call binary: `sort uniq cut tr nl tac rev paste comm cmp fold expand od xxd strings cksum md5sum sha256sum` ([The text, file and system tools](#the-text-file-and-system-tools)). |
+| `user/bin/fileutils.c` | Multi-call binary: `du dd basename dirname realpath mktemp chgrp file sync seq expr test [ printf`. |
+| `user/bin/sysutils.c` | Multi-call binary: `timeout nohup time whoami groups hostname tty printenv uptime cal pgrep pkill pidof killall watch`. |
+| `user/bin/{sed,find,xargs}.c` | The stream editor, the file finder and the command-line builder. |
+| `user/lib/pwd.c`, `user/lib/fnmatch.c` | `getpwnam`/`getpwuid`/`getpwent` and `getgrnam`/`getgrgid`/`getgrent` over `/etc/passwd` and `/etc/group`; shell-pattern matching. |
 | `user/bin/{ls,cat,grep,more,ps,top}.c` | Standalone file, text and process tools (`top` uses curses). |
 | `user/bin/{free,vmstat,pmap,fincore,dropcache,swapon,memhog}.c` | Memory and paging tools ([The memory tools](#the-memory-tools-top-vmstat-free-pmap-fincore-dropcache-swapon)). |
 | `user/lib/curses.c`, `user/include/curses.h` | A curses subset for full-screen programs ([curses](#curses-cursesh)). |
@@ -62,7 +67,7 @@ What it does not do:
 | `user/bin/{utests,stress,segv,spin,exitcode,hello}.c` | Test and demonstration programs. |
 | `user/etc/motd`, `user/etc/passwd`, `user/etc/group`, `user/etc/hostname`, `user/etc/eshrc` | Message of the day; user database (`root` 0, `guest` 1000, both with `/bin/esh`); group names (for `ps` and `ls`); host name for prompts; the shell's system-wide start-up file. |
 | `user/www/index.html` | `httpd`'s default page (links into `/proc`). |
-| `Makefile` (`UCFLAGS`, `ULIB`, `UPROGS`, `UMULTI`, `EUTILS_LINKS`, `FS_FILES`) | How user code is compiled, linked, stripped and put in the disk image. `UMULTI` links each directory `user/bin/NAME/` into one program `/bin/NAME`. |
+| `Makefile` (`UCFLAGS`, `ULIB`, `UPROGS`, `UMULTI`, `EUTILS_LINKS`, `TEXTUTILS_LINKS`, `FILEUTILS_LINKS`, `SYSUTILS_LINKS`, `FS_FILES`) | How user code is compiled, linked, stripped and put in the disk image. `UMULTI` links each directory `user/bin/NAME/` into one program `/bin/NAME`. |
 
 ## Concepts and data structures
 
@@ -583,6 +588,17 @@ Options: `-d SECONDS`, `-o cpu|mem|swap|time|pid`, `-b` (batch: plain-text frame
 
 `eutils` (`user/bin/eutils.c`) is one binary. `main` takes the basename of `argv[0]` and dispatches with a chain of `strcmp`s. The disk image has `/bin/eutils` plus one hard link per name in `EUTILS_LINKS`, made by mkfs's `/path=@/existing` syntax. An unknown name prints `eutils: unknown tool 'X'` and exits with 2. Running `/bin/eutils` directly ends up there too. Some tools (`ln`, `mv`, `chmod`, `chown`) are only matched when the argument count is right, so a usage error also produces the "unknown tool" message.
 
+### The text, file and system tools
+
+Three more multi-call binaries, dispatched on the basename of `argv[0]` like `eutils`, plus three standalone programs. They follow GNU coreutils, findutils and procps where the options overlap, read the files named (standard input with none, or for `-`), report errors as `PROG: WHAT: MESSAGE` on stderr, and exit with the conventional statuses (`cmp`, `test` and `expr` use 0, 1 and 2 as POSIX says; `timeout` 124 for a timeout and 125-127 for its own failures; `xargs` 123-127). The libc pieces they needed are `fnmatch.h`, `pwd.h` and `grp.h`.
+
+- **`textutils`** (`user/bin/textutils.c`). `sort` reads every line into memory and sorts with `qsort`; keys compare in order, then (without `-u`) the whole line bytewise, then the input order, so the result is stable. `-n` compares with `strtod`. Without `-t`, fields are separated by runs of blanks and a key starts at its first non-blank. `tr` builds a 256-entry map from the expanded sets (ranges, `[:class:]`, `[c*n]`, octal and C escapes); `SET2` is padded with its last character. `rev`, `fold` and `expand` count a UTF-8 sequence as one column. `od` lines up every `-t` type in the same columns and replaces repeated 16-byte lines with `*` (unless `-v`). `xxd -r` reads the normal and the `-p` dump. `md5sum` and `sha256sum` are implemented in the file; `cksum` is the POSIX CRC (polynomial 0x04C11DB7, length appended).
+- **`sed`** (`user/bin/sed.c`) compiles the script into an array of commands (with `{` pointing to its `}`, and branches to their labels), then runs it once per line with a one-line lookahead for `$`. Regexes go to libc's `regcomp`: basic by default (with `\+ \? \|`), extended with `-E`; `\n` and `\t` in a regex are turned into the characters first. An empty regex means the last one used. Ranges keep their state in the command, as in GNU (`ADDR1,ADDR2` where `ADDR2` is a line number not past `ADDR1` matches one line; a regex `ADDR2` is checked from the next line). `-i` writes to `FILE.sedXXXXXX` beside the file, keeps the mode, and renames it over the original (after renaming the original to `FILE` + `SUFFIX` if there is one); `-i` and `-s` restart line numbers and `$` for each file. GNU behaviours: `n` and `N` on the last line print the pattern space and quit; `a`, `i` and `c` take one-line text; `s///` with `\U \L \u \l \E`.
+- **`find`** (`user/bin/find.c`) parses the expression into a tree (`-o` binds looser than the implicit `-a`; `!` and `( )`), appends `-print` when it has no action, and walks the tree depth first with `stat` (there are no symbolic links, so `-L`/`-H`/`-P` are accepted and ignored). It reads a directory's names before descending, so `-delete` and `-exec` can change it. `-exec ... {} +` gathers up to 1000 paths (or 32 KiB) per run. `-mtime` counts whole days, `-mmin` minutes rounded up, `-size` units rounded up. `-perm` takes octal modes only.
+- **`xargs`** (`user/bin/xargs.c`) splits standard input at blanks and newlines with `'...'`, `"..."` and `\` quoting (or at NULs, a delimiter, or lines), and runs the command (`echo` by default) when `-n`, `-L` or the 64 KiB `-s` limit is reached and at the end. With `-I STR` each line is one item and every `STR` in the arguments is replaced. Commands get `/dev/null` as standard input. `-P N` runs up to N at once.
+- **`fileutils`** (`user/bin/fileutils.c`). `du` counts `st_blocks` (in KiB; `-b` sizes in bytes) and a file with several links once. `dd` copies `ibs`-sized reads into `obs`-sized writes (with `bs=`, each read is written as it came) and prints the record counts and rate on stderr; since efs cannot shorten a file, `seek=` leaves the old data after the written part. `realpath` resolves `.` and `..` lexically (no symbolic links) and wants all but the last component to exist (`-e`: all; `-m`: none). `file` recognises ELF (class, type, machine, static or dynamic, debug info, stripped), compressed and archive formats by their magic numbers, and ASCII and UTF-8 text (scripts by `#!`, C and assembler by suffix). `test` and `[` follow POSIX's rules by argument count, then parse `! -a -o ( )` by precedence. `printf` reuses the format until the arguments are used up and accepts `'c` for a character's code.
+- **`sysutils`** (`user/bin/sysutils.c`). `pgrep`, `pkill`, `pidof` and `killall` read `/proc/<pid>/status` and `cmdline`; `pgrep` patterns are extended regexes matched against the name (`-f`: the command line), `pidof` and `killall` names match the process name or `argv[0]`'s last component exactly, and none of them matches itself (`pkill` also spares its parent). `timeout` polls the child every 10 ms and signals it at the deadline (SIGCONT too), with SIGKILL after `-k`. `time` (the program; esh's `time` keyword is separate) has no `rusage` to read, so it samples the child's `cpu_ms` in `/proc` while it runs and prints `real` and `cpu` (the child's own time, not its children's). `uptime` shows the process counts from `/proc/stat` (there is no load average). `hostname NAME` writes `/etc/hostname`. `cal` highlights today when writing to a terminal. `watch` runs the command with `sh -c`, captures its output and redraws the screen; `-c COUNT` (an Eunuchs extra) stops after COUNT runs.
+
 ### Network programs
 
 All of them use the BSD socket API from `net.c`, with `resolve_host` for names (`localhost` → 127.0.0.1; `host` or `gateway` → 10.0.2.2; otherwise dotted-quad only).
@@ -628,7 +644,7 @@ Fork and exec interactions:
 |---|---|
 | `unistd.h` | `__syscall`; `read write _exit fork execve execv execvp execl execlp execle pipe pipe2 fcntl getpid getppid brk sbrk sched_yield kill close lseek unlink rmdir link rename chdir getcwd dup dup2 sync fsync ftruncate setpgid getpgid getpgrp setsid getsid getuid geteuid getgid getegid setuid setgid chown access isatty usleep sysconf gethostname ttyname symlink readlink`, `getopt` with `optarg optind opterr optopt`; `STDIN_FILENO`..., `SEEK_*`, `R_OK`..., `_SC_PAGESIZE`, `_SC_CLK_TCK`; Eunuchs extras `sleep_ms(ms)` and `uptime_ms()`. `ftruncate` and `symlink` fail with `ENOSYS` and `readlink` with `EINVAL` (efs has neither). |
 | `stdio.h` | `FILE`, `stdin stdout stderr`; `fopen` (modes `r w a`, `+`, `b` ignored, `x` for `O_EXCL`, `e` for `O_CLOEXEC`) `fdopen freopen fclose fflush setvbuf setbuf fileno feof ferror clearerr`; `fgetc getc getchar ungetc fgets getline getdelim fread`; `fputc putc putchar fputs puts fwrite`; `fseek ftell rewind fgetpos fsetpos`; `printf fprintf dprintf sprintf asprintf` and their `v` forms, `snprintf`/`vsnprintf` (macros for `ksnprintf`/`kvsnprintf`); the `scanf` family; `perror remove rename tmpfile tmpnam`; `BUFSIZ` (4096), `EOF`, `_IOFBF _IOLBF _IONBF`; Eunuchs extras `fprintf_fd`, `eprintf(...)`, `fflush_stdout`. No `popen`. |
-| `stdlib.h` | `malloc calloc realloc reallocarray free malloc_stats`; `exit _Exit abort atexit system`; `getenv setenv unsetenv putenv environ`; `atoi atol atoll atof strtol strtoul strtoll strtoull strtod strtof strtold`; `abs labs llabs div ldiv lldiv`; `qsort bsearch`; `rand srand random srandom`, `RAND_MAX`; `realpath mkstemp mkdtemp mktemp`; `EXIT_SUCCESS`, `EXIT_FAILURE`, `MB_CUR_MAX` (1). |
+| `stdlib.h` | `malloc calloc realloc reallocarray free malloc_stats`; `exit _Exit abort atexit system`; `getenv setenv unsetenv putenv environ`; `atoi atol atoll atof strtol strtoul strtoll strtoull strtod strtof strtold`; `abs labs llabs div ldiv lldiv`; `qsort bsearch`; `rand srand random srandom`, `RAND_MAX`; `realpath mkstemp mkdtemp mktemp` (the templates need at least six trailing `X`s, and all of them are replaced); `EXIT_SUCCESS`, `EXIT_FAILURE`, `MB_CUR_MAX` (1). |
 | `string.h` | everything in `kstring.h` (`memset memcpy memmove memcmp strlen strnlen strcmp strncmp strchr strrchr strstr strlcpy memchr_inv kstrtoul kisspace kisdigit kisprint`) plus `strcpy stpcpy strncpy strcat strncat strdup strndup strspn strcspn strpbrk strtok strtok_r strsep memchr memrchr strcasecmp strncasecmp strcoll strxfrm strerror`. |
 | `errno.h` | `errno`, `strerror` (returns `char *`), all `E*` constants. |
 | `fcntl.h` | `open(path, flags, [mode])`, `creat`, `O_*`, `F_*`, `FD_CLOEXEC`, `AT_*`. |
@@ -647,6 +663,8 @@ Fork and exec interactions:
 | `math.h` | See [Mathematics](#mathematics-mathh). |
 | `setjmp.h` | `jmp_buf sigjmp_buf setjmp longjmp _setjmp _longjmp sigsetjmp siglongjmp`. |
 | `regex.h` | `regex_t regmatch_t regoff_t`, `regcomp regexec regerror regfree`, `REG_*` flags and errors. |
+| `fnmatch.h` | `fnmatch(pattern, string, flags)`: `*`, `?`, `[...]` with ranges and `!`/`^`, `\` escapes; `FNM_NOESCAPE`, `FNM_PATHNAME`, `FNM_PERIOD`, `FNM_CASEFOLD`; returns 0 or `FNM_NOMATCH`. |
+| `pwd.h`, `grp.h` | `struct passwd` (`pw_name pw_passwd pw_uid pw_gid pw_gecos pw_dir pw_shell`), `getpwnam getpwuid setpwent getpwent endpwent`; `struct group` (`gr_name gr_passwd gr_gid gr_mem`, at most 64 members), `getgrnam getgrgid setgrent getgrent endgrent`. The structures are static and overwritten by the next call. |
 | `curses.h` | The curses subset (see [curses](#curses-cursesh)); every supported call is listed in the header. |
 | `sys/swap.h` | `swapon(volume, flags)`, `swapoff(volume)`: root only; the volume is `/dev/disk0p5`, `disk0p5` or its GPT name (`swap`). |
 | `sys/reboot.h` | `reboot(how)`, `RB_AUTOBOOT`, `RB_POWER_OFF` (from `uapi/reboot.h`, Linux's values). |
@@ -739,6 +757,70 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `clear` | `clear` | ANSI home + clear screen. |
 | `reboot`, `poweroff`, `halt` | `reboot [-f]`, `poweroff [-f]`, `halt [-f]` | Root only. Like `shutdown -r now` and `shutdown -p now` (`halt` powers off), without the warning: sync, signal init (SIGUSR1 or SIGUSR2), and wait for init's signals to end it. init terminates every process and calls `reboot(RB_AUTOBOOT)` (restart through the boot loader) or `reboot(RB_POWER_OFF)`. `-f` calls `reboot(2)` at once, without init: the kernel syncs every filesystem first, so every write that has returned survives, but no process is told. To install a kernel: `kinstall -r NEW`. |
 
+`textutils` applets (`TEXTUTILS_LINKS`):
+
+| Name | Usage | Notes |
+|---|---|---|
+| `sort` | `sort [-nrufbc] [-t SEP] [-k F[.C][,F[.C]][nrfb]]... [-o FILE] [FILE...]` | Up to 8 keys; `-c` checks the order; `-o` may name an input file. |
+| `uniq` | `uniq [-cdui] [-f N] [-s N] [INPUT [OUTPUT]]` | Adjacent duplicates; `-f` skips fields, `-s` characters. |
+| `cut` | `cut -b LIST \| -c LIST \| -f LIST [-d C] [-s] [FILE...]` | LIST: `N`, `N-M`, `N-`, `-M`, comma separated. `-c` counts bytes. |
+| `tr` | `tr [-cds] SET1 [SET2]` | Ranges, `[:alpha:]`-style classes, `[c*n]`, escapes. |
+| `nl` | `nl [-b a\|t\|n] [-n ln\|rn\|rz] [-w N] [-s SEP] [-v N] [-i N] [FILE]` | Numbers non-empty lines by default. |
+| `tac`, `rev` | `tac [FILE...]`, `rev [FILE...]` | Lines in reverse order; characters of each line reversed. |
+| `paste` | `paste [-s] [-d LIST] FILE...` | |
+| `comm` | `comm [-123] FILE1 FILE2` | Sorted inputs. |
+| `cmp` | `cmp [-l \| -s] FILE1 FILE2 [SKIP1 [SKIP2]]` | Exit 0 same, 1 different, 2 trouble. |
+| `fold` | `fold [-bs] [-w WIDTH] [FILE...]` | Default width 80. |
+| `expand` | `expand [-i] [-t N \| -t LIST] [FILE...]` | |
+| `od` | `od [-A o\|d\|x\|n] [-t TYPE]... [-bcdox] [-j SKIP] [-N COUNT] [-v] [FILE...]` | TYPE: `o x d u` with size `1 2 4 8` (or `C S I L`), `c`, `a`. Default `-t o2`. |
+| `xxd` | `xxd [-p] [-i] [-r] [-u] [-c COLS] [-g BYTES] [-l LEN] [-s SEEK] [IN [OUT]]` | Hex dump, plain (`-p`), C array (`-i`), or back to binary (`-r`). |
+| `strings` | `strings [-a] [-n MIN] [-t d\|o\|x] [FILE...]` | Printable runs of at least 4 (the whole file is always scanned). |
+| `cksum` | `cksum [FILE...]` | `CRC SIZE NAME`. |
+| `md5sum`, `sha256sum` | `md5sum [-c] [FILE...]`, `sha256sum [-c] [FILE...]` | `-c` checks `HASH  NAME` lines. |
+
+Standalone:
+
+| Name | Usage | Notes |
+|---|---|---|
+| `sed` | `sed [-nEsuz] [-i[SUFFIX]] [-e SCRIPT]... [-f FILE]... [SCRIPT] [FILE...]` | Addresses `N`, `$`, `/RE/[I]`, `\cREc`, `FIRST~STEP`, `A,B`, `A,+N`, `A,~N`, `0,/RE/`, `!`. Commands `{ } = a i c b t T : d D g G h H l n N p P q Q r w s y z #`. `s` flags `g p N i w FILE`. `--quiet`, `--regexp-extended`, `--separate`, `--in-place[=SUFFIX]`. |
+| `find` | `find [PATH...] [EXPRESSION]` | Tests `-name -iname -path -ipath -type -size -mtime -mmin -ctime -cmin -atime -amin -newer -perm -user -group -uid -gid -nouser -nogroup -links -inum -empty -readable -writable -executable -true -false`; actions `-print -print0 -printf -ls -exec ... ; -exec ... {} + -ok -delete -prune -quit`; options `-maxdepth -mindepth -depth -xdev`. `-printf` knows `%p %f %h %s %d %m %M %u %U %g %G %i %n %y %t %T?`. |
+| `xargs` | `xargs [-0] [-d DELIM] [-n MAX] [-L LINES] [-I STR] [-s SIZE] [-P N] [-rtpx] [COMMAND [ARG...]]` | `-E`/`-e` are accepted and ignored. |
+
+`fileutils` applets (`FILEUTILS_LINKS`):
+
+| Name | Usage | Notes |
+|---|---|---|
+| `du` | `du [-ahsbck] [-d DEPTH] [FILE...]` | KiB by default. |
+| `dd` | `dd [if=F] [of=F] [bs=N] [ibs=N] [obs=N] [count=N] [skip=N] [seek=N] [conv=notrunc,noerror,sync,ucase,lcase,fsync] [status=none\|noxfer]` | Sizes take `c w b k K M G` and `x`. |
+| `basename`, `dirname` | `basename NAME [SUFFIX]`, `basename -a [-s SUFFIX] NAME...`, `dirname NAME...` | |
+| `realpath` | `realpath [-e \| -m] [-q] PATH...` | |
+| `mktemp` | `mktemp [-dqtu] [-p DIR] [TEMPLATE]` | Default `$TMPDIR/tmp.XXXXXXXXXX` (`/tmp`). At least 3 `X`s. |
+| `chgrp` | `chgrp [-R] GROUP FILE...` | Root only (the kernel's `chown` rule). |
+| `file` | `file FILE...` | |
+| `sync` | `sync` | |
+| `seq` | `seq [-w] [-s SEP] [-f FORMAT] [FIRST [INCREMENT]] LAST` | Decimals as many as FIRST or INCREMENT have. |
+| `expr` | `expr EXPRESSION` | `\| & = == != < <= > >= + - * / % :`, `match substr index length`, `+ TOKEN`, `( )`. |
+| `test`, `[` | `test EXPRESSION`, `[ EXPRESSION ]` | The shell's builtins usually run instead; these are for `find -exec`, `xargs` and other programs. `-h`/`-L` are always false. |
+| `printf` | `printf FORMAT [ARGUMENT...]` | `%d %i %o %u %x %X %f %e %g %a %c %s %b %%`, flags, `*` widths; escapes `\a \b \c \e \f \n \r \t \v \NNN \xHH`. |
+
+`sysutils` applets (`SYSUTILS_LINKS`):
+
+| Name | Usage | Notes |
+|---|---|---|
+| `timeout` | `timeout [-s SIGNAL] [-k DURATION] [--preserve-status] DURATION COMMAND [ARG...]` | DURATION: seconds with `s m h d`; 0 means none. Exit 124 on timeout. |
+| `nohup` | `nohup COMMAND [ARG...]` | Ignores SIGHUP; output to `nohup.out` (or `$HOME/nohup.out`) when standard output is a terminal. |
+| `time` | `time [-p] COMMAND [ARG...]` | `real` and `cpu` on stderr. |
+| `whoami`, `groups` | `whoami`, `groups [USER...]` | Groups from `/etc/group` (the kernel has no supplementary groups). |
+| `hostname` | `hostname [-s] [NAME]` | Setting it writes `/etc/hostname`. |
+| `tty` | `tty [-s]` | |
+| `printenv` | `printenv [NAME...]` | |
+| `uptime` | `uptime [-p \| -s]` | |
+| `cal` | `cal [-y] [[MONTH] YEAR]` | Gregorian throughout (no 1752 gap). |
+| `pgrep`, `pkill` | `pgrep [-flaxinovc] [-d DELIM] [-u USER] [-P PPID] PATTERN`, `pkill [-SIGNAL \| -s SIGNAL] [-flxinoe] [-u USER] [-P PPID] PATTERN` | |
+| `pidof` | `pidof [-s] [-o PID] NAME...` | Newest first. |
+| `killall` | `killall [-q] [-v] [-SIGNAL \| -s SIGNAL] NAME...`, `killall -l` | |
+| `watch` | `watch [-t] [-g] [-n SECS] [-c COUNT] COMMAND [ARG...]` | Interval at least 0.1 s; ^C stops it. |
+
 ### Files in the disk image
 
 `FS_FILES` in the Makefile, installed in order into the image's `root` partition by `build/tools/eudisk install` (partition size `FS_MB` = 64 MiB). The image is one GPT disk: `boot` and `boot.old` (16 MiB each, `kernel.elf` in each, mounted on `/boot` and `/boot.old`), `root` and `home` (64 MiB, `/guest` owned by 1000:1000), and `swap` (128 MiB of swap space):
@@ -757,6 +839,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `/usr/src/` | the sources of every program (`user/bin/`) and `user/usr-src/Makefile` |
 | `/usr/src/eunuchs/` | the whole source tree needed to rebuild the system (kernel, libc, programs, tcc, kld, build scripts): `cd /usr/src/eunuchs && sh tools/selfhost.sh` ([13](13-toolchain.md#the-source-tree-in-the-image-usrsrceunuchs)) |
 | `/bin/<applet>` for every `EUTILS_LINKS` name | hard link to `/bin/eutils` (`=@/bin/eutils`) |
+| `/bin/<applet>` for every `TEXTUTILS_LINKS`, `FILEUTILS_LINKS` and `SYSUTILS_LINKS` name | hard links to `/bin/textutils`, `/bin/fileutils` and `/bin/sysutils` (`MULTI_LINKS`) |
 | `/etc/motd`, `/etc/passwd`, `/etc/group`, `/etc/hostname`, `/etc/eshrc` | `user/etc/`; marked `+` (configuration: if you edit one in `disk.img`, an update leaves yours and writes the new version as `FILE.new`) |
 | `/dev/`, `/proc/` | empty mount points |
 | `/tmp/` | mode 0777 |
@@ -784,6 +867,8 @@ guest:x:1000:1000:guest:/home/guest:/bin/esh
 1. Add a `if (!strcmp(prog, "foo")) { ... }` branch in `eutils.c` `main`, before the final `else` chain, or as a helper function like `head`/`tail`.
 2. Add `foo` to `EUTILS_LINKS` in the Makefile.
 3. Update the comment at the top of `eutils.c` and the tables here.
+
+The other multi-call binaries work the same way: a `foo_main(argc, argv)` in `textutils.c`, `fileutils.c` or `sysutils.c`, a line in its `main`, and the name in `TEXTUTILS_LINKS`, `FILEUTILS_LINKS` or `SYSUTILS_LINKS`.
 
 **A new libc function or system call wrapper:** add the code to the file for its area (`libc.c` for system call wrappers, `net.c` for networking, `stdio.c`, `stdlib.c`, `strings.c`, `math.c`, `time.c`, `unistd2.c`, ...; a new file in `user/lib/` is picked up by the `ULIB` wildcard) and the prototype to the right header in `user/include`. A new system call also needs an entry in `SYSCALLS` in `lib/include/uapi/syscall.h` and a kernel implementation. A new shell builtin is a function in `user/bin/esh/builtins.c` plus an entry (with its one-line help) in the `builtins[]` table.
 

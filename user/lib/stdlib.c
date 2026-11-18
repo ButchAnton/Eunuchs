@@ -441,6 +441,8 @@ char *realpath(const char *path, char *resolved)
                 o--;
                 while (o > 1 && out[o - 1] != '/')
                     o--;
+                if (o > 1)
+                    o--;                /* and the slash before it */
             }
         } else {
             if (o > 1)
@@ -467,27 +469,39 @@ char *realpath(const char *path, char *resolved)
     return resolved;
 }
 
-static int fill_template(char *tmpl)
+/* The number of trailing X's in a template (at least 6), or -1 (EINVAL). */
+static long template_xs(const char *tmpl)
 {
-    size_t n = strlen(tmpl);
-    if (n < 6 || strcmp(tmpl + n - 6, "XXXXXX")) {
+    size_t n = strlen(tmpl), x = n;
+    while (x > 0 && tmpl[x - 1] == 'X')
+        x--;
+    if (n - x < 6) {
         errno = EINVAL;
         return -1;
     }
+    return n - x;
+}
+
+/* Replace the last NX characters (the X's) with random ones. */
+static void fill_template(char *tmpl, long nx)
+{
     static const char chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
-    unsigned long long r = (unsigned long long)getpid() * 2654435761ULL + uptime_ms() + rand();
-    for (int i = 0; i < 6; i++) {
-        tmpl[n - 6 + i] = chars[r % 36];
+    static unsigned long long r;
+    r += (unsigned long long)getpid() * 2654435761ULL + uptime_ms() + rand();
+    size_t n = strlen(tmpl);
+    for (size_t i = n - nx; i < n; i++) {
+        tmpl[i] = chars[r % 36];
         r = r / 36 + rand();
     }
-    return 0;
 }
 
 int mkstemp(char *tmpl)
 {
+    long nx = template_xs(tmpl);
+    if (nx < 0)
+        return -1;
     for (int tries = 0; tries < 100; tries++) {
-        if (fill_template(tmpl) < 0)
-            return -1;
+        fill_template(tmpl, nx);
         int fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
         if (fd >= 0 || errno != EEXIST)
             return fd;
@@ -498,9 +512,11 @@ int mkstemp(char *tmpl)
 char *mktemp(char *tmpl)
 {
     struct stat st;
+    long nx = template_xs(tmpl);
+    if (nx < 0)
+        return 0;
     for (int tries = 0; tries < 100; tries++) {
-        if (fill_template(tmpl) < 0)
-            return 0;
+        fill_template(tmpl, nx);
         if (stat(tmpl, &st) < 0)
             return tmpl;
     }
@@ -510,9 +526,11 @@ char *mktemp(char *tmpl)
 
 char *mkdtemp(char *tmpl)
 {
+    long nx = template_xs(tmpl);
+    if (nx < 0)
+        return 0;
     for (int tries = 0; tries < 100; tries++) {
-        if (fill_template(tmpl) < 0)
-            return 0;
+        fill_template(tmpl, nx);
         if (mkdir(tmpl, 0700) == 0)
             return tmpl;
         if (errno != EEXIST)

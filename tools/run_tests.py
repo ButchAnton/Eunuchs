@@ -409,6 +409,93 @@ def main():
     # The native toolchain and the editors: tcc compiles and runs a program (to
     # a file and with -run), make rebuilds a program from /usr/src, and both
     # editor personalities edit and save a file.
+    # textutils (sort uniq cut tr nl tac rev paste comm cmp fold expand od
+    # xxd strings cksum md5sum sha256sum). Expected text never appears in
+    # the command line itself, which the console echoes.
+    interactive("text tools", [
+        ("printf 'b 2\\na 10\\nc 1\\n' | sort -n -k2 | tr '\\n' ,", "c 1,b 2,a 10,"),
+        ("printf 'x\\ny\\nx\\n' | sort | uniq -c | tr -s ' ' | tr '\\n' ,", "2 x, 1 y,"),
+        ("printf 'b\\na\\n' | sort -r -o /tmp/sorted && cat /tmp/sorted | paste -s -d=", "b=a"),
+        ("echo a:b:c:d | cut -d: -f2,4", "b:d"),
+        ("echo hello | tr a-z A-Z", "HELLO"),
+        ("echo aaabbbccc | tr -s abc | rev", "cba"),
+        ("echo 'x1y22z' | tr -cd '[:digit:]'; echo", "122"),
+        ("printf 'x\\n\\ny\\n' | nl -s: | tail -1", "2:y"),
+        ("seq 3 | tac | paste -s -d-", "3-2-1"),
+        ("printf 'a\\nb\\n' > /tmp/cm1; printf 'b\\nc\\n' > /tmp/cm2; comm -3 /tmp/cm1 /tmp/cm2 | tr '\\t\\n' '_,'",
+         "a,_c,"),
+        ("echo hello > /tmp/h1; echo hellp > /tmp/h2; cmp /tmp/h1 /tmp/h2", "differ: byte 5, line 1"),
+        ("echo abcdefghij | fold -w 4 | paste -s -d+", "abcd+efgh+ij"),
+        ("printf 'a\\tb|\\n' | expand -t 4", "a   b|"),
+        ("printf 'AB' | od -A x -t x1", "000000 41 42"),
+        ("printf 'hi\\n' | xxd", "00000000: 6869 0a"),
+        ("echo round-trip | xxd | xxd -r | tr a-z A-Z", "ROUND-TRIP"),
+        ("printf 'xy\\001longword\\002' | strings | tr a-z A-Z", "LONGWORD"),
+        ("cksum /tmp/h1", "3015617425 6 /tmp/h1"),
+        ("md5sum /tmp/h1", "b1946ac92492d2347c6235b4d2611184"),
+        ("cd /tmp && sha256sum h1 > sums && sha256sum -c sums; cd /", "h1: OK"),
+        ("sha256sum /tmp/h1", "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"),
+    ])
+
+    # sed, find and xargs
+    interactive("sed, find, xargs", [
+        ("seq 10 | sed -n '3,5p' | paste -s -d,", "3,4,5"),
+        ("echo hello world | sed 's/o/0/g'", "hell0 w0rld"),
+        ("seq 3 | sed '1!G;h;$!d' | paste -s -d,", "3,2,1"),
+        ("echo abc | sed -E 's/(b)/[\\1]/'", "a[b]c"),
+        ("echo ab | sed 's/\\(a\\)\\(b\\)/\\U\\2\\1/'", "BA"),
+        ("seq 3 | sed ':a;N;$!ba;s/\\n/+/g'", "1+2+3"),
+        ("seq 6 | sed -n '2~2p;$=' | paste -s -d,", "2,4,6,6"),
+        ("seq 2 | sed '1a after' | paste -s -d,", "1,after,2"),
+        ("echo foo > /tmp/i; sed -i.bak 's/foo/bar/' /tmp/i; cat /tmp/i /tmp/i.bak | paste -s -d,", "bar,foo"),
+        ("mkdir -p /tmp/ft/a/b; touch /tmp/ft/x.txt /tmp/ft/a/y.txt; echo z > /tmp/ft/a/b/z.c", None),
+        ("find /tmp/ft -name '*.txt' | sort | paste -s -d,", "/tmp/ft/a/y.txt,/tmp/ft/x.txt"),
+        ("find /tmp/ft -type d | sort | paste -s -d,", "/tmp/ft,/tmp/ft/a,/tmp/ft/a/b"),
+        ("find /tmp/ft -type f -size +0c", "/tmp/ft/a/b/z.c"),
+        ("find /tmp/ft -empty | sort | xargs -n1 basename | paste -s -d+", "y.txt+x.txt"),
+        ("find /tmp/ft -name '*.c' -exec cat {} + | tr z Z", "Z"),
+        ("find /tmp/ft -name a -prune -o -type f -print", "/tmp/ft/x.txt"),
+        ("printf 'a b\\nc\\n' | xargs -n 2 echo X | paste -s -d,", "X a b,X c"),
+        ("printf '1\\n2\\n' | xargs -I@ echo '[@]' | paste -s -d,", "[1],[2]"),
+        ("printf '1\\n' | xargs nonexistent-cmd; echo rc=$?", "rc=127"),
+    ])
+
+    # fileutils and sysutils
+    interactive("file and system tools", [
+        ("echo $(basename /x/y/file.txt .txt)-$(dirname /x/y/file.txt)", "file-/x/y"),
+        ("cd /etc && realpath ../tmp/./ft/a/..; cd /", "/tmp/ft"),
+        ("t=$(mktemp -d) && [ -d $t ] && echo $t | cut -c1-9", "/tmp/tmp."),
+        ("chgrp guest /tmp/ft/x.txt && find /tmp/ft/x.txt -printf '%u:%g'; echo", "root:guest"),
+        ("file /bin/ls", "ELF 64-bit LSB executable, UCB RISC-V, statically linked"),
+        ("file /etc/passwd /tmp", "/tmp: directory"),
+        ("echo abcdefgh | dd bs=1 skip=2 count=3 status=none; echo", "cde"),
+        ("du -sh /bin | grep -c M", "1"),
+        ("seq -w 8 10 | paste -s -d,", "08,09,10"),
+        ("expr 2 + 3 '*' 4", "14"),
+        ("expr hello : 'h\\(.*\\)o'", "ell"),
+        ("/bin/test 5 -lt 3; echo t=$?", "t=1"),
+        ("/bin/[ -d /etc -a ! -f /etc ]; echo u=$?", "u=0"),
+        ("/bin/printf '%05.1f|%-3s|%x\\n' 3.14159 ab 255", "003.1|ab |ff"),
+        ("echo me=$(whoami) h=$(hostname)", "me=root h=eunuchs"),
+        ("groups guest", "guest : guest"),
+        ("tty", "/dev/console"),
+        ("FOO=bar printenv FOO | tr a-z A-Z", "BAR"),
+        ("uptime", "processes"),
+        ("cal 2 2024 | grep 29", "25 26 27 28 29"),
+        ("sleep 1000 &", None),
+        ("echo n=$(pgrep -c sleep)", "n=1"),
+        ("test \"$(pidof sleep)\" = \"$!\"; echo p=$?", "p=0"),
+        ("pkill sleep; sleep 0.2; pgrep sleep; echo rc=$?", "rc=1"),
+        ("sleep 1000 &", None),
+        ("killall -v sleep", "Killed sleep("),
+        ("killall nothing-here", "no process found"),
+        ("timeout 0.3 sleep 5; echo rc=$?", "rc=124"),
+        ("timeout 5 true; echo rc=$?", "rc=0"),
+        ("cd /tmp && nohup echo detached; cat /tmp/nohup.out; cd /", "ignoring input and appending output"),
+        ("/bin/time sleep 0.2", "0m0.2"),
+        ("watch -n 0.1 -c 1 true", "Every 0.1s: true"),
+    ])
+
     interactive("toolchain and editors", [
         ("echo '#include <stdio.h>' > /tmp/h.c", None),
         ("echo 'int main(void) { printf(\"tcc says %d\", 6 * 7); puts(\"\"); return 0; }' >> /tmp/h.c",
