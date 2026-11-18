@@ -467,6 +467,37 @@ def main():
         (None, "eboot: powering off", False),
     ], image=bootimg)
 
+    # shutdown, reboot and poweroff go through init (SIGUSR1/SIGUSR2): it
+    # terminates every process (SIGKILL for those that ignore SIGHUP and
+    # SIGTERM), syncs, and reboots or powers off. Only root may ask it.
+    downimg = os.path.join(build, "test-shutdown.img")
+    shutil.copyfile(img, downimg)
+    interactive("shutdown", [
+        ("su guest", None, False), (None, "guest@eunuchs:~% ", False),
+        ("shutdown -r now", "you must be root"),
+        ("kill -USR1 1", "Operation not permitted"),
+        ("poweroff", "Operation not permitted"),
+        ("exit", None),
+        ("shutdown -x", "usage: shutdown"),
+        ("shutdown -r 25:00", "bad time"),
+        ("shutdown -r +5 back soon", "scheduled reboot at"),
+        (None, "going down for reboot in 5 minutes!", False),
+        ("shutdown now", "already pending"),
+        ("shutdown -c", "has been cancelled"),
+        ("shutdown -c", "no shutdown is pending"),
+        ("sh -c \"trap '' HUP TERM; sleep 100000\" &", None),
+        ("sleep 1", None),                  # so the trap is set before the signals come
+        ("echo survives > /persist2.txt; shutdown -r now", "going down for reboot NOW", False),
+        (None, "init: rebooting", False),
+        (None, "init: killing the processes that are left", False, 15),
+        (None, "Eunuchs 0.1 (riscv64)", False, 20),
+        (None, "root@eunuchs:/# ", False, 20),
+        ("cat /persist2.txt", "survives"),
+        ("sleep 100000 &", None),
+        ("poweroff", "init: powering off", False),
+        (None, "power off requested by pid 1", False, 15),
+    ], image=downimg)
+
     interactive("host share (9p)", [
         ("cat /mnt/host/from-mac.txt", "made on the mac"),
         ("echo made in eunuchs > /mnt/host/from-guest.txt && mkdir /mnt/host/d && "

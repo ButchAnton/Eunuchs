@@ -322,6 +322,9 @@ Programs that want big, page-granular memory can use `mmap(NULL, len, PROT_READ|
    - in once mode, init returns its status (`128 + signal` if it was killed), and the kernel powers off with that result;
    - otherwise it prints `init: /bin/esh (pid N) exited with status S; restarting`, sleeps 200 ms and starts it again.
 
+   init keeps SIGUSR1, SIGUSR2 and SIGCHLD blocked except while it sleeps in `sigsuspend` (it reaps with `waitpid(WNOHANG)`), so a signal that arrives just before it sleeps still wakes it. Its children start with the default mask and handlers.
+4. **Shutting down.** SIGUSR1 asks init to reboot, SIGUSR2 to power off (only root may signal pid 1; `shutdown`, `reboot`, `poweroff` and `halt` send them). init prints `init: rebooting` or `init: powering off`, stops restarting the shell, and sends SIGHUP, SIGTERM and SIGCONT to every other process (`kill(-1)`; SIGHUP because the interactive shell ignores SIGTERM). It reaps for up to 5 s; if anything is left it prints `init: killing the processes that are left`, sends SIGKILL and reaps for up to 5 s more. Then `sync()` and `reboot(2)`, which syncs again (waiting for the log commit) and resets or powers off.
+
 ### The shell
 
 The shell is `esh`; [12-shell.md](12-shell.md) describes the language, the line editor, and how they are implemented. As a user-space program, what matters here is:
@@ -663,7 +666,8 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 
 | Name | Usage | Notes |
 |---|---|---|
-| `init` | `init [-1] [PROG ARGS...]` | pid 1. Runs `/bin/esh -l` by default and restarts it 200 ms after it exits. `-1`: run once and return its status. |
+| `init` | `init [-1] [PROG ARGS...]` | pid 1. Runs `/bin/esh -l` by default and restarts it 200 ms after it exits. `-1`: run once and return its status. SIGUSR1/SIGUSR2: shut down and reboot/power off (see [init](#init)). |
+| `shutdown` | `shutdown [-r\|-h\|-p] [-k] [TIME] [MESSAGE...]`, `shutdown -c [MESSAGE...]` | Root only. `-r` reboot, `-h`/`-p` power off (the default; there is no halted state), `-k` only warn, `-c` cancel the pending shutdown. TIME: `now` (the default), `+MINUTES` or `HH:MM` (tomorrow if past). A delayed shutdown runs in the background in a session of its own, with its pid in `/tmp/shutdown.pid` (one is pending only if that pid is a running `shutdown`, so the file left by a reboot is ignored); a second one is refused. Warnings (`*** System shutdown message from root ***`, the time left and MESSAGE) go to `/dev/console` when it starts, at 60, 30, 15, 10, 5, 2 and 1 minutes and 30 and 10 seconds before, and at the time. Then it syncs and signals init (SIGUSR1 reboot, SIGUSR2 power off). |
 | `esh` (also `sh`) | `esh`, `esh -c CMDS [NAME ARGS]`, `esh FILE [ARGS]`, `esh -i`, `esh -l` | The shell; see [12-shell.md](12-shell.md). |
 | `ls` | `ls [OPTION]... [FILE]...` | GNU-style; see [The `ls` command](#the-ls-command). |
 | `cat` | `cat [FILE...]` | stdin with no arguments; 4 KiB reads. |
@@ -733,7 +737,7 @@ Standalone programs (each `user/bin/NAME.c` → `/bin/NAME`):
 | `dbg` | `dbg break \| mark TEXT \| vm \| files \| ps \| fscrash POINT` | Front end for `SYS_debug`. |
 | `uname` | `uname` | Prints `Eunuchs 0.1 riscv64`. |
 | `clear` | `clear` | ANSI home + clear screen. |
-| `reboot`, `poweroff` | `reboot`, `poweroff` | `reboot(RB_AUTOBOOT)` (restart through the boot loader) or `reboot(RB_POWER_OFF)`; root only. The kernel syncs every filesystem first, so every write that has returned survives. To install a kernel: `kinstall -r NEW`. |
+| `reboot`, `poweroff`, `halt` | `reboot [-f]`, `poweroff [-f]`, `halt [-f]` | Root only. Like `shutdown -r now` and `shutdown -p now` (`halt` powers off), without the warning: sync, signal init (SIGUSR1 or SIGUSR2), and wait for init's signals to end it. init terminates every process and calls `reboot(RB_AUTOBOOT)` (restart through the boot loader) or `reboot(RB_POWER_OFF)`. `-f` calls `reboot(2)` at once, without init: the kernel syncs every filesystem first, so every write that has returned survives, but no process is told. To install a kernel: `kinstall -r NEW`. |
 
 ### Files in the disk image
 

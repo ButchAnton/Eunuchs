@@ -299,9 +299,9 @@ Wrappers:
 - `pid > 0`: one process.
 - `pid == 0`: the caller's own group.
 - `pid < -1`: group `-pid`.
-- `pid == -1`: returns `-EINVAL` (not supported).
+- `pid == -1`: every live process except init (pid 1) and the caller; root only (`EPERM` otherwise), `ESRCH` if there was no one. init uses it to shut down.
 
-There is **no permission check**: any process may signal any other.
+The only permission checks are for init: only root may signal pid 1 (its SIGUSR1 and SIGUSR2 mean reboot and power off), and only root may use `kill(-1)`. Otherwise any process may signal any other.
 
 ### Delivery (`signal_deliver`) and the return-to-user path
 
@@ -614,7 +614,7 @@ The monitor's `kill` sends SIGKILL with `spin_lock_debug`, so it works even if t
 - **Orphans of init**: when init itself exits (utest mode), its children get `parent = NULL` and are never reaped.
 - **No orphaned-process-group rules**: there is no SIGHUP/SIGCONT to orphaned stopped groups, and SIGTTIN is still sent to an orphaned background group. Such a group can stop forever.
 - **No SIGCHLD semantics beyond notification**: `SA_NOCLDSTOP` is ignored, `SIG_IGN`/`SA_NOCLDWAIT` do not auto-reap, and there is no `WCONTINUED` and no SIGCHLD on continue.
-- **Signals**: 31 numbers in a `u32` mask, no real-time or queued signals (a second instance of a pending signal is merged), no `siginfo`, no `sigaltstack` (so a SIGSEGV handler cannot run after a stack overflow), `kill(-1)` is unsupported, and signalling a zombie returns `ESRCH` (Linux returns 0).
+- **Signals**: 31 numbers in a `u32` mask, no real-time or queued signals (a second instance of a pending signal is merged), no `siginfo`, no `sigaltstack` (so a SIGSEGV handler cannot run after a stack overflow), signalling a zombie returns `ESRCH` (Linux returns 0).
 - **FP state across handlers is not fully symmetric**: if a handler is the first code in the thread to use floating point, the frame has `fp_valid = 0`, so `rt_sigreturn` leaves the handler's FP register values (and `FS` on) for the interrupted code. That code had never used FP, so it is harmless, but it is not a strict restore. Every frame is 552 bytes, FP area included, even for programs that never use FP.
 - **TTY job control is partial**: only one tty; no SIGTTOU or `TOSTOP` for writes or `tcsetpgrp` from the background; `TIOCSPGRP` accepts any number; `TIOCSCTTY` steals the console from another session; a session leader's exit does not detach the terminal or send SIGHUP; `tty.pgrp` is read and written without a lock.
 - **Credentials**: `u16` ids, no supplementary groups, no `setreuid`/`setresuid`/`setfsuid`; `access()` checks effective rather than real ids; `chown` does not clear setuid/setgid bits; there is no `nosuid` handling.

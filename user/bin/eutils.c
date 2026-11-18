@@ -2,7 +2,7 @@
  * eutils: one binary, many small tools, chosen by argv[0] (the disk image
  * has /bin/<tool> as hard links to it):
  *   echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env
- *   id true false yes kill date dmesg sleep strace su dbg uname clear reboot poweroff
+ *   id true false yes kill date dmesg sleep strace su dbg uname clear reboot poweroff halt
  */
 #include <dirent.h>
 #include <errno.h>
@@ -487,6 +487,36 @@ static int crc32_cmd(int argc, char **argv)
     return rc;
 }
 
+/* reboot, poweroff, halt [-f]: ask init to shut down in order (it terminates
+   every process, syncs, then restarts through the boot loader or powers off;
+   Eunuchs has no halted state, so halt powers off). -f skips init and calls
+   reboot(2) at once: the kernel still syncs, but nothing is told to exit. */
+static int reboot_main(int argc, char **argv)
+{
+    int force = 0, rb = !strcmp(prog, "reboot");
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-f"))
+            force = 1;
+        else {
+            eprintf("usage: %s [-f]\n", prog);
+            return 2;
+        }
+    }
+    if (geteuid() != 0) {
+        errno = EPERM;
+        return fail(prog);
+    }
+    if (force) {
+        reboot(rb ? RB_AUTOBOOT : RB_POWER_OFF);
+        return fail(prog);
+    }
+    sync();
+    if (kill(1, rb ? SIGUSR1 : SIGUSR2) < 0)
+        return fail("init");
+    for (;;)
+        pause();                            /* until init's SIGTERM */
+}
+
 int main(int argc, char **argv)
 {
     prog = strrchr(argv[0], '/') ? strrchr(argv[0], '/') + 1 : argv[0];
@@ -752,10 +782,8 @@ int main(int argc, char **argv)
     } else if (!strcmp(prog, "mv") && argc == 3) {
         if (rename(argv[1], argv[2]) < 0)
             rc = fail(argv[1]);
-    } else if (!strcmp(prog, "reboot") || !strcmp(prog, "poweroff")) {
-        /* through the boot loader again (reboot), or off */
-        if (reboot(!strcmp(prog, "reboot") ? RB_AUTOBOOT : RB_POWER_OFF) < 0)
-            rc = fail(prog);
+    } else if (!strcmp(prog, "reboot") || !strcmp(prog, "poweroff") || !strcmp(prog, "halt")) {
+        rc = reboot_main(argc, argv);
     } else if (!strcmp(prog, "cp")) {
         rc = cp_main(argc, argv);
     } else if (!strcmp(prog, "wc")) {

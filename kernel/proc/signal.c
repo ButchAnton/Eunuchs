@@ -333,6 +333,8 @@ long do_kill(const u64 *a)
     if (sig < 0 || sig >= NSIG)
         return -EINVAL;
     if (pid > 0) {
+        if (pid == 1 && self->euid != 0 && self->pid != 1)
+            return -EPERM;              /* init's signals ask it to shut down */
         unsigned long flags = spin_lock_irqsave(&proc_lock);
         int r = signal_send_locked(proc_find((int)pid), sig, self->pid);
         spin_unlock_irqrestore(&proc_lock, flags);
@@ -342,7 +344,19 @@ long do_kill(const u64 *a)
         return signal_send_pgrp(self->pgid, sig, self->pid);
     if (pid < -1)
         return signal_send_pgrp((int)-pid, sig, self->pid);
-    return -EINVAL;                     /* kill(-1): not supported */
+
+    /* kill(-1): every process but init and the caller (shutdown); root only */
+    if (self->euid != 0)
+        return -EPERM;
+    int n = 0;
+    struct proc *p;
+    unsigned long flags = spin_lock_irqsave(&proc_lock);
+    list_for_each_entry(p, &all_procs, all_node)
+        if (p->pid != 1 && p != self && p->state == P_ALIVE &&
+            signal_send_locked(p, sig, self->pid) == 0)
+            n++;
+    spin_unlock_irqrestore(&proc_lock, flags);
+    return n ? 0 : -ESRCH;
 }
 
 long do_rt_sigaction(const u64 *a)
