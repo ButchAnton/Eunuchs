@@ -496,6 +496,36 @@ def main():
         ("watch -n 0.1 -c 1 true", "Every 0.1s: true"),
     ])
 
+    # gzip, tar, diff, bc and awk
+    interactive("gzip, tar, diff, bc, awk", [
+        ("cp /usr/src/eunuchs/user/bin/sed.c /tmp/z.c && gzip /tmp/z.c && ls /tmp/z.c*", "/tmp/z.c.gz"),
+        ("gzip -l /tmp/z.c.gz | awk 'NR == 2 { print ($1 < $2 / 2) ? \"well compressed\" : \"poorly\" }'",
+         "well compressed"),
+        ("zcat /tmp/z.c.gz | cmp - /usr/src/eunuchs/user/bin/sed.c && echo zcat same", "zcat same"),
+        ("gunzip /tmp/z.c.gz && cmp /tmp/z.c /usr/src/eunuchs/user/bin/sed.c && ls /tmp/z.c*", "/tmp/z.c\r\n"),
+        ("echo garbage | gzip -d; echo rc=$?", "not in gzip format"),
+        ("cd /tmp && tar czf t.tgz /usr/src/eunuchs/user/bin 2>/dev/null; "
+         "[ $(tar tf t.tgz | wc -l) -eq $(find /usr/src/eunuchs/user/bin | wc -l) ] && echo counts agree; cd /",
+         "counts agree"),
+        ("mkdir -p /tmp/tx && tar xzf /tmp/t.tgz -C /tmp/tx && diff -r /usr/src/eunuchs/user/bin "
+         "/tmp/tx/usr/src/eunuchs/user/bin && echo trees match", "trees match"),
+        ("tar tvf /tmp/t.tgz usr/src/eunuchs/user/bin/tar.c", "root/root"),
+        ("printf 'a\\nb\\nc\\n' > /tmp/d1; printf 'a\\nB\\nc\\nd\\n' > /tmp/d2; diff /tmp/d1 /tmp/d2 | paste -s -d' '",
+         "2c2 < b --- > B 3a4 > d"),
+        ("diff -u /tmp/d1 /tmp/d2 | grep @@", "@@ -1,3 +1,4 @@"),
+        ("diff /tmp/d1 /tmp/d1; echo same=$?", "same=0"),
+        ("echo '2^100' | bc", "1267650600228229401496703205376"),
+        ("echo 'scale=20; 4*a(1)' | bc -l", "3.14159265358979323844"),
+        ("echo 'define f(n) { if (n < 2) return (n); return (f(n-1) + f(n-2)) }; f(20)' | bc", "6765"),
+        ("echo 'obase=16; 255' | bc", "FF"),
+        ("awk -F: '{print $1 \"=\" $3}' /etc/passwd | paste -s -d,", "root=0,guest=1000"),
+        ("seq 10 | awk '{ s += $1 } END { print \"sum\", s, NR }'", "sum 55 10"),
+        ("echo 'b 2 a 1' | awk '{ for (i = 1; i < NF; i += 2) v[$i] = $(i+1); n = 0; "
+         "for (k in v) n += v[k]; printf \"%s:%d\\n\", toupper($1), n }'", "B:3"),
+        ("echo hello world | awk '{ gsub(/o/, \"0\"); print length($0), $2 }'", "11 w0rld"),
+        ("awk 'BEGIN { while ((\"seq 3\" | getline x) > 0) s = s x; print \"got\" s }'", "got123"),
+    ])
+
     interactive("toolchain and editors", [
         ("echo '#include <stdio.h>' > /tmp/h.c", None),
         ("echo 'int main(void) { printf(\"tcc says %d\", 6 * 7); puts(\"\"); return 0; }' >> /tmp/h.c",
