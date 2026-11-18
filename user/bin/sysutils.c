@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -230,13 +231,22 @@ static void fmt_secs(const char *label, unsigned long ms, int posix)
         eprintf("%s\t%lum%lu.%03lus\n", label, ms / 60000, ms / 1000 % 60, ms % 1000);
 }
 
+static unsigned long tv_ms(struct timeval tv)
+{
+    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
 static int time_main(int argc, char **argv)
 {
-    int i = 1, posix = 0;
-    if (i < argc && !strcmp(argv[i], "-p"))
-        posix = 1, i++;
+    int i = 1, posix = 0, verbose = 0;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "-p")) posix = 1;
+        else if (!strcmp(argv[i], "-v")) verbose = 1;
+        else if (!strcmp(argv[i], "--")) { i++; break; }
+        else die_usage("[-p | -v] COMMAND [ARG...]");
+    }
     if (i >= argc)
-        die_usage("[-p] COMMAND [ARG...]");
+        die_usage("[-p | -v] COMMAND [ARG...]");
     unsigned long t0 = uptime_ms();
     signal(SIGINT, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
@@ -253,29 +263,42 @@ static int time_main(int argc, char **argv)
         eprintf("time: cannot run %s: %s\n", argv[i], strerror(e));
         _exit(e == ENOENT ? 127 : 126);
     }
-    /* No rusage from wait4: sample the child's CPU time in /proc while it
-       runs (its own time only, not its children's). */
-    char path[64], buf[2048];
-    snprintf(path, sizeof(path), "/proc/%d/status", pid);
-    unsigned long cpu = 0, poll = 1;
     int st;
-    while (waitpid(pid, &st, WNOHANG) == 0) {
-        if (read_file(path, buf, sizeof(buf)) > 0) {
-            char *c = strstr(buf, "\ncpu_ms ");
-            if (c)
-                cpu = strtoul(c + 8, 0, 10);
+    struct rusage ru;
+    while (wait4(pid, &st, 0, &ru) < 0)
+        if (errno != EINTR) {
+            eprintf("time: wait: %s\n", strerror(errno));
+            return 125;
         }
-        sleep_ms(poll);
-        if (poll < 20)
-            poll *= 2;
-    }
-    unsigned long real = uptime_ms() - t0;
-    if (!posix)
-        eprintf("\n");
-    fmt_secs("real", real, posix);
-    fmt_secs("cpu ", cpu, posix);
+    unsigned long real = uptime_ms() - t0, user = tv_ms(ru.ru_utime), sys = tv_ms(ru.ru_stime);
     if (WIFSIGNALED(st))
         eprintf("time: command terminated by signal %d\n", WTERMSIG(st));
+    if (verbose) {
+        /* GNU time's -v */
+        char cmd[256];
+        size_t o = 0;
+        for (int k = i; k < argc && o < sizeof(cmd) - 1; k++)
+            o += snprintf(cmd + o, sizeof(cmd) - o, "%s%s", k > i ? " " : "", argv[k]);
+        unsigned long pct = real ? (user + sys) * 100 / real : 0;
+        eprintf("\tCommand being timed: \"%s\"\n", cmd);
+        eprintf("\tUser time (seconds): %lu.%02lu\n", user / 1000, user % 1000 / 10);
+        eprintf("\tSystem time (seconds): %lu.%02lu\n", sys / 1000, sys % 1000 / 10);
+        eprintf("\tPercent of CPU this job got: %lu%%\n", pct);
+        eprintf("\tElapsed (wall clock) time (h:mm:ss or m:ss): %lu:%02lu.%02lu\n", real / 60000,
+                real / 1000 % 60, real % 1000 / 10);
+        eprintf("\tMaximum resident set size (kbytes): %ld\n", ru.ru_maxrss);
+        eprintf("\tMajor (requiring I/O) page faults: %ld\n", ru.ru_majflt);
+        eprintf("\tMinor (reclaiming a frame) page faults: %ld\n", ru.ru_minflt);
+        eprintf("\tVoluntary context switches: %ld\n", ru.ru_nvcsw);
+        eprintf("\tInvoluntary context switches: %ld\n", ru.ru_nivcsw);
+        eprintf("\tExit status: %d\n", status_of(st));
+    } else {
+        if (!posix)
+            eprintf("\n");
+        fmt_secs("real", real, posix);
+        fmt_secs("user", user, posix);
+        fmt_secs("sys", sys, posix);
+    }
     return status_of(st);
 }
 
@@ -414,6 +437,29 @@ static long stat_field(const char *buf, const char *key)
     return -1;
 }
 
+/* Users: sessions with a terminal (there is no utmp): their leaders' ttys. */
+static int count_users(void)
+{
+    DIR *d = opendir("/proc");
+    if (!d)
+        return 0;
+    int n = 0;
+    struct dirent *e;
+    char path[64], buf[2048];
+    while ((e = readdir(d))) {
+        if (!isdigit((unsigned char)e->d_name[0]))
+            continue;
+        snprintf(path, sizeof(path), "/proc/%s/status", e->d_name);
+        if (read_file(path, buf, sizeof(buf)) <= 0)
+            continue;
+        char *tty = strstr(buf, "\ntty ");
+        if (stat_field(buf, "sid") == atol(e->d_name) && tty && strncmp(tty + 5, "-", 1))
+            n++;
+    }
+    closedir(d);
+    return n;
+}
+
 static int uptime_main(int argc, char **argv)
 {
     int pretty = 0, since = 0;
@@ -441,7 +487,7 @@ static int uptime_main(int argc, char **argv)
         putchar('\n');
         return 0;
     }
-    char clock[16], buf[2048];
+    char clock[16];
     strftime(clock, sizeof(clock), "%H:%M:%S", localtime(&now));
     printf(" %s up ", clock);
     if (d)
@@ -450,12 +496,13 @@ static int uptime_main(int argc, char **argv)
         printf("%2lu:%02lu, ", h, m);
     else
         printf("%lu min, ", m);
-    if (read_file("/proc/stat", buf, sizeof(buf)) > 0)
-        printf(" %ld processes, %ld running, %ld cpu%s\n", stat_field(buf, "procs"),
-               stat_field(buf, "procs_running"), stat_field(buf, "cpus"),
-               stat_field(buf, "cpus") == 1 ? "" : "s");
+    int users = count_users();
+    printf(" %d user%s,  load average: ", users, users == 1 ? "" : "s");
+    double load[3];
+    if (getloadavg(load, 3) == 3)
+        printf("%.2f, %.2f, %.2f\n", load[0], load[1], load[2]);
     else
-        putchar('\n');
+        printf("?\n");
     return 0;
 }
 

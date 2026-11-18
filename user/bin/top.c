@@ -386,6 +386,12 @@ static int draw_header(void)
          cur.blocked, cur.ncpu);
     end_line();
     y++;
+    double load[3];
+    if (getloadavg(load, 3) == 3) {
+        putf(y, 0, 0, "load average: %.2f, %.2f, %.2f", load[0], load[1], load[2]);
+        end_line();
+        y++;
+    }
     /* CPUs: two to a row (four on a wide screen, one on a narrow one) */
     int cols = batch ? 80 : COLS;
     int per = cols >= 160 ? 4 : cols >= 60 ? 2 : 1;

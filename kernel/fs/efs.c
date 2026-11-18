@@ -117,7 +117,8 @@ static int efs_read_inode(struct inode *ip)
     struct buf *b = inode_block(ip, &d);
     ip->u.efs = *d;
     brelse(b);
-    ip->type = d->type == EFS_T_DIR ? I_DIR : d->type == EFS_T_FILE ? I_FILE : I_FREE;
+    ip->type = d->type == EFS_T_DIR ? I_DIR : d->type == EFS_T_FILE ? I_FILE
+             : d->type == EFS_T_SYMLINK ? I_LNK : I_FREE;
     ip->nlink = d->nlink;
     ip->mode = d->mode;
     ip->uid = d->uid;
@@ -136,7 +137,8 @@ static int efs_write_inode(struct inode *ip)
 {
     struct efs_dinode *d;
     struct buf *b = inode_block(ip, &d);
-    ip->u.efs.type = ip->type == I_DIR ? EFS_T_DIR : ip->type == I_FILE ? EFS_T_FILE : EFS_T_FREE;
+    ip->u.efs.type = ip->type == I_DIR ? EFS_T_DIR : ip->type == I_FILE ? EFS_T_FILE
+                   : ip->type == I_LNK ? EFS_T_SYMLINK : EFS_T_FREE;
     ip->u.efs.nlink = ip->nlink;
     ip->u.efs.mode = ip->mode;
     ip->u.efs.uid = ip->uid;
@@ -158,7 +160,7 @@ static struct inode *efs_alloc_inode(struct super_block *sb, enum itype type)
         struct efs_dinode *d = (struct efs_dinode *)b->data + ino % EFS_IPB;
         if (d->type == EFS_T_FREE) {
             memset(d, 0, sizeof(*d));
-            d->type = type == I_DIR ? EFS_T_DIR : EFS_T_FILE;
+            d->type = type == I_DIR ? EFS_T_DIR : type == I_LNK ? EFS_T_SYMLINK : EFS_T_FILE;
             d->mtime = d->ctime = rtc_time_ns();
             log_write(fi->log, b);
             brelse(b);
@@ -251,6 +253,18 @@ static int efs_truncate(struct inode *ip, u64 size)
 {
     struct super_block *sb = ip->sb;
     u32 *addrs = ip->u.efs.addrs;
+    /* the block where the data now ends: zero it past the end, so that
+       growing the file again shows zeros, not what was cut off */
+    u64 edge = size < ip->size ? size : ip->size;
+    if (edge % EFS_BSIZE) {
+        u32 bno = bmap(ip, edge / EFS_BSIZE, false);
+        if (bno) {
+            struct buf *b = BREAD(bno);
+            memset(b->data + edge % EFS_BSIZE, 0, EFS_BSIZE - edge % EFS_BSIZE);
+            log_write(info(sb)->log, b);
+            brelse(b);
+        }
+    }
     u64 keep = (size + EFS_BSIZE - 1) / EFS_BSIZE;      /* blocks to keep */
 
     for (u64 i = keep; i < EFS_NDIRECT; i++) {
@@ -468,7 +482,26 @@ static void efs_stat_fs(struct super_block *sb, print_fn print)
     log_print(fi->log, print);
 }
 
+static void efs_statfs(struct super_block *sb, struct statfs *st)
+{
+    struct efs_info *fi = info(sb);
+    st->f_blocks = fi->s.size - fi->s.datastart;
+    st->f_bfree = st->f_bavail = fi->nfree_blocks;
+    st->f_files = fi->s.ninodes - 1;
+    st->f_ffree = fi->nfree_inodes;
+}
+
+static void efs_unmount(struct super_block *sb)
+{
+    struct efs_info *fi = info(sb);
+    log_destroy(fi->log);
+    kfree(fi);
+    sb->priv = NULL;
+}
+
 static const struct fs_ops efs_ops = {
+    .statfs = efs_statfs,
+    .unmount = efs_unmount,
     .read_inode = efs_read_inode,
     .write_inode = efs_write_inode,
     .alloc_inode = efs_alloc_inode,

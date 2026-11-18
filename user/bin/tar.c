@@ -10,8 +10,8 @@
  * the data through /bin/gzip; when reading a file, a gzip archive is
  * recognised without -z. Names longer than ustar's 100+155 characters get a
  * GNU ././@LongLink entry; pax headers are read for their path. Hard links
- * are stored once and as links after that. Leading '/' and ".." components
- * are taken out of names.
+ * are stored once and as links after that; symbolic links as links (followed
+ * with -h). Leading '/' and ".." components are taken out of names.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -277,7 +277,7 @@ static const char *member_name(const char *path)
 static void add(const char *path)
 {
     struct stat st;
-    if (stat(path, &st) < 0) {
+    if ((deref ? stat(path, &st) : lstat(path, &st)) < 0) {
         eprintf("tar: %s: %s\n", path, strerror(errno));
         rc = 2;
         return;
@@ -306,7 +306,18 @@ static void add(const char *path)
         snprintf(h.gname, sizeof(h.gname), "%s", gr->gr_name);
     unsigned long long size = 0;
     const char *link_target = 0;
-    if (S_ISDIR(st.st_mode)) {
+    char symtarget[PATH_MAX];
+    if (S_ISLNK(st.st_mode)) {
+        long n = readlink(path, symtarget, sizeof(symtarget) - 1);
+        if (n < 0) {
+            eprintf("tar: %s: %s\n", path, strerror(errno));
+            rc = 2;
+            return;
+        }
+        symtarget[n] = 0;
+        h.typeflag = '2';
+        link_target = symtarget;
+    } else if (S_ISDIR(st.st_mode)) {
         h.typeflag = '5';
     } else if (S_ISREG(st.st_mode)) {
         h.typeflag = '0';
@@ -497,6 +508,8 @@ static void list_line(const struct header *h, const char *name, unsigned long lo
     printf("%s %s %8llu %s %s", m, owner, size, when, name);
     if (t == '1')
         printf(" link to %.100s", h->linkname);
+    else if (t == '2')
+        printf(" -> %.100s", h->linkname);
     putchar('\n');
 }
 
@@ -631,6 +644,12 @@ static void extract_or_list(int argc, char **argv)
             } else if (keep_old && stat(name, &st) == 0) {
                 eprintf("tar: %s: already exists; not overwritten\n", name);
                 rc = 2;
+            } else if (t == '2') {
+                unlink(name);
+                if (symlink(target, name) < 0) {
+                    eprintf("tar: %s: cannot make a symbolic link: %s\n", name, strerror(errno));
+                    rc = 2;
+                }
             } else if (t == '1') {
                 safe_name(target);
                 unlink(name);
@@ -748,7 +767,7 @@ int main(int argc, char **argv)
             case 'm': no_mtime = 1; break;
             case 'p': break;            /* modes are always restored */
             case 'O': to_stdout = 1; break;
-            case 'h': deref = 1; break; /* no symbolic links: always so */
+            case 'h': deref = 1; break; /* follow symbolic links */
             case 'f':
             case 'C': {
                 const char *v = f[1] && !bundle ? f + 1 : i + 1 < argc ? argv[++i] : 0;

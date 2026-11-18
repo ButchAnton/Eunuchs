@@ -234,6 +234,29 @@ void pc_drop_inode(struct super_block *sb, u32 ino)
     drop_from(sb, ino, 0);
 }
 
+void pc_drop_sb(struct super_block *sb)
+{
+    for (;;) {
+        struct page *batch[32];
+        int n = 0;
+        unsigned long flags = spin_lock_irqsave(&pc_lock);
+        struct page *pg, *tmp;
+        list_for_each_entry_safe(pg, tmp, &pc_lru, list) {
+            if (pg->cache.owner != sb)
+                continue;
+            unhash_locked(pg);
+            batch[n++] = pg;
+            if (n == 32)
+                break;
+        }
+        spin_unlock_irqrestore(&pc_lock, flags);
+        for (int i = 0; i < n; i++)
+            release(batch[i], false, 0);
+        if (n < 32)
+            return;
+    }
+}
+
 /*
  * Write one dirty file page to its file. Clean afterwards unless something
  * still maps it writable (then the next writeback writes it again).

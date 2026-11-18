@@ -68,6 +68,7 @@ struct mm {
     struct list_head vmas;
     uintptr_t brk_start, brk;
     u64 rss;                        /* resident pages */
+    u64 max_rss;                    /* the most rss has been (getrusage's ru_maxrss) */
     u64 swapped;                    /* pages out in swap */
     u64 faults, cow_copies;         /* statistics */
     u64 major_faults;               /* faults that read a file or swap */
@@ -146,6 +147,14 @@ struct exec_image {
     char path[64];
 };
 
+/* Resource use (getrusage, wait4, times), in rdtime ticks and counts. */
+struct proc_usage {
+    u64 utime, stime;
+    u64 minflt, majflt;
+    u64 nvcsw, nivcsw;
+    u64 maxrss_kib;
+};
+
 struct proc {
     int pid;
     char name[16];
@@ -159,6 +168,8 @@ struct proc {
     struct waitqueue child_wq;      /* parent sleeps here in wait4 */
     struct waitqueue exit_wq;       /* kernel waiters (proc_wait_kernel) */
     int exit_status;                /* wait4 encoding */
+    struct proc_usage usage;        /* its own, saved when it exits */
+    struct proc_usage child_usage;  /* reaped children's, their children's included */
     int strace;                     /* 0 off, 1 on, 2 on + follow forks */
     struct exec_image *exe;         /* program file, for symbolization */
     const void *image;              /* = exe->data */
@@ -216,6 +227,12 @@ struct proc {
 #define WSTOPPED_ENC(sig)      (((sig) << 8) | 0x7f)
 
 
+static inline void mm_rss_inc(struct mm *mm)
+{
+    if (++mm->rss > mm->max_rss)
+        mm->max_rss = mm->rss;
+}
+
 static inline struct proc *current_proc(void)
 {
     return current ? current->proc : NULL;
@@ -232,7 +249,9 @@ struct proc *proc_spawn(const char *path, char *const argv[]);   /* from the ker
 int proc_wait_kernel(struct proc *p);
 void proc_exit(int status) __noreturn;
 struct proc *proc_find(int pid);            /* proc_lock held (or world stopped) */
+void proc_usage_self(struct proc *p, struct proc_usage *u);  /* p's own so far (p is current) */
 bool proc_exists(int pid);
+int proc_last_pid(void);
 int proc_nth_pid(int n);                    /* 0 if fewer processes */
 void proc_list_print(int (*print)(const char *fmt, ...));
 int proc_user_backtrace(int (*print)(const char *fmt, ...), struct proc *p,

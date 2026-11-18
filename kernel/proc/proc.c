@@ -19,6 +19,7 @@
 #include <trap.h>
 #include <uapi/errno.h>
 #include <uapi/ptrace.h>
+#include <uapi/resource.h>
 #include <uapi/syscall.h>
 
 /* exec: arguments and environment, together (a link line for the kernel
@@ -542,6 +543,100 @@ long sys_fork(void)
 
 /* ---- exit and wait ---- */
 
+/* p's own resource use so far (p is the current process, or exiting). */
+void proc_usage_self(struct proc *p, struct proc_usage *u)
+{
+    memset(u, 0, sizeof(*u));
+    struct thread *t = p->thread;
+    if (t) {
+        u64 run = thread_cpu_ticks(t);
+        u->utime = t->utime < run ? t->utime : run;
+        u->stime = run - u->utime;
+        u->nvcsw = t->nvcsw;
+        u->nivcsw = t->nivcsw;
+    }
+    if (p->mm) {
+        u->majflt = p->mm->major_faults;
+        u->minflt = p->mm->faults - p->mm->major_faults;
+        u->maxrss_kib = p->mm->max_rss * (PAGE_SIZE / 1024);
+    }
+}
+
+static struct timeval ticks_to_tv(u64 ticks)
+{
+    u64 tb = platform.timebase ? platform.timebase : 1;
+    struct timeval tv = { (i64)(ticks / tb), (i64)((ticks % tb) * 1000000 / tb) };
+    return tv;
+}
+
+static int usage_to_user(uintptr_t uaddr, const struct proc_usage *u)
+{
+    struct rusage r;
+    memset(&r, 0, sizeof(r));
+    r.ru_utime = ticks_to_tv(u->utime);
+    r.ru_stime = ticks_to_tv(u->stime);
+    r.ru_maxrss = u->maxrss_kib;
+    r.ru_minflt = u->minflt;
+    r.ru_majflt = u->majflt;
+    r.ru_nvcsw = u->nvcsw;
+    r.ru_nivcsw = u->nivcsw;
+    return copy_to_user(uaddr, &r, sizeof(r)) ? -EFAULT : 0;
+}
+
+static void usage_add(struct proc_usage *to, const struct proc_usage *u)
+{
+    to->utime += u->utime;
+    to->stime += u->stime;
+    to->minflt += u->minflt;
+    to->majflt += u->majflt;
+    to->nvcsw += u->nvcsw;
+    to->nivcsw += u->nivcsw;
+    if (u->maxrss_kib > to->maxrss_kib)
+        to->maxrss_kib = u->maxrss_kib;
+}
+
+long do_getrusage(const u64 *a)
+{
+    struct proc *p = current_proc();
+    struct proc_usage u;
+    if ((long)a[0] == RUSAGE_SELF) {
+        proc_usage_self(p, &u);
+    } else if ((long)a[0] == RUSAGE_CHILDREN) {
+        unsigned long flags = spin_lock_irqsave(&proc_lock);
+        u = p->child_usage;
+        spin_unlock_irqrestore(&proc_lock, flags);
+    } else {
+        return -EINVAL;
+    }
+    int e = usage_to_user(a[1], &u);
+    if (!e && (long)a[0] == RUSAGE_SELF) {
+        long n = p->signals_received;
+        if (copy_to_user(a[1] + offsetof(struct rusage, ru_nsignals), &n, sizeof(n)))
+            return -EFAULT;
+    }
+    return e;
+}
+
+/* times(buf): CPU times in 1/100 s; returns the time since boot in the same unit. */
+long do_times(const u64 *a)
+{
+    struct proc *p = current_proc();
+    struct proc_usage self, kids;
+    proc_usage_self(p, &self);
+    unsigned long flags = spin_lock_irqsave(&proc_lock);
+    kids = p->child_usage;
+    spin_unlock_irqrestore(&proc_lock, flags);
+    u64 tb = platform.timebase ? platform.timebase : 1;
+#define TCK(x) (long)((x) * EUNUCHS_CLK_TCK / tb)
+    if (a[0]) {
+        struct tms t = { TCK(self.utime), TCK(self.stime), TCK(kids.utime), TCK(kids.stime) };
+        if (copy_to_user(a[0], &t, sizeof(t)))
+            return -EFAULT;
+    }
+    return TCK(rdtime());
+#undef TCK
+}
+
 void proc_exit(int status)
 {
     struct proc *p = current_proc();
@@ -558,6 +653,7 @@ void proc_exit(int status)
      * it, the scheduler must not switch back onto it (it would re-activate a
      * page table that is being freed).
      */
+    proc_usage_self(p, &p->usage);     /* for the parent's wait4 and getrusage */
     unsigned long flags = spin_lock_irqsave(&proc_lock);
     struct mm *mm = p->mm;
     p->mm = NULL;
@@ -669,7 +765,6 @@ static bool has_zombie(struct proc *p, long pid, long options)
 
 long sys_wait4(long pid, uintptr_t ustatus, long options, uintptr_t rusage)
 {
-    (void)rusage;
     struct proc *p = current_proc();
     for (;;) {
         bool any;
@@ -701,8 +796,13 @@ long sys_wait4(long pid, uintptr_t ustatus, long options, uintptr_t rusage)
 
         if (z) {
             int status = z->exit_status, cpid = z->pid;
+            struct proc_usage zu = z->usage;
+            usage_add(&zu, &z->child_usage);
+            usage_add(&p->child_usage, &zu);
             kfree(z);
             if (ustatus && copy_to_user(ustatus, &status, sizeof(status)))
+                return -EFAULT;
+            if (rusage && usage_to_user(rusage, &zu))
                 return -EFAULT;
             return cpid;
         }
@@ -832,6 +932,11 @@ void user_fault(struct trap_frame *tf, const char *what, int sig)
     klog(LOG_ERR, SUBSYS_PROC, "  memory map:\n");
     mm_print(err_print, p->mm);
     proc_exit(WSIGNAL_ENC(sig) | WCOREFLAG);
+}
+
+int proc_last_pid(void)
+{
+    return next_pid - 1;
 }
 
 void proc_list_print(print_fn print)

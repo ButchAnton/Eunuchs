@@ -96,7 +96,10 @@ struct thread {
     struct list_head sleep_node;
 
     u64 runtime;                    /* rdtime ticks spent running */
+    u64 utime;                      /* of runtime, ticks in user mode (the rest is system) */
+    u64 user_entry;                 /* rdtime when it last returned to user mode */
     u64 switches;                   /* times switched in */
+    u64 nvcsw, nivcsw;              /* switched out waiting, or preempted */
     u64 created;                    /* rdtime at creation */
     uintptr_t create_site;
 };
@@ -154,6 +157,8 @@ int thread_backtrace(int (*print)(const char *fmt, ...), int tid);
 void sched_print(int (*print)(const char *fmt, ...));
 const char *thread_state_name(enum thread_state s);
 u64 thread_cpu_ticks(struct thread *t);
+void loadavg_init(void);                /* starts the sampling thread */
+void loadavg_print(int (*print)(const char *fmt, ...), int last_pid);   /* /proc/loadavg */
 size_t kstack_used(const void *base, size_t size);
 
 /* ---- wait queues ---- */

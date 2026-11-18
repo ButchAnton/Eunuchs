@@ -4,6 +4,7 @@
 #include <uapi/fs.h>
 
 int stat(const char *path, struct stat *st);
+int lstat(const char *path, struct stat *st);   /* a symbolic link itself */
 int fstat(int fd, struct stat *st);
 int mkdir(const char *path, int mode);
 struct timespec;

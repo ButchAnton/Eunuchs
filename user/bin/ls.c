@@ -34,6 +34,7 @@ enum { Q_LITERAL, Q_SHELL, Q_C, Q_ESCAPE, Q_HIDE };
 enum { T_DEFAULT, T_FULL, T_LONG, T_ISO };
 
 static int format = -1, sort = S_NAME, reverse, show_all, almost_all, dir_itself, recursive;
+static int deref, deref_args;           /* -L: follow every symbolic link; -H: those named */
 static int no_owner, no_group, numeric, human, kblocks = 1, show_blocks, show_inode;
 static int classify, slash_dirs, file_type, color, use_ctime, dirs_first, quoting = -1;
 static int ignore_backups, time_style = T_DEFAULT, width;
@@ -198,6 +199,8 @@ static const char *color_for(struct ent *e)
     if (!e->ok)
         return crule("or") ? crule("or") : 0;
     unsigned m = e->st.st_mode;
+    if (S_ISLNK(m))
+        return crule("ln");
     if (S_ISDIR(m)) {
         if ((m & 0002) && crule("ow"))
             return crule("ow");
@@ -309,6 +312,8 @@ static char type_char(struct ent *e)
         return 0;
     if (S_ISFIFO(m))
         return '|';
+    if (S_ISLNK(m))
+        return '@';
     if (classify && S_ISREG(m) && (m & 0111))
         return '*';
     return 0;
@@ -584,7 +589,7 @@ static void list_long(struct ent *v, int n)
         }
         unsigned m = e->st.st_mode;
         char mode[11];
-        mode[0] = S_ISDIR(m) ? 'd' : S_ISCHR(m) ? 'c' : S_ISFIFO(m) ? 'p' : '-';
+        mode[0] = S_ISDIR(m) ? 'd' : S_ISCHR(m) ? 'c' : S_ISFIFO(m) ? 'p' : S_ISLNK(m) ? 'l' : '-';
         for (int k = 0; k < 9; k++)
             mode[1 + k] = m & (0400 >> k) ? "rwxrwxrwx"[k] : '-';
         if (m & S_ISUID)
@@ -607,7 +612,16 @@ static void list_long(struct ent *v, int n)
             printf("%-*s ", uw, id_name(e->st.st_uid, 0));
         if (!no_group)
             printf("%-*s ", gw, id_name(e->st.st_gid, 1));
-        printf("%*s %s %s\n", sw, size, tbuf, name);
+        printf("%*s %s %s", sw, size, tbuf, name);
+        if (S_ISLNK(m)) {
+            char target[PATH_MAX];
+            long tn = readlink(e->path, target, sizeof(target) - 1);
+            if (tn >= 0) {
+                target[tn] = 0;
+                printf(" -> %s", target);
+            }
+        }
+        putchar('\n');
         free(name);
     }
 }
@@ -800,7 +814,7 @@ static void list_dir(const char *path, int header, int *first)
         e->name = xstrdup(de->d_name);
         e->path = join(path, de->d_name);
         if (st_needed || show_inode)
-            e->ok = stat(e->path, &e->st) == 0;
+            e->ok = (deref ? stat(e->path, &e->st) : lstat(e->path, &e->st)) == 0;
         else {
             e->ok = 1;
             e->st.st_ino = de->d_ino;
@@ -1013,7 +1027,9 @@ int main(int argc, char **argv)
             case 'b': quoting = Q_ESCAPE; break;
             case 'q': quoting = Q_HIDE; break;
             case 'B': ignore_backups = 1; break;
-            case 'L': case 'H': case 'T': break;    /* no symbolic links; tab size */
+            case 'L': deref = 1; break;
+            case 'H': deref_args = 1; break;
+            case 'T': break;                /* tab size */
             case 'I':
             case 'w': {
                 char opt = *c;
@@ -1058,7 +1074,7 @@ int main(int argc, char **argv)
         memset(&e, 0, sizeof(e));
         e.name = xstrdup(files[i]);
         e.path = xstrdup(files[i]);
-        if (stat(files[i], &e.st) < 0) {
+        if (lstat(files[i], &e.st) < 0) {
             eprintf("ls: cannot access '%s': %s\n", files[i], strerror(errno));
             status = 2;
             free(e.name);
@@ -1066,6 +1082,12 @@ int main(int argc, char **argv)
             continue;
         }
         e.ok = 1;
+        struct stat t;
+        /* a link named on the command line: followed with -L or -H, or to list
+           a directory (unless -l or -d, which show the link) */
+        if (S_ISLNK(e.st.st_mode) && stat(files[i], &t) == 0 &&
+            (deref || deref_args || (S_ISDIR(t.st_mode) && format != F_LONG && !dir_itself)))
+            e.st = t;
         if (S_ISDIR(e.st.st_mode) && !dir_itself)
             dv[nd++] = e;
         else

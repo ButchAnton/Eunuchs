@@ -276,3 +276,9 @@ void log_print(struct efs_log *log, print_fn print)
           log->outstanding, log->n, (unsigned long)log->recovered,
           log->crash_at ? "; fs.crash armed" : "");
 }
+
+void log_destroy(struct efs_log *log)
+{
+    log_sync(log);
+    kfree(log);
+}

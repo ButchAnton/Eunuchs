@@ -532,7 +532,7 @@ void efs_usage(struct efs *fs, struct efs_usage *u)
         uint16_t t = efs_inode(fs, ino)->type;
         if (t == EFS_T_DIR)
             u->dirs++;
-        else if (t == EFS_T_FILE)
+        else if (t == EFS_T_FILE || t == EFS_T_SYMLINK)
             u->files++;
         else
             u->free_inodes++;
@@ -662,7 +662,7 @@ static void check_dir(struct check *c, uint32_t ino, uint32_t parent, const char
                 cerr(c, "%s: directory has more than one parent (hard link to a directory?)", sub);
             else
                 check_dir(c, de->ino, ino, sub, depth + 1);
-        } else if (ch->type != EFS_T_FILE) {
+        } else if (ch->type != EFS_T_FILE && ch->type != EFS_T_SYMLINK) {
             cerr(c, "%s: inode %u has unknown type %u", sub, de->ino, ch->type);
         }
     }
@@ -718,7 +718,8 @@ int efs_check(struct efs *fs, FILE *out)
             cerr(&c, "inode %u: size %llu exceeds the maximum file size", ino, (unsigned long long)d->size);
         if (!c.refs[ino])
             cerr(&c, "inode %u (%s, %llu bytes, nlink %u) is allocated but not in any directory (orphan)",
-                 ino, d->type == EFS_T_DIR ? "dir" : "file", (unsigned long long)d->size, d->nlink);
+                 ino, d->type == EFS_T_DIR ? "dir" : d->type == EFS_T_SYMLINK ? "symlink" : "file",
+                 (unsigned long long)d->size, d->nlink);
         else if (d->nlink != c.refs[ino])
             cerr(&c, "inode %u: nlink is %u but %u directory entries refer to it", ino, d->nlink,
                  c.refs[ino]);

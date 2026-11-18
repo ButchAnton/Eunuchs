@@ -15,5 +15,9 @@
 
 pid_t wait(int *status);
 pid_t waitpid(pid_t pid, int *status, int options);
+struct rusage;
+/* waitpid, and the child's resource use (its children's included) */
+pid_t wait4(pid_t pid, int *status, int options, struct rusage *ru);
+pid_t wait3(int *status, int options, struct rusage *ru);
 
 #endif

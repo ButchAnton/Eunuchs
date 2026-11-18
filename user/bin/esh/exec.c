@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <termios.h>
 
@@ -1197,6 +1198,16 @@ static int exec_compound(struct node *n, int flags)
     return st;
 }
 
+/* user (1) or system (0) CPU time in microseconds: the shell's and its reaped children's */
+static long long cpu_us(int user)
+{
+    struct rusage a, b;
+    if (getrusage(RUSAGE_SELF, &a) < 0 || getrusage(RUSAGE_CHILDREN, &b) < 0)
+        return 0;
+    struct timeval *x = user ? &a.ru_utime : &a.ru_stime, *y = user ? &b.ru_utime : &b.ru_stime;
+    return (x->tv_sec + y->tv_sec) * 1000000LL + x->tv_usec + y->tv_usec;
+}
+
 int exec_node(struct node *n, int flags)
 {
     if (!n)
@@ -1249,11 +1260,14 @@ int exec_node(struct node *n, int flags)
         st = 0;
         break;
     case N_TIME: {
-        long long t0 = now_ms();
+        /* zsh's report: the shell's own CPU time and its children's (reaped) */
+        long long t0 = now_ms(), u0 = cpu_us(1), s0 = cpu_us(0);
         st = exec_node(n->a, flags & EF_FORKED);
-        long long t = now_ms() - t0;
-        eprintf("%s  %lld.%03lld total\n", n->a && n->a->text && *n->a->text ? n->a->text : "shell",
-                t / 1000, t % 1000);
+        long long t = now_ms() - t0, u = cpu_us(1) - u0, s = cpu_us(0) - s0;
+        long long pct = t > 0 ? (u + s) / 10 / t : 0;
+        eprintf("%s  %lld.%02llds user %lld.%02llds system %lld%% cpu %lld.%03lld total\n",
+                n->a && n->a->text && *n->a->text ? n->a->text : "shell", u / 1000000, u / 10000 % 100,
+                s / 1000000, s / 10000 % 100, pct, t / 1000, t % 1000);
         break;
     }
     default: {
@@ -1288,7 +1302,9 @@ static int file_test(const char *op, const char *path)
     case 'd': return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
     case 'c': return stat(path, &st) == 0 && S_ISCHR(st.st_mode);
     case 'p': return stat(path, &st) == 0 && S_ISFIFO(st.st_mode);
-    case 'b': case 'S': case 'h': case 'L': return 0;
+    case 'h': case 'L': return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+    case 'b': return stat(path, &st) == 0 && S_ISBLK(st.st_mode);
+    case 'S': return stat(path, &st) == 0 && S_ISSOCK(st.st_mode);
     case 's': return stat(path, &st) == 0 && st.st_size > 0;
     case 'r': return access(path, R_OK) == 0;
     case 'w': return access(path, W_OK) == 0;

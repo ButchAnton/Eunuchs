@@ -58,6 +58,8 @@ int unsetenv(const char *name);
 int putenv(char *s);
 char *realpath(const char *path, char *resolved);
 int mkstemp(char *tmpl);
+/* the 1, 5 and 15 minute load averages (from /proc/loadavg); how many it filled, or -1 */
+int getloadavg(double loadavg[], int nelem);
 char *mktemp(char *tmpl);
 char *mkdtemp(char *tmpl);
 

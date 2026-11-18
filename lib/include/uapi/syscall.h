@@ -19,8 +19,15 @@
     X(29,  ioctl,       3, "dxx")            \
     X(34,  mkdirat,     3, "dsx")            \
     X(35,  unlinkat,    3, "dsx")            \
+    X(36,  symlinkat,   3, "sds")            \
     X(37,  linkat,      5, "dsdsx")          \
     X(38,  renameat,    4, "dsds")           \
+    X(39,  umount2,     2, "sx")             \
+    X(40,  mount,       5, "sssxp")          \
+    X(43,  statfs,      2, "sp")             \
+    X(44,  fstatfs,     2, "dp")             \
+    X(45,  truncate,    2, "sd")             \
+    X(46,  ftruncate,   2, "dd")             \
     X(48,  faccessat,   3, "dsx")            \
     X(49,  chdir,       1, "s")              \
     X(52,  fchmod,      2, "do")             \
@@ -34,6 +41,7 @@
     X(63,  read,        3, "dpu")            \
     X(64,  write,       3, "dbu")            \
     X(73,  ppoll,       4, "pdpp")           \
+    X(78,  readlinkat,  4, "dspu")           \
     X(79,  fstatat,     4, "dspx")           \
     X(88,  utimensat,   4, "dspx")           \
     X(80,  fstat,       2, "dp")             \
@@ -88,6 +96,8 @@
     X(242, accept4,     4, "dppx")           \
     X(260, wait4,       4, "dpxp")           \
     X(142, reboot,      1, "x")              \
+    X(153, times,       1, "p")              \
+    X(165, getrusage,   2, "dp")             \
     X(500, sleep_ms,    1, "u")              \
     X(501, uptime_ms,   0, "")               \
     X(502, debug,       3, "dxx")

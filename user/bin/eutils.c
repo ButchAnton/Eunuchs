@@ -3,6 +3,7 @@
  * has /bin/<tool> as hard links to it):
  *   echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod chown env
  *   id true false yes kill date dmesg sleep strace su dbg uname clear reboot poweroff halt
+ *   (ln makes hard links, or symbolic ones with -s)
  */
 #include <dirent.h>
 #include <errno.h>
@@ -55,7 +56,7 @@ static int mkdir_p(const char *path)
 static int rm_tree(const char *path, int force)
 {
     struct stat st;
-    if (stat(path, &st) < 0)
+    if (lstat(path, &st) < 0)           /* a link to a directory: the link goes, not the tree */
         return force && errno == ENOENT ? 0 : fail(path);
     if (!S_ISDIR(st.st_mode))
         return unlink(path) < 0 ? fail(path) : 0;
@@ -121,11 +122,21 @@ static int copy(const char *from, const char *to)
 }
 
 /* cp -r: a directory and everything in it (names read first, as rm_tree) */
-static int copy_tree(const char *from, const char *to)
+static int copy_tree(const char *from, const char *to, int top)
 {
     struct stat st;
-    if (stat(from, &st) < 0)
+    /* inside a tree, a symbolic link is copied as a link (GNU cp -r) */
+    if ((top ? stat(from, &st) : lstat(from, &st)) < 0)
         return fail(from);
+    if (S_ISLNK(st.st_mode)) {
+        char target[PATH_MAX];
+        long n = readlink(from, target, sizeof(target) - 1);
+        if (n < 0)
+            return fail(from);
+        target[n] = 0;
+        unlink(to);
+        return symlink(target, to) < 0 ? fail(to) : 0;
+    }
     if (!S_ISDIR(st.st_mode))
         return copy(from, to);
     /* the names first (before `to` may appear among them), then the copies */
@@ -176,12 +187,61 @@ static int copy_tree(const char *from, const char *to)
         struct stat as, ts;
         if (stat(a, &as) == 0 && stat(to, &ts) == 0 && as.st_dev == ts.st_dev && as.st_ino == ts.st_ino)
             continue;
-        rc |= copy_tree(a, b);
+        rc |= copy_tree(a, b, 0);
     }
 out:
     for (int i = 0; i < n; i++)
         free(names[i]);
     free(names);
+    return rc;
+}
+
+/* ln [-s] [-f] [-n] TARGET LINK, or ln [-s] [-f] TARGET... DIR */
+static int ln_main(int argc, char **argv)
+{
+    int i = 1, sym = 0, force = 0, no_deref = 0, rc = 0;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "--")) {
+            i++;
+            break;
+        }
+        for (char *f = argv[i] + 1; *f; f++) {
+            if (*f == 's') sym = 1;
+            else if (*f == 'f') force = 1;
+            else if (*f == 'n') no_deref = 1;
+            else {
+                eprintf("ln: unknown option -%c\nusage: ln [-sfn] TARGET LINK | ln [-sfn] TARGET... DIR\n", *f);
+                return 2;
+            }
+        }
+    }
+    if (argc - i < 1) {
+        eprintf("usage: ln [-sfn] TARGET LINK | ln [-sfn] TARGET... DIR\n");
+        return 2;
+    }
+    const char *dest = argc - i == 1 ? "." : argv[argc - 1];
+    int nsrc = argc - i == 1 ? 1 : argc - i - 1;
+    struct stat st;
+    /* into a directory: DEST/name (a link to a directory counts, unless -n) */
+    int into = (no_deref ? lstat(dest, &st) : stat(dest, &st)) == 0 && S_ISDIR(st.st_mode);
+    if (nsrc > 1 && !into) {
+        eprintf("ln: %s: not a directory\n", dest);
+        return 1;
+    }
+    for (int k = 0; k < nsrc; k++) {
+        const char *src = argv[i + k];
+        char link_path[PATH_MAX];
+        if (into) {
+            const char *base = strrchr(src, '/') ? strrchr(src, '/') + 1 : src;
+            snprintf(link_path, sizeof(link_path), "%s/%s", dest, base);
+        } else {
+            snprintf(link_path, sizeof(link_path), "%s", dest);
+        }
+        if (force)
+            unlink(link_path);
+        if ((sym ? symlink(src, link_path) : link(src, link_path)) < 0)
+            rc = fail(link_path);
+    }
     return rc;
 }
 
@@ -236,7 +296,7 @@ static int cp_main(int argc, char **argv)
             rc = 1;
             continue;
         }
-        rc |= copy_tree(src, target);
+        rc |= copy_tree(src, target, 1);
     }
     return rc;
 }
@@ -776,9 +836,8 @@ int main(int argc, char **argv)
             else
                 close(fd);
         }
-    } else if (!strcmp(prog, "ln") && argc == 3) {
-        if (link(argv[1], argv[2]) < 0)
-            rc = fail(argv[2]);
+    } else if (!strcmp(prog, "ln")) {
+        rc = ln_main(argc, argv);
     } else if (!strcmp(prog, "mv") && argc == 3) {
         if (rename(argv[1], argv[2]) < 0)
             rc = fail(argv[1]);
@@ -808,14 +867,22 @@ int main(int argc, char **argv)
     } else if (!strcmp(prog, "stat")) {
         for (int i = 1; i < argc; i++) {
             struct stat st;
-            if (stat(argv[i], &st) < 0) {
+            if (lstat(argv[i], &st) < 0) {
                 rc = fail(argv[i]);
                 continue;
             }
-            printf("%s: inode %u, %s, %lu bytes, %lu blocks, %u links, mode %o\n", argv[i],
-                   st.st_ino, S_ISDIR(st.st_mode) ? "directory" : S_ISCHR(st.st_mode) ? "device" : "file",
+            printf("%s: inode %u, %s, %lu bytes, %lu blocks, %u links, mode %o", argv[i],
+                   st.st_ino, S_ISDIR(st.st_mode) ? "directory" : S_ISCHR(st.st_mode) ? "device"
+                   : S_ISLNK(st.st_mode) ? "symbolic link" : "file",
                    (unsigned long)st.st_size, (unsigned long)st.st_blocks, st.st_nlink,
                    st.st_mode & 07777);
+            if (S_ISLNK(st.st_mode)) {
+                char target[PATH_MAX];
+                long n = readlink(argv[i], target, sizeof(target) - 1);
+                if (n >= 0)
+                    printf(" -> %.*s", (int)n, target);
+            }
+            putchar('\n');
         }
     } else {
         eprintf("eutils: unknown tool '%s'\n", prog);

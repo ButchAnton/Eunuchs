@@ -14,6 +14,7 @@
  *   bmapstart..        free-block bitmap, 1 bit per block (1 = used)
  *   datastart..size-1  data blocks
  *
+ * A symbolic link is a file whose data is the target path (no NUL).
  * Files use EFS_NDIRECT direct blocks, one single-indirect and one
  * double-indirect block (max ~4 GiB). Directories are files of fixed-size
  * entries; inode 0 means "empty slot". The root directory is inode 1.
@@ -38,6 +39,7 @@ enum efs_type {
     EFS_T_FREE = 0,
     EFS_T_DIR  = 1,
     EFS_T_FILE = 2,
+    EFS_T_SYMLINK = 3,      /* the target path is the file's data */
 };
 
 struct efs_super {

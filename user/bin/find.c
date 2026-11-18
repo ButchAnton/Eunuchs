@@ -3,13 +3,14 @@
  *
  *   find [PATH...] [EXPRESSION]
  *
- * Tests: -name -iname -path -ipath -type [fdcbp] -size [+-]N[cwbkMG]
+ * Tests: -name -iname -path -ipath -type [fdcbpl] -size [+-]N[cwbkMG]
  *   -mtime/-ctime/-atime [+-]N (days) -mmin/-cmin/-amin [+-]N -newer FILE
  *   -perm [-/]MODE -user -group -uid -gid -nouser -nogroup -links -inum
  *   -empty -readable -writable -executable -true -false
  * Actions: -print -print0 -printf FMT -ls -exec CMD {} ; -exec CMD {} +
  *   -ok CMD ; -delete -prune -quit
- * Options: -maxdepth N -mindepth N -depth -xdev (-mount)
+ * Options: -maxdepth N -mindepth N -depth -xdev (-mount); before the paths, -P (links
+ * are not followed; the default), -L (all are) and -H (those named are)
  * Operators: ( ) ! -not -a -and -o -or ,  (implicit -a between terms)
  * Without an action, the whole expression is followed by -print.
  */
@@ -54,6 +55,7 @@ struct node {
 static char **args;
 static int nargs, ai;
 static int maxdepth = -1, mindepth = 0, depth_first, xdev, had_action;
+static char follow = 'P';               /* -P: links not followed; -L: all; -H: those named */
 static int status, quit;
 static time_t now;
 
@@ -252,7 +254,11 @@ static struct node *parse_primary(void)
         xdev = 1;
         return mk(N_TRUE);
     }
-    if (IS("-follow") || IS("-noleaf"))
+    if (IS("-follow")) {
+        follow = 'L';
+        return mk(N_TRUE);
+    }
+    if (IS("-noleaf"))
         return mk(N_TRUE);
 #undef IS
     die("unknown predicate `%s'", a);
@@ -415,7 +421,8 @@ static void flush_all(struct node *n)
 
 static void mode_string(unsigned mode, char *b)
 {
-    b[0] = S_ISDIR(mode) ? 'd' : S_ISCHR(mode) ? 'c' : S_ISBLK(mode) ? 'b' : S_ISFIFO(mode) ? 'p' : '-';
+    b[0] = S_ISDIR(mode) ? 'd' : S_ISCHR(mode) ? 'c' : S_ISBLK(mode) ? 'b' : S_ISFIFO(mode) ? 'p'
+         : S_ISLNK(mode) ? 'l' : '-';
     const char *rwx = "rwxrwxrwx";
     for (int i = 0; i < 9; i++)
         b[i + 1] = mode & (0400 >> i) ? rwx[i] : '-';
@@ -479,7 +486,15 @@ static void do_printf(const char *f)
         case 'G': printf("%u", (unsigned)cur_st.st_gid); break;
         case 'i': printf("%lu", (unsigned long)cur_st.st_ino); break;
         case 'n': printf("%u", (unsigned)cur_st.st_nlink); break;
-        case 'y': putchar(S_ISDIR(cur_st.st_mode) ? 'd' : S_ISCHR(cur_st.st_mode) ? 'c' : S_ISBLK(cur_st.st_mode) ? 'b' : S_ISFIFO(cur_st.st_mode) ? 'p' : 'f'); break;
+        case 'y': putchar(S_ISDIR(cur_st.st_mode) ? 'd' : S_ISCHR(cur_st.st_mode) ? 'c' : S_ISBLK(cur_st.st_mode) ? 'b' : S_ISFIFO(cur_st.st_mode) ? 'p' : S_ISLNK(cur_st.st_mode) ? 'l' : 'f'); break;
+        case 'l':
+            if (S_ISLNK(cur_st.st_mode)) {
+                char t[PATH_MAX];
+                long n = readlink(cur_path, t, sizeof(t) - 1);
+                if (n >= 0)
+                    fwrite(t, 1, n, stdout);
+            }
+            break;
         case 't': { time_t t = cur_st.st_mtime; char b[64]; strftime(b, sizeof(b), "%a %b %e %H:%M:%S %Y", localtime(&t)); fputs(b, stdout); break; }
         case 'T':
             if (f[1]) {
@@ -540,7 +555,8 @@ static int eval(struct node *n)
         case 'c': return S_ISCHR(m);
         case 'b': return S_ISBLK(m);
         case 'p': return S_ISFIFO(m);
-        default: return 0;              /* no symbolic links or sockets in efs */
+        case 'l': return S_ISLNK(m);
+        default: return 0;              /* no sockets in efs */
         }
     }
     case N_SIZE: {
@@ -606,13 +622,16 @@ static int eval(struct node *n)
 }
 
 static struct node *expr;
+static struct { unsigned dev, ino; } ancestors[512];    /* the directories being walked */
 
 static void visit(const char *path, int depth, unsigned root_dev)
 {
     if (quit)
         return;
     struct stat st;
-    if (stat(path, &st) < 0) {
+    int follow_this = follow == 'L' || (follow == 'H' && depth == 0);
+    if ((follow_this ? stat(path, &st) : lstat(path, &st)) < 0 &&
+        (!follow_this || lstat(path, &st) < 0)) {   /* a broken link stays a link */
         eprintf("find: `%s': %s\n", path, strerror(errno));
         status = 1;
         return;
@@ -624,6 +643,17 @@ static void visit(const char *path, int depth, unsigned root_dev)
         eval(expr);
         if (pruned)
             descend = 0;
+    }
+    if (descend && depth < 512) {
+        /* following links can lead back up the tree: a loop */
+        for (int k = 0; k < depth; k++)
+            if (ancestors[k].dev == st.st_dev && ancestors[k].ino == st.st_ino) {
+                eprintf("find: File system loop detected; `%s' is part of the same loop\n", path);
+                status = 1;
+                descend = 0;
+            }
+        ancestors[depth].dev = st.st_dev;
+        ancestors[depth].ino = st.st_ino;
     }
     if (descend && !quit) {
         DIR *d = opendir(path);
@@ -667,7 +697,7 @@ int main(int argc, char **argv)
     now = time(0);
     int i = 1;
     while (i < argc && (!strcmp(argv[i], "-H") || !strcmp(argv[i], "-L") || !strcmp(argv[i], "-P")))
-        i++;
+        follow = argv[i++][1];
     int first_path = i;
     while (i < argc && argv[i][0] != '-' && strcmp(argv[i], "(") && strcmp(argv[i], "!"))
         i++;

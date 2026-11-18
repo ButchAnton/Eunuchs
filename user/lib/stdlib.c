@@ -411,22 +411,28 @@ int putenv(char *s)
 
 /* ---- paths and temporary files ---- */
 
+/* The canonical absolute path: ".", ".." and symbolic links resolved; every
+   component must exist. */
 char *realpath(const char *path, char *resolved)
 {
-    char buf[PATH_MAX];
-    if (path[0] == '/') {
-        snprintf(buf, sizeof(buf), "%s", path);
-    } else {
-        if (!getcwd(buf, sizeof(buf)))
-            return 0;
-        size_t n = strlen(buf);
-        snprintf(buf + n, sizeof(buf) - n, "/%s", path);
-    }
-    /* normalize: drop empty and "." components, resolve ".." */
-    char out[PATH_MAX];
+    char rest[PATH_MAX * 2], out[PATH_MAX], target[PATH_MAX];
     size_t o = 0;
+    int links = 0;
+    if (!path || !*path) {
+        errno = ENOENT;
+        return 0;
+    }
+    if (path[0] == '/') {
+        snprintf(rest, sizeof(rest), "%s", path);
+    } else {
+        if (!getcwd(out, sizeof(out)))
+            return 0;
+        snprintf(rest, sizeof(rest), "%s/%s", out, path);
+    }
     out[o++] = '/';
-    for (char *t = buf; *t;) {
+    out[o] = 0;
+    char *t = rest;
+    while (*t) {
         while (*t == '/')
             t++;
         if (!*t)
@@ -436,30 +442,58 @@ char *realpath(const char *path, char *resolved)
             e++;
         size_t len = e - t;
         if (len == 1 && t[0] == '.') {
-        } else if (len == 2 && t[0] == '.' && t[1] == '.') {
-            if (o > 1) {
+            t = e;
+            continue;
+        }
+        if (len == 2 && t[0] == '.' && t[1] == '.') {
+            while (o > 1 && out[o - 1] != '/')
                 o--;
-                while (o > 1 && out[o - 1] != '/')
-                    o--;
-                if (o > 1)
-                    o--;                /* and the slash before it */
-            }
-        } else {
             if (o > 1)
-                out[o++] = '/';
-            if (o + len >= sizeof(out)) {
-                errno = ENAMETOOLONG;
+                o--;
+            out[o] = 0;
+            t = e;
+            continue;
+        }
+        size_t save = o;
+        if (o + len + 2 >= sizeof(out)) {
+            errno = ENAMETOOLONG;
+            return 0;
+        }
+        if (o > 1)
+            out[o++] = '/';
+        memcpy(out + o, t, len);
+        o += len;
+        out[o] = 0;
+        struct stat st;
+        if (lstat(out, &st) < 0)
+            return 0;
+        if (S_ISLNK(st.st_mode)) {
+            if (++links > 40) {
+                errno = ELOOP;
                 return 0;
             }
-            memcpy(out + o, t, len);
-            o += len;
+            long n = readlink(out, target, sizeof(target) - 1);
+            if (n < 0)
+                return 0;
+            target[n] = 0;
+            /* the target, then what is left of the path */
+            char tail[PATH_MAX * 2];
+            snprintf(tail, sizeof(tail), "%s%s", target, e);
+            snprintf(rest, sizeof(rest), "%s", tail);
+            t = rest;
+            if (target[0] == '/')
+                o = 1;                  /* from the root */
+            else
+                o = save;               /* from the link's directory */
+            out[o] = 0;
+            continue;
+        }
+        if (*e && !S_ISDIR(st.st_mode)) {
+            errno = ENOTDIR;
+            return 0;
         }
         t = e;
     }
-    out[o] = 0;
-    struct stat st;
-    if (stat(out, &st) < 0)
-        return 0;
     if (!resolved) {
         resolved = malloc(o + 1);
         if (!resolved)

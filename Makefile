@@ -97,7 +97,8 @@ EUTILS_LINKS = echo mkdir rm rmdir touch ln mv cp wc stat head tail tee chmod ch
 # Other multi-call programs: user/bin/NAME.c, with /bin/<link> -> /bin/NAME
 TEXTUTILS_LINKS = sort uniq cut tr nl tac rev paste comm cmp fold expand od xxd strings \
                   cksum md5sum sha256sum
-FILEUTILS_LINKS = du dd basename dirname realpath mktemp chgrp file sync seq expr test [ printf
+FILEUTILS_LINKS = du df dd basename dirname realpath readlink mktemp chgrp file sync truncate mount umount \
+                  seq expr test [ printf
 SYSUTILS_LINKS  = timeout nohup time whoami groups hostname tty printenv uptime cal \
                   pgrep pkill pidof killall watch
 MULTI_LINKS = $(foreach l,$(TEXTUTILS_LINKS),/bin/$(l)=@/bin/textutils) \

@@ -66,6 +66,8 @@ static void gen_uptime(print_fn print)
 
 static void gen_trace(print_fn print) { trace_print(print, 200); }
 
+static void gen_loadavg(print_fn print) { loadavg_print(print, proc_last_pid()); }
+
 /* For top and vmstat: times in ms since boot, per CPU busy and idle, and
    process counts (running: runnable or on a CPU; blocked: uninterruptible). */
 static void gen_stat(print_fn print)
@@ -122,7 +124,8 @@ static const struct {
     { "threads", thread_list_print },
     { "sched", sched_print },
     { "procs", proc_list_print },
-    { "mounts", vfs_mounts_print },
+    { "mounts", vfs_mounts_list },
+    { "fsinfo", vfs_mounts_print },
     { "bcache", bcache_print },
     { "blk", blk_print },
     { "icache", icache_print },
@@ -130,6 +133,7 @@ static const struct {
     { "virtio", virtio_print },
     { "9p", p9_print },
     { "uptime", gen_uptime },
+    { "loadavg", gen_loadavg },
     { "pipes", pipes_print },
     { "tty", tty_print },
     { "cpus", cpus_print },
@@ -206,6 +210,11 @@ static void gen_pid_locked(struct proc *p, int which, print_fn print)
             spin_unlock_irqrestore(&p->mm->vma_lock, vf);
         }
         u64 tbase = platform.timebase ? platform.timebase : 1;
+        if (t) {
+            u64 run = thread_cpu_ticks(t), ut = t->utime < run ? t->utime : run;
+            print("utime_ms %lu\nstime_ms %lu\n", (unsigned long)(ut * 1000 / tbase),
+                  (unsigned long)((run - ut) * 1000 / tbase));
+        }
         print("ustate %c\nstart_ms %lu\ncpu_ms %lu\nvsz_kib %lu\ntty %s\ntpgid %d\npsr %d\n", st,
               (unsigned long)(p->started * 1000 / tbase),
               (unsigned long)(t ? thread_cpu_ticks(t) * 1000 / tbase : 0),

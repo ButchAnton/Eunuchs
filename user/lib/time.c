@@ -1,6 +1,7 @@
 /* time: calendar conversion and formatting. Local time is UTC. */
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -71,8 +72,11 @@ double difftime(time_t a, time_t b)
 
 clock_t clock(void)
 {
-    /* no per-process CPU time yet: time since boot (CLOCKS_PER_SEC is 10^6) */
-    return (clock_t)uptime_ms() * 1000;
+    /* this process's CPU time, user and system (CLOCKS_PER_SEC is 10^6) */
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) < 0)
+        return (clock_t)-1;
+    return (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000000 + ru.ru_utime.tv_usec + ru.ru_stime.tv_usec;
 }
 
 static const char *const wdays[] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday",

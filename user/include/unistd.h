@@ -14,6 +14,7 @@
 #define SEEK_END 2
 #endif
 int ftruncate(int fd, long length);
+int truncate(const char *path, long length);
 int isatty(int fd);
 int fsync(int fd);
 int usleep(unsigned long usec);

@@ -16,6 +16,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/reboot.h>
+#include <sys/resource.h>
+#include <sys/times.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -264,6 +266,13 @@ unsigned long uptime_ms(void) { return SC0(SYS_uptime_ms); }
 int reboot(int how) { return ret(SC1(SYS_reboot, (unsigned)how)); }
 pid_t waitpid(pid_t pid, int *st, int opt) { return ret(__syscall(SYS_wait4, pid, (long)st, opt, 0, 0, 0)); }
 pid_t wait(int *st) { return waitpid(-1, st, 0); }
+pid_t wait4(pid_t pid, int *st, int opt, struct rusage *ru)
+{
+    return ret(__syscall(SYS_wait4, pid, (long)st, opt, (long)ru, 0, 0));
+}
+pid_t wait3(int *st, int opt, struct rusage *ru) { return wait4(-1, st, opt, ru); }
+int getrusage(int who, struct rusage *ru) { return ret(SC2(SYS_getrusage, who, ru)); }
+clock_t times(struct tms *buf) { return ret(SC1(SYS_times, buf)); }
 int munmap(void *a, size_t n) { return ret(SC2(SYS_munmap, a, n)); }
 int mprotect(void *a, size_t n, int prot) { return ret(SC3(SYS_mprotect, a, n, prot)); }
 int msync(void *a, size_t n, int flags) { return ret(SC3(SYS_msync, a, n, flags)); }
@@ -334,6 +343,10 @@ int creat(const char *path, int mode) { return open(path, O_WRONLY | O_CREAT | O
 int close(int fd) { return ret(SC1(SYS_close, fd)); }
 long lseek(int fd, long off, int whence) { return ret(SC3(SYS_lseek, fd, off, whence)); }
 int stat(const char *path, struct stat *st) { return ret(SC4(SYS_fstatat, AT_FDCWD, path, st, 0)); }
+int lstat(const char *path, struct stat *st)
+{
+    return ret(SC4(SYS_fstatat, AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW));
+}
 int fstat(int fd, struct stat *st) { return ret(SC2(SYS_fstat, fd, st)); }
 int mkdir(const char *path, int mode) { return ret(SC3(SYS_mkdirat, AT_FDCWD, path, mode)); }
 int unlink(const char *path) { return ret(SC3(SYS_unlinkat, AT_FDCWD, path, 0)); }

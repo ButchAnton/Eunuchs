@@ -6,7 +6,9 @@
 #include <stdint.h>
 
 #define AT_FDCWD      (-100)
+#define AT_SYMLINK_NOFOLLOW 0x100    /* fstatat: about a symbolic link itself (lstat) */
 #define AT_REMOVEDIR  0x200
+#define AT_SYMLINK_FOLLOW   0x400    /* linkat: link what a symbolic link points to */
 
 #define O_RDONLY      00
 #define O_WRONLY      01
@@ -18,6 +20,7 @@
 #define O_APPEND      02000
 #define O_NONBLOCK    04000
 #define O_DIRECTORY   0200000
+#define O_NOFOLLOW    0400000
 #define O_CLOEXEC     02000000
 
 #define F_DUPFD         0
@@ -43,10 +46,10 @@
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
 #define S_ISCHR(m) (((m) & S_IFMT) == S_IFCHR)
-/* Not made by efs (no block devices, symbolic links or sockets in the
-   filesystem), but programs test for them. */
+/* Not made by efs (no block devices or sockets in the filesystem), but
+   programs test for them. */
 #define S_IFBLK  0060000
-#define S_IFLNK  0120000
+#define S_IFLNK  0120000                /* a symbolic link */
 #define S_IFSOCK 0140000
 #define S_ISVTX  01000
 #define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
@@ -83,6 +86,7 @@ struct stat {
 #define DT_CHR     2
 #define DT_DIR     4
 #define DT_REG     8
+#define DT_LNK     10
 
 /* getdents64: an array of fixed-size records. */
 struct dirent {

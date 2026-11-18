@@ -535,7 +535,7 @@ static int cmd_info(int argc, char **argv)
 
 static void mode_string(const struct efs_dinode *d, char out[11])
 {
-    out[0] = d->type == EFS_T_DIR ? 'd' : '-';
+    out[0] = d->type == EFS_T_DIR ? 'd' : d->type == EFS_T_SYMLINK ? 'l' : '-';
     for (int i = 0; i < 9; i++)
         out[1 + i] = d->mode & (0400 >> i) ? "rwxrwxrwx"[i] : '-';
     out[10] = 0;
@@ -554,7 +554,7 @@ static void list_entry(struct efs *fs, const char *name, uint32_t ino, bool long
         printf(",\"path\":");
         json_str(path);
         printf(",\"type\":\"%s\",\"mode\":%u,\"uid\":%u,\"gid\":%u,\"nlink\":%u,\"size\":%llu,"
-               "\"mtime\":%llu,\"ino\":%u}", d->type == EFS_T_DIR ? "dir" : "file", d->mode, d->uid, d->gid,
+               "\"mtime\":%llu,\"ino\":%u}", d->type == EFS_T_DIR ? "dir" : d->type == EFS_T_SYMLINK ? "symlink" : "file", d->mode, d->uid, d->gid,
                d->nlink, (unsigned long long)d->size, (unsigned long long)(d->mtime / 1000000000ull), ino);
         return;
     }

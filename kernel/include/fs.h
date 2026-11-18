@@ -23,6 +23,7 @@
 #include <sched.h>
 #include <types.h>
 #include <uapi/fs.h>
+#include <uapi/statfs.h>
 
 /* ---- buffer cache ---- */
 
@@ -50,7 +51,7 @@ void bcache_print(int (*print)(const char *fmt, ...));
 
 /* ---- VFS ---- */
 
-enum itype { I_FREE = 0, I_DIR = 1, I_FILE = 2, I_CHR = 3 };
+enum itype { I_FREE = 0, I_DIR = 1, I_FILE = 2, I_CHR = 3, I_LNK = 4 };
 
 struct inode;
 struct file;
@@ -98,6 +99,10 @@ struct fs_ops {
     void (*begin_op)(struct super_block *sb);
     void (*end_op)(struct super_block *sb);
     void (*stat_fs)(struct super_block *sb, int (*print)(const char *fmt, ...));
+    /* statfs(2): blocks, inodes (the VFS fills the rest) */
+    void (*statfs)(struct super_block *sb, struct statfs *st);
+    /* undo mount (the VFS has synced, and dropped every inode and cached page) */
+    void (*unmount)(struct super_block *sb);
     /* optional: put everything that has finished on disk */
     void (*sync)(struct super_block *sb);
     /*
@@ -124,7 +129,8 @@ struct super_block {
     struct inode *root;
     struct inode *covered;      /* mount point in the parent fs (NULL for /) */
     struct mutex ns_lock;
-    char path[32];
+    char path[64];
+    char source[32];            /* what was mounted: disk0p4, a 9p tag, devfs, proc */
     void *priv;
     int disk;                   /* the disk a disk-based filesystem lives on */
     u32 dev;                    /* st_dev: 1, 2, ... in mount order */
@@ -171,6 +177,11 @@ extern struct inode *root_inode;
 void vfs_init(void);
 int vfs_mount(const struct fs_type *type, const char *path);
 int vfs_mount_disk(const struct fs_type *type, const char *path, int disk);
+/* mount(2): fstype efs (SOURCE: a volume name or label), devfs, proc, 9p (SOURCE: the tag) */
+int vfs_mount_named(const char *source, const char *target, const char *fstype);
+int vfs_umount(const char *target);
+void vfs_statfs(struct inode *ip, struct statfs *st);
+void vfs_mounts_list(int (*print)(const char *fmt, ...));     /* /proc/mounts, Linux's format */
 int efs_label(int disk, char out[17]);         /* -1 if the disk holds no efs */
 struct inode *iget(struct super_block *sb, u32 ino);
 struct inode *idup(struct inode *ip);
@@ -181,13 +192,17 @@ void iput(struct inode *ip);
 void iunlockput(struct inode *ip);
 int icache_busy(void);                  /* inodes referenced (leak checks) */
 
-struct inode *namei(const char *path, int *err);
+struct inode *namei(const char *path, int *err);              /* follows symbolic links */
+struct inode *namei_nofollow(const char *path, int *err);     /* not a final one (lstat) */
 struct inode *nameiparent(const char *path, char *name, int *err);
 struct file *vfs_open(const char *path, int flags, int mode, int *err);
 int vfs_mkdir(const char *path, int mode);
 int vfs_unlink(const char *path, bool dir);
-int vfs_link(const char *oldpath, const char *newpath);
+int vfs_link(const char *oldpath, const char *newpath, bool follow);
 int vfs_rename(const char *oldpath, const char *newpath);
+int vfs_truncate(struct inode *ip, u64 size);
+int vfs_symlink(const char *target, const char *linkpath);
+long vfs_readlink(const char *path, char *buf, size_t size);  /* the target's length (no NUL) */
 int vfs_getcwd(struct inode *cwd, char *buf, size_t size);
 void vfs_stat(struct inode *ip, struct stat *st);
 /* May the current process access ip? mask: R_OK/W_OK/X_OK bits. 0 or -EACCES. */
@@ -244,6 +259,7 @@ struct efs_log *log_create(struct super_block *sb, const struct efs_super *esb);
 void log_begin(struct efs_log *log);
 void log_end(struct efs_log *log);
 void log_sync(struct efs_log *log);
+void log_destroy(struct efs_log *log);      /* umount: after the last commit */
 void log_write(struct efs_log *log, struct buf *b);
 void log_print(struct efs_log *log, int (*print)(const char *fmt, ...));
 int efs_arm_crash(const char *point);

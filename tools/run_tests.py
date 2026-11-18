@@ -480,7 +480,7 @@ def main():
         ("groups guest", "guest : guest"),
         ("tty", "/dev/console"),
         ("FOO=bar printenv FOO | tr a-z A-Z", "BAR"),
-        ("uptime", "processes"),
+        ("uptime", "load average"),
         ("cal 2 2024 | grep 29", "25 26 27 28 29"),
         ("sleep 1000 &", None),
         ("echo n=$(pgrep -c sleep)", "n=1"),
@@ -524,6 +524,44 @@ def main():
          "for (k in v) n += v[k]; printf \"%s:%d\\n\", toupper($1), n }'", "B:3"),
         ("echo hello world | awk '{ gsub(/o/, \"0\"); print length($0), $2 }'", "11 w0rld"),
         ("awk 'BEGIN { while ((\"seq 3\" | getline x) > 0) s = s x; print \"got\" s }'", "got123"),
+    ])
+
+    # CPU accounting (rusage, times), load average, truncate, statfs/df,
+    # mount/umount and symbolic links
+    interactive("time, mounts, links", [
+        ("/bin/time -p awk 'BEGIN { for (i = 0; i < 200000; i++) s += i }' 2>&1 | "
+         "awk '/^user/ { u = $2 } /^sys/ { s = $2 } END { print (u > s) ? toupper(\"yes\") : \"no\" }'", "YES"),
+        ("time sleep 0.1", "system"),
+        ("awk '{ print ($4 ~ /^[0-9]+\\/[0-9]+$/) ? \"fmt\" \"-ok\" : \"bad\" }' /proc/loadavg", "fmt-ok"),
+        ("uptime", "load average: "),
+        ("grep -c _ms /proc/self/status", "4"),
+        ("printf abcdef > /tmp/tr; truncate -s 3 /tmp/tr; truncate -s 5 /tmp/tr; od -c /tmp/tr | head -1",
+         "a   b   c  \\0  \\0"),
+        ("seq 100 > /tmp/dd1; dd if=/dev/zero of=/tmp/dd1 bs=4 seek=1 count=1 status=none; wc -c < /tmp/dd1",
+         "8"),
+        ("df / | tail -1 | awk '{ print $1 \":\" $NF }'", "disk0p3:/"),
+        ("df -T /proc | tail -1", "proc"),
+        ("grep home /proc/mounts", "disk0p4 /home efs rw 0 0"),
+        ("cd /home && umount /home; cd /", "target is busy"),
+        ("umount /home && mount home /home && ls /home", "guest"),
+        ("mkdir -p /tmp/p2 && mount -t proc proc /tmp/p2 && awk 'END { print \"nr=\" NR }' /tmp/p2/loadavg", "nr=1"),
+        ("umount /tmp/p2 && ls /tmp/p2 | awk 'END { print \"left=\" NR }'", "left=0"),
+        ("su guest", None, False), (None, "guest@eunuchs:~% ", False),
+        ("mount home /mnt", "Operation not permitted"),
+        ("exit", None),
+        ("cd /tmp && mkdir -p ld/sub && echo through > ld/sub/f && ln -s ld/sub sl && ln -s nowhere dl; cd /", None),
+        ("ls -l /tmp/sl", "sl -> ld/sub"),
+        ("cat /tmp/sl/f | tr a-z A-Z", "THROUGH"),
+        ("readlink /tmp/sl; readlink -f /tmp/sl/f", "/tmp/ld/sub/f"),
+        ("cat /tmp/dl", "No such file or directory"),
+        ("ln -s /tmp/lp1 /tmp/lp2; ln -s /tmp/lp2 /tmp/lp1; cat /tmp/lp1", "Too many levels of symbolic links"),
+        ("test -h /tmp/sl && /bin/test -L /tmp/sl && [ -d /tmp/sl ] && echo \"both\"\" ways\"", "both ways"),
+        ("find /tmp -type l | sort | paste -s -d,", "/tmp/dl,/tmp/lp1,/tmp/lp2,/tmp/sl"),
+        ("cd /tmp && tar cf lk.tar sl && mkdir -p lx && tar xf lk.tar -C lx && readlink lx/sl; cd /", "ld/sub"),
+        ("cp -r /tmp/ld /tmp/ld2 && ln -s sub/f /tmp/ld/fl && cp -r /tmp/ld /tmp/ld3 && ls -l /tmp/ld3/fl",
+         "fl -> sub/f"),
+        ("rm /tmp/sl && ls /tmp/ld/sub", "f"),
+        ("file /tmp/dl", "broken symbolic link to nowhere"),
     ])
 
     interactive("toolchain and editors", [

@@ -198,6 +198,7 @@ void pc_update(struct inode *ip, u64 off, const void *src, size_t n);
 void pc_truncate(struct inode *ip, u64 size);
 /* The file is gone: forget its pages (dirty ones too). */
 void pc_drop_inode(struct super_block *sb, u32 ino);
+void pc_drop_sb(struct super_block *sb);    /* every page of a filesystem (umount) */
 /* Write dirty pages of one file (ino 0: every file on sb; sb NULL: all) to
    their files. With lock_wait false, files whose lock is busy are skipped. */
 int pc_writeback(struct super_block *sb, u32 ino, u64 first, u64 last, bool lock_wait);

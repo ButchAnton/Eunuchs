@@ -67,6 +67,7 @@ static void kinit(void *arg)
     p9_init();                          /* host directories, mounted by vfs_init */
     vfs_init();
     reclaim_init();                     /* swap (needs the volumes vfs_init found), kswapd */
+    loadavg_init();
     net_init();
 
     const char *tests = cmdline_get("ktest");

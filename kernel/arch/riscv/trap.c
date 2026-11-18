@@ -248,6 +248,20 @@ static void return_to_user_checks(struct trap_frame *tf)
     }
     syscall_restart_check(tf);
     intr_off();
+    current->user_entry = rdtime();     /* user time runs from here to the next trap */
+}
+
+/* Coming in from user mode: the time since it went back out was user time.
+   (It cannot span a switch: the thread was in the kernel when it was switched
+   out, so a start before this CPU switched it in is stale.) */
+static void account_user(void)
+{
+    struct thread *t = current;
+    u64 now = rdtime(), start = t->user_entry;
+    if (start < this_cpu()->last_switch)
+        start = this_cpu()->last_switch;
+    if (now > start)
+        t->utime += now - start;
 }
 
 void trap_handler(struct trap_frame *tf)
@@ -257,6 +271,8 @@ void trap_handler(struct trap_frame *tf)
 
     if (unlikely(this_cpu()->overflow_sp))
         stack_overflow(tf);
+    if (from_user)
+        account_user();
 
     if (tf->scause & SCAUSE_INTR) {
         handle_interrupt(tf, code);

@@ -256,7 +256,7 @@ On failure (no `mm` or no thread) the child is unlinked under `proc_lock` and fr
 `proc_exit(status)` is called from `exit` (`do_exit`), from fatal default actions in `signal_deliver`, from `user_fault`, from `do_rt_sigreturn` via `user_fault`, and from `user_entry`.
 
 1. It panics if called from a kernel thread. It also panics if the process is init and no kernel waiter has registered (`init (pid 1) exited with status ...`).
-2. Detaches the address space under `proc_lock` (`p->mm = NULL`), switches to the kernel page table (`vm_activate(NULL)`), then `mm_destroy`. The order matters: if the thread is preempted during the destroy, the scheduler must not reactivate a page table that is being freed (`sched.c` calls `vm_activate(next->proc->mm)`).
+2. Saves its resource use in `p->usage` (`proc_usage_self`, while the thread and the address space still exist), then detaches the address space under `proc_lock` (`p->mm = NULL`), switches to the kernel page table (`vm_activate(NULL)`), then `mm_destroy`. The order matters: if the thread is preempted during the destroy, the scheduler must not reactivate a page table that is being freed (`sched.c` calls `vm_activate(next->proc->mm)`).
 3. `files_close_all` (descriptors and cwd) and `set_image(p, NULL)`.
 4. Under `proc_lock`:
    - Reparents every child to `initproc`. If the exiting process *is* init, the children get `parent = NULL`. If any reparented child is already a zombie, init is woken.
@@ -268,16 +268,26 @@ On failure (no `mm` or no thread) the child is unlinked under `proc_lock` and fr
 
 ### Waiting (`sys_wait4`)
 
-The `pid` argument follows POSIX: -1 means any child, > 0 one child, 0 the caller's process group, < -1 group `-pid` (`child_matches`). The options are `WNOHANG` (1) and `WUNTRACED` (2). `rusage` is ignored.
+The `pid` argument follows POSIX: -1 means any child, > 0 one child, 0 the caller's process group, < -1 group `-pid` (`child_matches`). The options are `WNOHANG` (1) and `WUNTRACED` (2). With a `rusage` pointer, a reaped child's resource use is copied out (see below).
 
 Loop:
 1. Under `proc_lock`, `find_reportable` scans the children. A child is *reportable* if it is a zombie, or if it is stopped and not yet reported and either `WUNTRACED` was given (a job-control stop) or it is in a tracing stop and the caller is its tracer (no `WUNTRACED` needed). A tracing stop is never reported to a parent that is not the tracer. It then scans `all_procs` for processes the caller traces without being their parent (`tracee_reportable`): their tracing stops, and their exit, which is reported to the tracer once (`ptrace_exit_report`) while the real parent still reaps the zombie.
 2. Stopped child (or tracee): sets `stop_reported = true` and returns the pid with `WSTOPPED_ENC(stop_sig)`. The child stays in the list.
-3. Zombie of a traced non-child: clears `ptrace_exit_report` and `tracer` and returns its pid and status without reaping it. Zombie child: `proc_unlink` under the lock, then (unlocked) reads `exit_status`, `kfree`s the proc, copies the status out and returns the pid. If the status copy faults, the child has already been reaped and the call returns `-EFAULT`.
+3. Zombie of a traced non-child: clears `ptrace_exit_report` and `tracer` and returns its pid and status without reaping it. Zombie child: `proc_unlink` under the lock, then (unlocked) reads `exit_status`, adds the child's resource use (its own plus its children's) to the caller's `child_usage`, `kfree`s the proc, copies the status (and the `rusage`) out and returns the pid. If the status copy faults, the child has already been reaped and the call returns `-EFAULT`.
 4. No matching child: `-ECHILD`. With `WNOHANG`: 0.
 5. Otherwise it sleeps with `wait_event_interruptible(&p->child_wq, has_zombie(...))`. `has_zombie` re-scans under `proc_lock`, so a wakeup between the scan and the sleep is not lost. If a signal interrupts the wait, it returns `-ERESTARTSYS`.
 
 `proc_wait_kernel(p)` is the kernel-side version for processes that have no parent. It sets `init_has_kernel_waiter` when waiting for init, waits on `exit_wq` until `P_ZOMBIE`, unlinks and frees the proc, and clears `initproc`.
+
+### Resource use (`getrusage`, `wait4`, `times`)
+
+`struct proc_usage` (`proc.h`) holds user and system time (rdtime ticks), minor and major faults, voluntary and involuntary context switches, and the largest resident set (KiB). A process has two: `usage`, its own, filled at exit, and `child_usage`, the sum over the children it has reaped (each child counting its own reaped children too; for the largest set, the maximum). While a process runs, `proc_usage_self` computes its own from the thread (`utime`, `thread_cpu_ticks` less `utime` for system time, `nvcsw`, `nivcsw`; [04](04-threads-scheduling-smp.md#cpu-time-and-the-load-average)) and the address space (`faults` less `major_faults`, `major_faults`, `max_rss`, which `mm_rss_inc` raises wherever `rss` grows). Faults and the resident set belong to the address space, so they restart at `exec`, as on Linux.
+
+- **`getrusage(who, ru)`** (165): `RUSAGE_SELF` (`proc_usage_self`, plus `signals_received` as `ru_nsignals`) or `RUSAGE_CHILDREN` (`child_usage`). The other fields of Linux's `struct rusage` (`lib/include/uapi/resource.h`) are 0.
+- **`wait4(..., ru)`**: the reaped child's own use plus its children's.
+- **`times(buf)`** (153): the caller's and its children's user and system time in clock ticks of 1/100 s (`_SC_CLK_TCK`); returns the time since boot in the same ticks.
+
+`/proc/<pid>/status` shows `utime_ms` and `stime_ms`.
 
 ### Sending signals (`signal_send_locked`)
 
@@ -543,7 +553,9 @@ Numbers are from `lib/include/uapi/syscall.h`.
 | 48, 52, 53, 54 | faccessat, fchmod, fchmodat, fchownat | `cred.c` |
 | 220 | fork | `sys_fork` (Linux's 220 is `clone`; here it is a plain fork) |
 | 221 | execve | `sys_execve` |
-| 260 | wait4 | `sys_wait4` (`WNOHANG`, `WUNTRACED`) |
+| 260 | wait4 | `sys_wait4` (`WNOHANG`, `WUNTRACED`; fills `rusage`) |
+| 153 | times | `proc.c: do_times` |
+| 165 | getrusage | `proc.c: do_getrusage` (`RUSAGE_SELF`, `RUSAGE_CHILDREN`) |
 | 500 | sleep_ms | `syscall.c` (returns `-EINTR`, not restarted) |
 | 502 | debug | `DBG_STRACE`, `DBG_PS`, `DBG_BREAK`, `DBG_VM`, ... |
 | 29 | ioctl (tty) | `TIOCGPGRP`, `TIOCSPGRP`, `TIOCSCTTY`, `TIOCNOTTY` |
@@ -553,7 +565,7 @@ Numbers are from `lib/include/uapi/syscall.h`.
 | File | Contents |
 |---|---|
 | `/proc/procs` | `proc_list_print`: PID, PPID, PGID, SID, name, state (`zombie`, `T` for stopped, or the thread state), TID, syscalls, RSS, strace, SIGPEND, SIGBLK, age. |
-| `/proc/<pid>/status` | pid, ppid, name, state, tid, wait reason, context switches, syscalls, rss_kib, strace, uid/euid/gid/egid/umask, pgid, sid, stopped, sig_pending, sig_blocked, sig_caught, sig_ignored; then, for `ps`, `ustate` (the Unix state letter: R, S, D for an uninterruptible sleep, T, Z), `start_ms` (start time, ms since boot), `cpu_ms` (CPU time including the current slice, `thread_cpu_ticks`), `vsz_kib` (sum of the VMAs), `tty` (`console` or `-`), `tpgid` (the terminal's foreground group), `psr` (the CPU it last ran on). |
+| `/proc/<pid>/status` | pid, ppid, name, state, tid, wait reason, context switches, syscalls, rss_kib, strace, uid/euid/gid/egid/umask, pgid, sid, stopped, sig_pending, sig_blocked, sig_caught, sig_ignored; then, for `ps`, `ustate` (the Unix state letter: R, S, D for an uninterruptible sleep, T, Z), `utime_ms` and `stime_ms` (user and system time), `start_ms` (start time, ms since boot), `cpu_ms` (CPU time including the current slice, `thread_cpu_ticks`), `vsz_kib` (sum of the VMAs), `tty` (`console` or `-`), `tpgid` (the terminal's foreground group), `psr` (the CPU it last ran on). |
 | `/proc/<pid>/cmdline` | The arguments of the last `execve`, each followed by a NUL (as on Linux), kept in `proc.cmdline` (256 bytes, truncated) and copied by `fork`. |
 | `/proc/<pid>/maps` | `mm_print` (VMAs, resident and COW pages). |
 | `/proc/<pid>/fds` | The cwd path, then the descriptors. |

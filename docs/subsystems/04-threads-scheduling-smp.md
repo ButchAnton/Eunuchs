@@ -99,6 +99,8 @@ The accessors in `percpu.h` are:
 | `wake_time`, `on_sleepq`, `sleep_node` | Timed sleep: deadline in `rdtime` units, linked into `sleepq` |
 | `all_node` | Linked into the global `all_threads` list |
 | `runtime`, `switches`, `created`, `create_site` | Accounting and the creator's return address |
+| `utime`, `user_entry` | Of `runtime`, the ticks spent in user mode, and when the thread last returned to it (see CPU time) |
+| `nvcsw`, `nivcsw` | Times switched out while sleeping (voluntary) or still runnable (preempted, yielded) |
 
 **State invariants (under `sched_lock`):**
 
@@ -202,7 +204,7 @@ A new thread first runs `thread_entry` (via `thread_start`). At that point it ho
 6. `next = dequeue(c->id)`: the oldest thread on `runq` whose `bound_cpu` is -1 or this CPU. If there is none, `next` is this CPU's idle thread.
 7. If `next == prev`: set `T_RUNNING` if it was `T_RUNNABLE`, unlock with the saved flags, and return.
 8. Otherwise:
-   - charge `now - last_switch` to `prev->runtime`;
+   - charge `now - last_switch` to `prev->runtime`, and count the switch in `prev->nvcsw` (it was sleeping) or `prev->nivcsw` (anything but the idle thread, still runnable);
    - emit `sched_switch(prev, next, prev->state)`;
    - mark `next` `T_RUNNING` if it was `T_RUNNABLE` (a preempted sleeper stays `T_SLEEPING`) and set `next->on_cpu`;
    - count a migration if `next->cpu != c->id` (and it has run before);
@@ -304,6 +306,14 @@ The next thread on that CPU then runs `finish_switch` and `post_switch`.
 The decision is made exactly once, under the lock, so a race between `detach` and the final switch cannot double-free or leak.
 
 A thread that is never joined or detached stays in `all_threads` as `T_DEAD` forever. `ps` shows it as "(exited; awaiting join)".
+
+### CPU time and the load average
+
+**User and system time.** `runtime` is all the time a thread has been on a CPU; `utime` is the part in user mode, and the system time is the difference. The split is made at the trap boundary (`kernel/arch/riscv/trap.c`): `return_to_user_checks`, the last step before going back to user mode, sets `user_entry = rdtime()`, and `trap_handler`, on a trap from user mode, adds the time since then to `utime` (`account_user`). A stretch of user time always ends in a trap and never spans a context switch, since the thread is in the kernel when it is switched out; so a `user_entry` older than the CPU's `last_switch` is stale (a new thread, or one that returned to user mode by another path, such as fork's return or exec), and the stretch is counted from `last_switch`. It costs one `rdtime` each way. `thread_cpu_ticks` includes the current slice, so a thread running in user mode right now has that time counted as system time until its next trap.
+
+The process side (`proc_usage_self`, `getrusage`, `wait4`'s `rusage`, `times`) is in [05](05-processes-and-signals.md#resource-use-getrusage-wait4-times).
+
+**Load average.** The `loadavg` kernel thread (started by `kinit` after kswapd) wakes every 5 s, counts the threads that are running, runnable, or in an uninterruptible sleep with a reason (`wait_what`), kernel threads included but not the idle threads or itself, and updates three averages as Linux does: `load = load * e + n * (1 - e)` with `e` = exp(-5 s / 1, 5 or 15 min) in 11-bit fixed point (1884, 2014, 2037 out of 2048). `/proc/loadavg` prints them in Linux's format, `0.44 0.10 0.03 3/9 16` (the three averages, threads running now (the reader included) and in all, and the last pid allocated). An idle system reads 0.00: no kernel thread sleeps uninterruptibly for long.
 
 ### Idle loop
 

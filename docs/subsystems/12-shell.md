@@ -11,7 +11,7 @@ What esh does:
 - **The language.**
   - Simple commands, pipelines (`|`, `|&`) and lists (`;`, `&`, `&&`, `||`).
   - Subshells and groups.
-  - `if`, `while`, `until`, `for` (both forms), `case`, `repeat`, functions, `[[ ]]`, `(( ))` and `time`.
+  - `if`, `while`, `until`, `for` (both forms), `case`, `repeat`, functions, `[[ ]]`, `(( ))` and `time` (zsh's report on stderr: `CMD  0.89s user 0.00s system 99% cpu 0.911 total`, from `getrusage` of the shell and its reaped children before and after).
   - Here-documents and here-strings, aliases, arrays and local variables.
 - **Expansion, as zsh does it.**
   - Brace, tilde, parameter (with zsh's `${(flags)...}`), command and arithmetic expansion, then globbing (including `**`).
@@ -94,7 +94,7 @@ Redirections apply to builtins and functions too (they are undone afterwards). `
 #### Conditions: `[[ ... ]]`
 
 - **Unary.**
-  - file tests: `-e -f -d -c -p -s -r -w -x -u -g -O -G -N`;
+  - file tests: `-e -f -d -c -p -s -r -w -x -u -g -O -G -N`, and `-h`/`-L` (a symbolic link, by `lstat`; the others follow links);
   - `-n` and `-z` for strings;
   - `-t fd`;
   - `-o option` (true if the option is on);

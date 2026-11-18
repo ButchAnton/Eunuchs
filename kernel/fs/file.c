@@ -308,6 +308,67 @@ long do_openat(const u64 *a)
     return fd;
 }
 
+long do_truncate(const u64 *a)
+{
+    char path[PATH_MAX];
+    long r = get_path(path, a[0], AT_FDCWD);
+    if (r)
+        return r;
+    if ((long)a[1] < 0)
+        return -EINVAL;
+    int err;
+    struct inode *ip = namei(path, &err);
+    if (!ip)
+        return err;
+    ilock(ip);
+    r = vfs_permission(ip, W_OK);
+    iunlock(ip);
+    if (!r)
+        r = vfs_truncate(ip, a[1]);
+    iput(ip);
+    return r;
+}
+
+long do_ftruncate(const u64 *a)
+{
+    struct file *f = fd_get(a[0]);
+    if (!f)
+        return -EBADF;
+    if (!f->writable || !f->ip || f->cops)
+        return -EINVAL;
+    if ((long)a[1] < 0)
+        return -EINVAL;
+    return vfs_truncate(f->ip, a[1]);
+}
+
+long do_symlinkat(const u64 *a)
+{
+    char target[PATH_MAX], path[PATH_MAX];
+    long r = strncpy_from_user(target, a[0], PATH_MAX);
+    if (r < 0)
+        return r;
+    if (r >= PATH_MAX)
+        return -ENAMETOOLONG;
+    r = get_path(path, a[2], (long)a[1]);
+    return r ? r : vfs_symlink(target, path);
+}
+
+long do_readlinkat(const u64 *a)
+{
+    char path[PATH_MAX], target[PATH_MAX];
+    long r = get_path(path, a[1], (long)a[0]);
+    if (r)
+        return r;
+    if ((long)a[3] <= 0)
+        return -EINVAL;
+    long n = vfs_readlink(path, target, sizeof(target));
+    if (n < 0)
+        return n;
+    if ((u64)n > a[3])
+        n = a[3];                       /* truncated, without a NUL (as POSIX says) */
+    return copy_to_user(a[2], target, n) ? -EFAULT : n;
+}
+
 long do_close(const u64 *a)
 {
     struct file *f = fd_get((long)a[0]);
@@ -384,7 +445,7 @@ long do_fstatat(const u64 *a)
     if (r)
         return r;
     int err;
-    struct inode *ip = namei(path, &err);
+    struct inode *ip = (a[3] & AT_SYMLINK_NOFOLLOW) ? namei_nofollow(path, &err) : namei(path, &err);
     if (!ip)
         return err;
     struct stat st;
@@ -415,7 +476,8 @@ long do_getdents64(const u64 *a)
         if (kd.type == DT_UNKNOWN) {
             struct inode *ip = iget(dp->sb, kd.ino);
             ilock(ip);
-            kd.type = ip->type == I_DIR ? DT_DIR : ip->type == I_CHR ? DT_CHR : DT_REG;
+            kd.type = ip->type == I_DIR ? DT_DIR : ip->type == I_CHR ? DT_CHR
+                        : ip->type == I_LNK ? DT_LNK : DT_REG;
             iunlockput(ip);
         }
         struct dirent ud = { .d_ino = kd.ino, .d_type = kd.type };
@@ -448,7 +510,7 @@ long do_linkat(const u64 *a)
     long r = get_path(from, a[1], (long)a[0]);
     if (!r)
         r = get_path(to, a[3], (long)a[2]);
-    return r ? r : vfs_link(from, to);
+    return r ? r : vfs_link(from, to, a[4] & AT_SYMLINK_FOLLOW);
 }
 
 long do_renameat(const u64 *a)
@@ -610,4 +672,61 @@ long do_fsync(const u64 *a)
     if (f->ip)
         vfs_sync(f->ip->sb);
     return r;
+}
+
+long do_statfs(const u64 *a)
+{
+    char path[PATH_MAX];
+    long r = get_path(path, a[0], AT_FDCWD);
+    if (r)
+        return r;
+    int err;
+    struct inode *ip = namei(path, &err);
+    if (!ip)
+        return err;
+    struct statfs st;
+    vfs_statfs(ip, &st);
+    iput(ip);
+    return copy_to_user(a[1], &st, sizeof(st)) ? -EFAULT : 0;
+}
+
+long do_fstatfs(const u64 *a)
+{
+    struct file *f = fd_get(a[0]);
+    if (!f)
+        return -EBADF;
+    if (!f->ip)
+        return -EINVAL;                 /* a pipe or socket */
+    struct statfs st;
+    vfs_statfs(f->ip, &st);
+    return copy_to_user(a[1], &st, sizeof(st)) ? -EFAULT : 0;
+}
+
+/* mount(source, target, fstype, flags, data): root only */
+long do_mount(const u64 *a)
+{
+    if (current_proc()->euid != 0)
+        return -EPERM;
+    char source[64] = "", target[PATH_MAX], fstype[16];
+    long r;
+    if (a[0] && (r = strncpy_from_user(source, a[0], sizeof(source))) < 0)
+        return r;
+    if ((r = strncpy_from_user(target, a[1], sizeof(target))) < 0)
+        return r;
+    if (!a[2])
+        return -EINVAL;
+    if ((r = strncpy_from_user(fstype, a[2], sizeof(fstype))) < 0)
+        return r;
+    return vfs_mount_named(source, target, fstype);
+}
+
+long do_umount2(const u64 *a)
+{
+    if (current_proc()->euid != 0)
+        return -EPERM;
+    char target[PATH_MAX];
+    long r = strncpy_from_user(target, a[0], sizeof(target));
+    if (r < 0)
+        return r;
+    return vfs_umount(target);
 }

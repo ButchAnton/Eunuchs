@@ -425,8 +425,15 @@ ABI: `ecall` with `a7` = number, `a0`–`a5` = arguments; result in `a0`, `-errn
 | 29 | `ioctl` | `kernel/fs/file.c: do_ioctl` | Forwarded to the file's `cops->ioctl` (TTY); else `ENOTTY`. |
 | 34 | `mkdirat` | `kernel/fs/file.c: do_mkdirat` | Directory fd must be `AT_FDCWD` unless the path is absolute (all `*at` path calls). |
 | 35 | `unlinkat` | `kernel/fs/file.c: do_unlinkat` | `AT_REMOVEDIR` for directories. |
+| 36 | `symlinkat` | `kernel/fs/file.c: do_symlinkat` → `vfs.c: vfs_symlink` | efs only. See [06](06-filesystems.md#path-lookup-walk). |
 | 37 | `linkat` | `kernel/fs/file.c: do_linkat` | Hard link. |
 | 38 | `renameat` | `kernel/fs/file.c: do_renameat` | |
+| 39 | `umount2` | `kernel/fs/file.c: do_umount2` → `vfs.c: vfs_umount` | Root only; `EBUSY` while anything uses the filesystem; flags ignored. |
+| 40 | `mount` | `kernel/fs/file.c: do_mount` → `vfs.c: vfs_mount_named` | Root only; `efs`, `devfs`, `proc`, `9p`; flags and data ignored. |
+| 43 | `statfs` | `kernel/fs/file.c: do_statfs` → `vfs.c: vfs_statfs` | Linux's `struct statfs` (`uapi/statfs.h`). |
+| 44 | `fstatfs` | `kernel/fs/file.c: do_fstatfs` | `EINVAL` for a pipe or socket. |
+| 45 | `truncate` | `kernel/fs/file.c: do_truncate` → `vfs.c: vfs_truncate` | Needs write permission. |
+| 46 | `ftruncate` | `kernel/fs/file.c: do_ftruncate` | `EINVAL` unless open for writing. |
 | 48 | `faccessat` | `kernel/proc/cred.c: do_faccessat` | `AT_FDCWD` only; checks with effective credentials via `vfs_permission`. |
 | 49 | `chdir` | `kernel/fs/file.c: do_chdir` | |
 | 52 | `fchmod` | `kernel/proc/cred.c: do_fchmod` | |
@@ -440,6 +447,7 @@ ABI: `ecall` with `a7` = number, `a0`–`a5` = arguments; result in `a0`, `-errn
 | 63 | `read` | `kernel/fs/file.c: do_read` | May return `-ERESTARTSYS` internally (pipes, TTY, sockets). |
 | 64 | `write` | `kernel/fs/file.c: do_write` | |
 | 73 | `ppoll` | `kernel/fs/poll.c: do_ppoll` | Up to 64 fds (`POLL_MAX_FDS`); the signal-mask argument is not used; interrupted → `EINTR`. |
+| 78 | `readlinkat` | `kernel/fs/file.c: do_readlinkat` → `vfs.c: vfs_readlink` | No NUL; cut to the buffer. |
 | 79 | `fstatat` | `kernel/fs/file.c: do_fstatat` | Flags ignored. |
 | 80 | `fstat` | `kernel/fs/file.c: do_fstat` | Pipes report `S_IFIFO`. |
 | 81 | `sync` | `kernel/fs/file.c: do_sync` | `vfs_sync_all`: waits for every filesystem's next log commit (efs `log_sync`). |
@@ -458,10 +466,12 @@ ABI: `ecall` with `a7` = number, `a0`–`a5` = arguments; result in `a0`, `-errn
 | 142 | `reboot` | `kernel/proc/syscall.c: do_reboot` | Root only (`EPERM`). Calls `vfs_sync_all` first, so every completed write is on disk. `RB_AUTOBOOT` (0x01234567): cold reboot through SBI SRST (OpenSBI, eboot, the kernel again); `RB_POWER_OFF` (0x4321fedc): shut down; anything else `EINVAL`. Never returns on success. |
 | 144 | `setgid` | `kernel/proc/cred.c: do_setgid` | |
 | 146 | `setuid` | `kernel/proc/cred.c: do_setuid` | Root sets all three ids; others may set euid to real or saved. |
+| 153 | `times` | `kernel/proc/proc.c: do_times` | 1/100 s ticks. |
 | 154 | `setpgid` | `kernel/proc/signal.c: do_setpgid` | |
 | 155 | `getpgid` | `kernel/proc/signal.c: do_getpgid` | |
 | 156 | `getsid` | `kernel/proc/signal.c: do_getsid` | |
 | 157 | `setsid` | `kernel/proc/signal.c: do_setsid` | |
+| 165 | `getrusage` | `kernel/proc/proc.c: do_getrusage` | `RUSAGE_SELF`, `RUSAGE_CHILDREN`. |
 | 166 | `umask` | `kernel/proc/cred.c: do_umask` | Returns the old mask. |
 | 169 | `gettimeofday` | `kernel/proc/cred.c: do_gettimeofday` | From the RTC; timezone ignored. |
 | 172 | `getpid` | `kernel/proc/syscall.c: do_getpid` | |
@@ -490,7 +500,7 @@ ABI: `ecall` with `a7` = number, `a0`–`a5` = arguments; result in `a0`, `-errn
 | 227 | `msync` | `kernel/proc/syscall.c: do_msync` → `uvm.c: uvm_msync` | Writes dirty shared file pages in the range back (`MS_ASYNC`, `MS_SYNC`, `MS_INVALIDATE`). |
 | 232 | `mincore` | `kernel/proc/syscall.c: do_mincore` → `uvm.c: uvm_mincore` | `vec[i]` bit 0: page mapped, or (file mapping) the file page cached. Unaligned or bad range → `EINVAL`; unmapped pages → `ENOMEM`. Done 256 pages at a time under `mm->lock`. |
 | 242 | `accept4` | `kernel/net/socket.c: do_accept4` | |
-| 260 | `wait4` | `kernel/proc/syscall.c: do_wait4` → `proc.c: sys_wait4` | `rusage` ignored; `-ERESTARTSYS` when interrupted. |
+| 260 | `wait4` | `kernel/proc/syscall.c: do_wait4` → `proc.c: sys_wait4` | fills `rusage` ([05](05-processes-and-signals.md#resource-use-getrusage-wait4-times)); `-ERESTARTSYS` when interrupted. |
 | 500 | `sleep_ms` | `kernel/proc/syscall.c: do_sleep_ms` | Eunuchs-specific. `EINTR` if a signal is pending afterwards (not restarted). |
 | 501 | `uptime_ms` | `kernel/proc/syscall.c: do_uptime_ms` | `rdtime * 1000 / timebase`. |
 | 502 | `debug` | `kernel/proc/syscall.c: do_debug` | Debug operations, below. |
@@ -575,7 +585,7 @@ Strings are cut at 40 bytes, buffers at 32, argv at 6 elements of 24 bytes; `brk
 - **strace buffer overrun.** In `strace_enter`, `len` is advanced by the return value of `ksnprintf`, which is the untruncated length. When an argument separator (`", "`) pushes `len` past `sizeof(strace_buf)` (192) in the middle of an argument, the next call is given `size - len`, which wraps to a huge `size_t`, and writes past the end of `p->strace_buf` (the last field of `struct proc`). Long `execve` argument lists under strace can trigger it.
 - **`__restore_rt` has no fallback** after its `ecall`. If `rt_sigreturn` fails and the process survives (it has a SIGSEGV handler), execution falls through into whatever follows `__restore_rt`.
 - **`extable_lookup` is a linear scan**, done twice per kernel memory fault.
-- **The `ppoll` signal mask, `wait4` `rusage`, `fstatat` flags, and `*at` directory fds** (other than `AT_FDCWD`) are ignored or rejected.
+- **The `ppoll` signal mask and `*at` directory fds** (other than `AT_FDCWD`) are ignored or rejected.
 - **Assembly constants are hand-maintained.** `trapentry.S` defines its own `FRAME_SIZE` and `TF_*` offsets; only the total size and the `struct cpu` offsets are checked by static asserts.
 - **CFI for user traps** describes the user frame as the caller of `kernel_trap_entry`; GDB will try to unwind into user code using kernel symbols.
 

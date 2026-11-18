@@ -37,6 +37,7 @@
     X(ENAMETOOLONG, 36, "File name too long")       \
     X(ENOSYS,   38, "Function not implemented")     \
     X(ENOTEMPTY, 39, "Directory not empty")         \
+    X(ELOOP,    40, "Too many levels of symbolic links") \
     X(ENOTSOCK, 88, "Socket operation on non-socket") \
     X(EDESTADDRREQ, 89, "Destination address required") \
     X(EMSGSIZE, 90, "Message too long")             \

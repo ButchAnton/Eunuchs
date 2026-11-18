@@ -20,6 +20,8 @@ struct inode *root_inode;
 static LIST_HEAD(icache);
 static spinlock_t icache_lock = SPINLOCK_INIT("icache");
 static LIST_HEAD(mounts);
+/* Taken to change the mount list, and to walk it from where a mount can go away. */
+static struct mutex mounts_lock = MUTEX_INIT(mounts_lock, "mounts");
 
 u64 rtc_time_ns(void);
 
@@ -201,6 +203,8 @@ int vfs_mount_disk(const struct fs_type *type, const char *path, int disk)
     sb->ops = type->ops;
     mutex_init(&sb->ns_lock, "namespace");
     strlcpy(sb->path, path, sizeof(sb->path));
+    strlcpy(sb->source, type == &efs_type ? blk_name(disk) : type == &ninep_type ? p9_tag(disk)
+                        : type == &procfs_type ? "proc" : type->name, sizeof(sb->source));
 
     struct inode *covered = NULL;
     if (strcmp(path, "/")) {
@@ -227,11 +231,15 @@ int vfs_mount_disk(const struct fs_type *type, const char *path, int disk)
         return r;
     }
     sb->covered = covered;
+    unsigned long flags = spin_lock_irqsave(&icache_lock);   /* lookups cross mounts under it */
     if (covered)
         covered->mounted = sb;          /* the mount keeps its reference */
     else
         root_inode = sb->root;
+    spin_unlock_irqrestore(&icache_lock, flags);
+    mutex_lock(&mounts_lock);
     list_add_tail(&sb->node, &mounts);
+    mutex_unlock(&mounts_lock);
     if (type == &efs_type)
         pr_info("mounted %s (%s) on %s\n", type->name, blk_name(disk), path);
     else
@@ -245,14 +253,168 @@ void vfs_sync(struct super_block *sb)
         sb->ops->sync(sb);
 }
 
-/* Every mounted filesystem (mounts are only ever added, at boot), with the
-   file pages written through shared mappings first. */
+/* Every mounted filesystem, with the file pages written through shared
+   mappings first. */
 void vfs_sync_all(void)
 {
     struct super_block *sb;
     pc_writeback(NULL, 0, 0, ~0ULL, true);
+    mutex_lock(&mounts_lock);
     list_for_each_entry(sb, &mounts, node)
         vfs_sync(sb);
+    mutex_unlock(&mounts_lock);
+}
+
+/* /proc/mounts: "SOURCE PATH TYPE OPTIONS 0 0" */
+void vfs_mounts_list(print_fn print)
+{
+    struct super_block *sb;
+    mutex_lock(&mounts_lock);
+    list_for_each_entry(sb, &mounts, node)
+        print("%s %s %s rw 0 0\n", sb->source, sb->path, sb->type == &procfs_type ? "proc" : sb->type->name);
+    mutex_unlock(&mounts_lock);
+}
+
+/* A path from the root, with "." and ".." resolved and slashes squeezed. */
+static int absolute_path(const char *path, char *out, size_t size)
+{
+    char buf[PATH_MAX * 2];
+    if (path[0] == '/') {
+        strlcpy(buf, path, sizeof(buf));
+    } else {
+        struct proc *p = current_proc();
+        if (!p || !p->cwd || vfs_getcwd(p->cwd, buf, PATH_MAX) < 0)
+            return -ENOENT;
+        size_t n = strlen(buf);
+        ksnprintf(buf + n, sizeof(buf) - n, "/%s", path);
+    }
+    size_t o = 0;
+    out[o++] = '/';
+    for (char *t = buf; *t;) {
+        while (*t == '/')
+            t++;
+        if (!*t)
+            break;
+        char *e = t;
+        while (*e && *e != '/')
+            e++;
+        size_t len = e - t;
+        if (len == 1 && t[0] == '.') {
+        } else if (len == 2 && t[0] == '.' && t[1] == '.') {
+            while (o > 1 && out[o - 1] != '/')
+                o--;
+            if (o > 1)
+                o--;
+        } else {
+            if (o + len + 2 > size)
+                return -ENAMETOOLONG;
+            if (o > 1)
+                out[o++] = '/';
+            memcpy(out + o, t, len);
+            o += len;
+        }
+        t = e;
+    }
+    out[o] = 0;
+    return 0;
+}
+
+int vfs_mount_named(const char *source, const char *target, const char *fstype)
+{
+    char path[64];
+    int r = absolute_path(target, path, sizeof(path));
+    if (r)
+        return r;
+    if (!strcmp(fstype, "efs")) {
+        int v = swap_find_volume(source);       /* a volume by name or GPT label */
+        if (v < 0)
+            return -ENODEV;
+        if (v == swap_volume())
+            return -EBUSY;                      /* swap space */
+        char label[17];
+        if (efs_label(v, label))
+            return -EINVAL;                     /* not an efs filesystem */
+        struct super_block *sb;
+        mutex_lock(&mounts_lock);
+        list_for_each_entry(sb, &mounts, node)
+            if (sb->type == &efs_type && sb->disk == v) {
+                mutex_unlock(&mounts_lock);
+                return -EBUSY;                  /* mounted already */
+            }
+        mutex_unlock(&mounts_lock);
+        return vfs_mount_disk(&efs_type, path, v);
+    }
+    if (!strcmp(fstype, "devfs"))
+        return vfs_mount(&devfs_type, path);
+    if (!strcmp(fstype, "proc") || !strcmp(fstype, "procfs"))
+        return vfs_mount(&procfs_type, path);
+    if (!strcmp(fstype, "9p")) {
+        for (int i = 0; i < p9_count(); i++)
+            if (!strcmp(p9_tag(i), source))
+                return vfs_mount_disk(&ninep_type, path, i);
+        return -ENODEV;
+    }
+    return -ENODEV;                             /* no such filesystem type */
+}
+
+int vfs_umount(const char *target)
+{
+    int err;
+    struct inode *ip = namei(target, &err);
+    if (!ip)
+        return err;
+    struct super_block *sb = ip->sb;
+    if (ip != sb->root) {
+        iput(ip);
+        return -EINVAL;                         /* not a mount point */
+    }
+    if (!sb->covered || (sb->priv && !sb->ops->unmount)) {
+        iput(ip);
+        return -EBUSY;                          /* /, or a filesystem that can't let go */
+    }
+    mutex_lock(&mounts_lock);
+    pc_writeback(sb, 0, 0, ~0ULL, true);
+    vfs_sync(sb);
+    /* busy if anything but the mount (and our lookup) holds one of its inodes:
+       open files, working directories, mappings, mounts inside it */
+    bool busy = false;
+    struct inode *x;
+    unsigned long flags = spin_lock_irqsave(&icache_lock);
+    list_for_each_entry(x, &icache, cache_node)
+        if (x->sb == sb && x->refcnt > (x == sb->root ? 2 : 0))
+            busy = true;
+    if (!busy)
+        sb->covered->mounted = NULL;            /* no lookup can enter it now */
+    spin_unlock_irqrestore(&icache_lock, flags);
+    if (busy) {
+        mutex_unlock(&mounts_lock);
+        iput(ip);
+        return -EBUSY;
+    }
+    list_del(&sb->node);
+    mutex_unlock(&mounts_lock);
+    pc_drop_sb(sb);
+    iput(ip);
+    iput(sb->root);
+    iput(sb->covered);
+    if (sb->ops->unmount)
+        sb->ops->unmount(sb);
+    pr_info("unmounted %s (%s) from %s\n", sb->type->name, sb->source, sb->path);
+    kfree(sb);
+    return 0;
+}
+
+void vfs_statfs(struct inode *ip, struct statfs *st)
+{
+    struct super_block *sb = ip->sb;
+    memset(st, 0, sizeof(*st));
+    st->f_type = sb->type == &efs_type ? EFS_SUPER_MAGIC : sb->type == &devfs_type ? DEVFS_SUPER_MAGIC
+               : sb->type == &procfs_type ? PROC_SUPER_MAGIC : V9FS_MAGIC;
+    st->f_bsize = st->f_frsize = EFS_BSIZE;
+    st->f_namelen = sb->type == &efs_type ? EFS_NAMELEN : 255;
+    st->f_fsid.val[0] = sb->dev;
+    if (sb->ops->statfs)
+        sb->ops->statfs(sb, st);
 }
 
 void vfs_mounts_print(print_fn print)
@@ -317,41 +479,88 @@ static struct inode *start_dir(const char *path)
     return idup(root_inode);
 }
 
+/* A directory with a filesystem mounted on it: that filesystem's root instead
+   (under icache_lock, so that umount can't take it away in between). */
+static struct inode *cross_mount(struct inode *ip)
+{
+    unsigned long flags = spin_lock_irqsave(&icache_lock);
+    struct inode *r = ip->mounted ? ip->mounted->root : NULL;
+    if (r)
+        r->refcnt++;
+    spin_unlock_irqrestore(&icache_lock, flags);
+    if (!r)
+        return ip;
+    iput(ip);
+    return r;
+}
+
+#define MAXSYMLINKS 40
+
+/* A symbolic link's target into BUF (NUL-terminated); its length, or an error. ip is locked. */
+static long read_link(struct inode *ip, char *buf, size_t size)
+{
+    if (ip->size >= size)
+        return -ENAMETOOLONG;
+    long n = ip->sb->ops->read(ip, buf, 0, ip->size, false);
+    if (n < 0)
+        return n;
+    buf[n] = 0;
+    return n;
+}
+
+/* Is there a component after the current one? */
+static bool more_components(const char *p)
+{
+    while (*p == '/')
+        p++;
+    return *p != 0;
+}
+
+enum { W_PARENT = 1, W_FOLLOW = 2 };
+
 /*
- * Walk `path`. With `parent`, stop at the last component's directory and
- * copy the last component into `name`.
+ * Walk `path`. With W_PARENT, stop at the last component's directory and
+ * copy the last component into `name`. Symbolic links met on the way are
+ * followed (their target replaces them in the path still to walk); a final
+ * one only with W_FOLLOW. More than MAXSYMLINKS of them: ELOOP.
  */
-static struct inode *walk(const char *path, bool parent, char *name, int *err)
+static struct inode *walk(const char *path, int how, char *name, int *err)
 {
     char comp[EFS_NAMELEN + 1];
-    int e = 0;
+    int e = 0, links = 0;
+    bool parent = how & W_PARENT;
 
-    if (!root_inode) {
+    if (!root_inode || !*path) {
         *err = -ENOENT;
         return NULL;
     }
-    if (!*path) {
-        *err = -ENOENT;
+    /* the path still to walk; symbolic links rewrite it */
+    char *buf = kmalloc(2 * PATH_MAX), *tmp = NULL;
+    if (!buf) {
+        *err = -ENOMEM;
         return NULL;
     }
+    strlcpy(buf, path, 2 * PATH_MAX);
     struct inode *ip = start_dir(path);
-    const char *p = path;
+    const char *p = buf;
 
     while ((p = next_component(p, comp, &e)) != NULL) {
         ilock(ip);
         if (ip->type != I_DIR) {
             iunlockput(ip);
-            *err = -ENOTDIR;
-            return NULL;
+            e = -ENOTDIR;
+            goto fail;
         }
         if (vfs_permission(ip, X_OK)) {          /* search permission */
             iunlockput(ip);
-            *err = -EACCES;
-            return NULL;
+            e = -EACCES;
+            goto fail;
         }
         if (parent && !next_component(p, name, &e) && !e) {
             strlcpy(name, comp, EFS_NAMELEN + 1);
             iunlock(ip);
+            kfree(buf);
+            kfree(tmp);
             return ip;
         }
         if (!strcmp(comp, ".")) {
@@ -372,39 +581,83 @@ static struct inode *walk(const char *path, bool parent, char *name, int *err)
         u32 ino = ip->sb->ops->lookup ? ip->sb->ops->lookup(ip, comp) : 0;
         if (!ino) {
             iunlockput(ip);
-            *err = -ENOENT;
-            return NULL;
+            e = -ENOENT;
+            goto fail;
         }
         struct inode *next = iget(ip->sb, ino);
-        iunlockput(ip);
-        if (next && next->mounted) {    /* enter a mounted filesystem */
-            struct inode *r = idup(next->mounted->root);
-            iput(next);
-            next = r;
+        iunlock(ip);                    /* still referenced: a relative link starts here */
+        if (!next) {
+            iput(ip);
+            e = -EIO;
+            goto fail;
         }
-        ip = next;
+        ilock(next);
+        if (next->type == I_LNK && (more_components(p) || (how & W_FOLLOW))) {
+            if (++links > MAXSYMLINKS) {
+                iunlockput(next);
+                iput(ip);
+                e = -ELOOP;
+                goto fail;
+            }
+            if (!tmp && !(tmp = kmalloc(2 * PATH_MAX))) {
+                iunlockput(next);
+                iput(ip);
+                e = -ENOMEM;
+                goto fail;
+            }
+            long n = read_link(next, tmp, PATH_MAX);
+            iunlockput(next);
+            if (n <= 0 || n + strlen(p) + 2 > 2 * PATH_MAX) {
+                iput(ip);
+                e = n < 0 ? (int)n : n == 0 ? -ENOENT : -ENAMETOOLONG;
+                goto fail;
+            }
+            /* the target, then the rest of the path */
+            strlcpy(tmp + n, p, 2 * PATH_MAX - n);
+            strlcpy(buf, tmp, 2 * PATH_MAX);
+            p = buf;
+            if (buf[0] == '/') {
+                iput(ip);
+                ip = idup(root_inode);
+            }
+            continue;
+        }
+        iunlock(next);
+        iput(ip);
+        ip = cross_mount(next);
     }
     if (e) {
         iput(ip);
-        *err = e;
-        return NULL;
+        goto fail;
     }
+    kfree(buf);
+    kfree(tmp);
     if (parent) {                       /* path was "/" or only "." components */
         iput(ip);
         *err = -EEXIST;
         return NULL;
     }
     return ip;
+fail:
+    kfree(buf);
+    kfree(tmp);
+    *err = e;
+    return NULL;
 }
 
 struct inode *namei(const char *path, int *err)
 {
-    return walk(path, false, NULL, err);
+    return walk(path, W_FOLLOW, NULL, err);
+}
+
+struct inode *namei_nofollow(const char *path, int *err)
+{
+    return walk(path, 0, NULL, err);
 }
 
 struct inode *nameiparent(const char *path, char *name, int *err)
 {
-    return walk(path, true, name, err);
+    return walk(path, W_PARENT, name, err);
 }
 
 /* Wall-clock time of boot, for files of filesystems that keep no times. */
@@ -426,7 +679,8 @@ void vfs_stat(struct inode *ip, struct stat *st)
     memset(st, 0, sizeof(*st));
     st->st_dev = ip->sb->dev;
     st->st_ino = ip->ino;
-    st->st_mode = ip->mode | (ip->type == I_DIR ? S_IFDIR : ip->type == I_CHR ? S_IFCHR : S_IFREG);
+    st->st_mode = ip->mode | (ip->type == I_DIR ? S_IFDIR : ip->type == I_CHR ? S_IFCHR
+                              : ip->type == I_LNK ? S_IFLNK : S_IFREG);
     st->st_nlink = ip->nlink;
     st->st_uid = ip->uid;
     st->st_gid = ip->gid;
@@ -526,7 +780,7 @@ struct file *vfs_open(const char *path, int flags, int mode, int *err)
                 *err = -EEXIST;
                 return NULL;
             }
-            ip = namei(path, err);      /* may cross into a mount */
+            ip = (flags & O_NOFOLLOW) ? namei_nofollow(path, err) : namei(path, err);  /* may cross into a mount */
             if (!ip)
                 return NULL;
             ilock(ip);
@@ -539,13 +793,17 @@ struct file *vfs_open(const char *path, int flags, int mode, int *err)
                 return NULL;
         }
     } else {
-        ip = namei(path, err);
+        ip = (flags & O_NOFOLLOW) ? namei_nofollow(path, err) : namei(path, err);
         if (!ip)
             return NULL;
         ilock(ip);
     }
 
     int acc = flags & O_ACCMODE;
+    if (ip->type == I_LNK) {
+        *err = -ELOOP;                  /* O_NOFOLLOW, and the last component is a link */
+        goto fail;
+    }
     if (ip->valid && ip->sb->ops->refresh) {
         int rr = ip->sb->ops->refresh(ip);
         if (rr == -ENOENT || rr == -ESTALE) {
@@ -628,6 +886,86 @@ struct file *vfs_open(const char *path, int flags, int mode, int *err)
 fail:
     iunlockput(ip);
     return NULL;
+}
+
+/* Set a regular file's size: shorter drops data, longer adds a hole that reads as zeros. */
+int vfs_truncate(struct inode *ip, u64 size)
+{
+    struct super_block *sb = ip->sb;
+    ilock(ip);
+    int type = ip->type;
+    iunlock(ip);
+    if (type == I_DIR)
+        return -EISDIR;
+    if (type != I_FILE)
+        return -EINVAL;
+    if (!sb->ops->truncate)
+        return -EPERM;
+    if (size > EFS_MAXFILE)
+        return -EFBIG;
+    fs_begin_op(sb);                    /* the transaction first, then the inode */
+    ilock(ip);
+    u64 old = ip->size;
+    int r = sb->ops->truncate(ip, size);
+    if (!r) {
+        pc_truncate(ip, old < size ? old : size);   /* cached pages past the end, a partial tail */
+        ip->ctime = ip->mtime;
+        if (sb->ops->write_inode)
+            sb->ops->write_inode(ip);
+    }
+    iunlock(ip);
+    fs_end_op(sb);
+    return r;
+}
+
+int vfs_symlink(const char *target, const char *linkpath)
+{
+    size_t len = strlen(target);
+    if (!len)
+        return -ENOENT;
+    if (len >= PATH_MAX)
+        return -ENAMETOOLONG;
+    char name[EFS_NAMELEN + 1];
+    int err;
+    struct inode *dp = nameiparent(linkpath, name, &err);
+    if (!dp)
+        return err;
+    struct super_block *sb = dp->sb;
+    if (!sb->ops->alloc_inode || !sb->ops->write) {
+        iput(dp);
+        return -EPERM;                  /* devfs, procfs, 9p */
+    }
+    mutex_lock(&sb->ns_lock);
+    fs_begin_op(sb);
+    ilock(dp);
+    struct inode *ip = NULL;
+    if (sb->ops->lookup(dp, name))
+        err = -EEXIST;
+    else if (vfs_permission(dp, W_OK | X_OK))
+        err = -EACCES;
+    else if ((ip = create_in(dp, name, I_LNK, 0777, &err)) != NULL) {
+        long n = sb->ops->write(ip, target, 0, len, false);
+        err = n == (long)len ? 0 : n < 0 ? (int)n : -ENOSPC;
+        ip->mode = 0777;                /* a link's own permissions mean nothing */
+        sb->ops->write_inode(ip);
+        iunlockput(ip);
+    }
+    iunlockput(dp);
+    fs_end_op(sb);
+    mutex_unlock(&sb->ns_lock);
+    return err;
+}
+
+long vfs_readlink(const char *path, char *buf, size_t size)
+{
+    int err;
+    struct inode *ip = namei_nofollow(path, &err);
+    if (!ip)
+        return err;
+    ilock(ip);
+    long n = ip->type == I_LNK ? read_link(ip, buf, size) : -EINVAL;
+    iunlockput(ip);
+    return n;
 }
 
 int vfs_mkdir(const char *path, int mode)
@@ -738,11 +1076,11 @@ int vfs_unlink(const char *path, bool want_dir)
     return err;
 }
 
-int vfs_link(const char *oldpath, const char *newpath)
+int vfs_link(const char *oldpath, const char *newpath, bool follow)
 {
     char name[EFS_NAMELEN + 1];
     int err;
-    struct inode *ip = namei(oldpath, &err);
+    struct inode *ip = follow ? namei(oldpath, &err) : namei_nofollow(oldpath, &err);
     if (!ip)
         return err;
     struct inode *dp = nameiparent(newpath, name, &err);

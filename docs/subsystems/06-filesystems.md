@@ -73,7 +73,7 @@ All sizes come from `efs_format.h`. A block is `EFS_BSIZE` = 4096 bytes, which i
 
 | Offset | Field | Notes |
 |---:|---|---|
-| 0 | `u16 type` | `EFS_T_FREE` 0, `EFS_T_DIR` 1, `EFS_T_FILE` 2 |
+| 0 | `u16 type` | `EFS_T_FREE` 0, `EFS_T_DIR` 1, `EFS_T_FILE` 2, `EFS_T_SYMLINK` 3 (the data is the target path, without a NUL) |
 | 2 | `u16 nlink` | directory entries naming it (directories count `.` and each child's `..`) |
 | 4 | `u16 mode` | permission bits only (07777); the type comes from `type` |
 | 6 | `u16 uid`, 8 `u16 gid` | 16-bit ids |
@@ -141,17 +141,17 @@ file block bn            where
   - `root`: the root inode of this filesystem.
   - `covered`: the directory it is mounted on, `NULL` for `/`.
   - `ns_lock`: a mutex that serializes all namespace changes.
-  - `path[32]`, `priv` (efs: `struct efs_info`), and `errors`, which counts `fs_error` reports.
+  - `path[64]` (where it is mounted), `source[32]` (what: `disk0p4`, a 9P tag, `devfs`, `proc`), `priv` (efs: `struct efs_info`), and `errors`, which counts `fs_error` reports.
   - `dev`: the mount's number, 1, 2, … in the order `vfs_mount_disk` is called (`/` is 1, then `/home`, `/boot` and `/boot.old` when those volumes exist, `/dev`, `/proc`, and the 9P shares), reported as `st_dev`.
 - **`struct inode`**: one in-memory copy per (sb, ino) while referenced.
   - `refcnt` is protected by `icache_lock`. Everything else is protected by `lock`, a mutex.
   - `valid` is set by the first `ilock`, which calls `read_inode`.
-  - Generic copies of the inode fields: `type` (`enum itype`: `I_FREE`, `I_DIR`, `I_FILE`, `I_CHR`), `nlink`, `mode`, `uid`, `gid`, `size`, `mtime`, `ctime`, `rdev`.
+  - Generic copies of the inode fields: `type` (`enum itype`: `I_FREE`, `I_DIR`, `I_FILE`, `I_CHR`, `I_LNK`), `nlink`, `mode`, `uid`, `gid`, `size`, `mtime`, `ctime`, `rdev`.
   - `cops`: device or synthetic-file hooks.
   - `mounted`: the filesystem mounted on this directory.
   - `u.efs`: a full copy of the `efs_dinode`, including `addrs`.
 - **`struct efs_info`** (`efs.c`): a copy of the superblock, the log pointer, `bhint` (the next place to look for a free block), and the in-memory counters `nfree_blocks` and `nfree_inodes`. It also has an `alloc_lock`, which is initialized but never taken (see Limitations).
-- **`struct fs_ops`**: `read_inode`, `write_inode`, `alloc_inode`, `free_inode`, `read`, `write`, `truncate`, `lookup`, `link`, `unlink`, `readdir`, `begin_op`, `end_op`, `stat_fs` and `sync` (make every completed operation durable; efs only), plus four optional hooks for filesystems that work by name rather than by allocating inodes and editing directories (9pfs): `create` (make a file or directory and return it locked), `remove`, `rename`, and `refresh` (re-read attributes that may have changed elsewhere). When present, the VFS calls them instead of its generic code (see Opening and creating, Namespace operations). Any of them may be `NULL`. devfs and procfs provide only `read_inode`, `lookup` and `readdir`. Because they have no `alloc_inode`, `link`, `unlink` or `write_inode`, the VFS returns `EPERM` for creates, removals, chmod and chown on them.
+- **`struct fs_ops`**: `read_inode`, `write_inode`, `alloc_inode`, `free_inode`, `read`, `write`, `truncate`, `lookup`, `link`, `unlink`, `readdir`, `begin_op`, `end_op`, `stat_fs`, `sync` (make every completed operation durable; efs only), `statfs` (block and inode counts for `statfs(2)`; efs only) and `unmount` (free the filesystem's state once the VFS has synced and dropped its inodes and pages; efs and 9pfs), plus four optional hooks for filesystems that work by name rather than by allocating inodes and editing directories (9pfs): `create` (make a file or directory and return it locked), `remove`, `rename`, and `refresh` (re-read attributes that may have changed elsewhere). When present, the VFS calls them instead of its generic code (see Opening and creating, Namespace operations). Any of them may be `NULL`. devfs and procfs provide only `read_inode`, `lookup` and `readdir`. Because they have no `alloc_inode`, `link`, `unlink` or `write_inode`, the VFS returns `EPERM` for creates, removals, chmod and chown on them.
 - **`struct chr_ops`**: `open`, `read`, `write`, `close`, `ioctl` and `poll`. They are used for devices, procfs files, pipes and sockets. When `f->cops->read` or `write` is set, `file_read`/`file_write` call it instead of `fs_ops`.
 
 **The inode "cache" is not a cache.** `iput` frees the in-memory inode as soon as `refcnt` reaches 0 (`kernel/fs/vfs.c: iput`). Every later `iget` + `ilock` therefore re-reads the dinode, which usually comes from the buffer cache. The `icache` list holds exactly the inodes that are referenced (`icache_busy` counts them for leak tests).
@@ -233,7 +233,15 @@ All devfs inodes have uid and gid 0 (they are `kzalloc`ed and never set). `rdev`
 
 Every block access in `efs.c` goes to its own superblock's volume (the `BREAD(bno)` macro is `bread(sb->disk, bno)`), and each mounted efs has its own `struct efs_log` on its own volume, with its own log area, transactions and recovery. The two filesystems' transactions are independent: an operation never spans them, since `rename` and `link` across mounts fail with `EXDEV`.
 
-The `/` mount sets the global `root_inode`. Mounts are added to the `mounts` list and are never removed: there is no unmount and no mount system call.
+The `/` mount sets the global `root_inode`. The `mounts` list changes under the `mounts_lock` mutex, and `covered->mounted` (which lookups follow) under `icache_lock`.
+
+**`mount(2)`** (`vfs_mount_named`, root only) turns the target into an absolute path (from the caller's working directory, with `.` and `..` resolved) and mounts by type: `efs` takes a volume by name or GPT label (`swap_find_volume`), refusing the swap volume and a volume mounted already (`EBUSY`) and one without an efs superblock (`EINVAL`); `devfs` and `proc` need no source; `9p` takes a share's tag. Anything else is `ENODEV`. The flags and data are ignored.
+
+**`umount2(2)`** (`vfs_umount`, root only) needs the root of a mounted filesystem other than `/` (`EINVAL` or `EBUSY` otherwise):
+
+1. Under `mounts_lock`, it writes back the filesystem's dirty pages (`pc_writeback(sb, 0, ...)`) and syncs it.
+2. Under `icache_lock`, it looks for any of its inodes still referenced by anything but the mount and its own lookup: an open file, a working directory, a mapping, or a filesystem mounted inside it (which holds its mount point). Then it is `EBUSY`. Otherwise it clears `covered->mounted` under the same lock, so no lookup can enter the filesystem from then on (`cross_mount` reads the pointer and takes the root's reference under that lock).
+3. It removes the mount from the list, drops its cached pages (`pc_drop_sb`), releases the root and the mount point, and calls `ops->unmount`: efs commits the log and frees `efs_info` (`log_destroy`); 9pfs frees its fid table. The buffer cache keeps the volume's blocks, which stay valid if it is mounted again.
 
 ### Buffer cache
 
@@ -362,7 +370,9 @@ A large `write()` is therefore **not atomic** across chunks: a crash can leave a
 - `free_ind` frees the data blocks at or after `from` and zeroes their slots, logging the indirect block. A block it fully empties (`from == 0`) is freed too.
 - It sets `size` and `mtime` and writes the inode.
 
-The only caller with `size != 0` would be a growing or shrinking `ftruncate`, but no such system call exists. In practice truncate runs from `open(O_TRUNC)` (`vfs_open`) and from `efs_free_inode`.
+First, the block where the data now ends (the smaller of the old and new sizes) is zeroed past that point and logged, so that a file cut short and grown again reads zeros, not the old bytes. Growing (`size` above the old size) frees nothing and leaves a hole, which reads as zeros.
+
+It runs from `open(O_TRUNC)` (`vfs_open`), from `efs_free_inode`, and from `truncate(2)` and `ftruncate(2)` through **`vfs_truncate(ip, size)`**: regular files only (`EISDIR`, `EINVAL`), at most `EFS_MAXFILE` (`EFBIG`); in a transaction, it calls `ops->truncate`, then `pc_truncate` at the smaller size (drops cached pages past the end and zeroes the tail of a partial one), and sets `ctime`. `truncate(2)` needs write permission; `ftruncate(2)` a descriptor open for writing.
 
 **Freeing an inode.** `iput` frees it on disk when dropping the **last** reference to a valid inode whose `nlink == 0`:
 
@@ -387,7 +397,7 @@ All directory operations run with the directory's inode locked:
 
 ### Path lookup (`walk`)
 
-`walk(path, parent, name, err)` in `kernel/fs/vfs.c`:
+`walk(path, how, name, err)` in `kernel/fs/vfs.c` (`namei` follows a final symbolic link, `namei_nofollow` doesn't, `nameiparent` stops at the last component's directory):
 
 1. It starts at the process's `cwd` for a relative path, otherwise at `root_inode`. An empty path is `-ENOENT`.
 2. For each component (`next_component`; one longer than 59 bytes is `-ENAMETOOLONG`):
@@ -396,11 +406,12 @@ All directory operations run with the directory's inode locked:
    3. `.` stays put.
    4. `..` at the root of a mounted filesystem continues from the covered directory in the parent filesystem; at `/` it stays at `/`.
    5. It looks up the name with `ops->lookup`; a missing name is `-ENOENT`.
-   6. It `iget`s the result and unlocks and releases the directory, so only one inode is locked at a time.
-   7. If the result has a filesystem mounted on it, it switches to that filesystem's root.
+   6. It `iget`s the result and unlocks the directory, so only one inode is locked at a time.
+   7. If the result is a symbolic link, and either more components follow or the caller wants a final link followed (`W_FOLLOW`), it reads the target and puts it in place of the link in the path still to walk (a 2 × `PATH_MAX` buffer). An absolute target continues from `/`, a relative one from the directory that holds the link. More than `MAXSYMLINKS` (40) links in one lookup is `-ELOOP`; an empty target is `-ENOENT`.
+   8. Otherwise it releases the directory and continues with the result, or with the root of the filesystem mounted on it (`cross_mount`).
 3. If `parent` is set and the loop ran out (the path was `/` or only `.`), it returns `-EEXIST`.
 
-There are no symbolic links. Only `AT_FDCWD` is accepted as `dirfd`: `get_path` in `file.c` returns `-EINVAL` for any other `dirfd` with a relative path.
+`..` after a link goes to the parent of where the link led (the physical parent), as in Linux. Only `AT_FDCWD` is accepted as `dirfd`: `get_path` in `file.c` returns `-EINVAL` for any other `dirfd` with a relative path.
 
 ### Permission checks
 
@@ -566,7 +577,7 @@ Reads (`proc_read`) and seeks then work on this snapshot, so a reader always see
 
 **Generators:**
 
-- **Global files**: the same print functions the monitor uses (`pmm_print`, `bcache_print`, `vfs_mounts_print`, ...). `uptime`, `trace` (the last 200 events), `stat` (`uptime_ms`, `cpus`, a `cpuN idle_ms X switches Y` line per CPU, `procs`, `procs_running`, `procs_blocked`) and `drop_caches` are local.
+- **Global files**: the same print functions the monitor uses (`pmm_print`, `bcache_print`, `vfs_mounts_print`, ...). `uptime`, `loadavg` (`loadavg_print`: three averages, running/total threads, the last pid), `mounts` (`vfs_mounts_list`), `trace` (the last 200 events), `stat` (`uptime_ms`, `cpus`, a `cpuN idle_ms X switches Y` line per CPU, `procs`, `procs_running`, `procs_blocked`) and `drop_caches` are local.
 - **`/proc/net/*`**: generated with the network mutex `net_lock` held (`NET_GEN`).
 - **`/proc/<pid>/*`** (`gen_pid`): generated with `proc_lock` held, so the process cannot be freed meanwhile.
   - `status`: pid, ppid, name, state, tid, waiting, switches, syscalls, RSS, ids, umask, process group, session, and signal masks plus caught and ignored signals; then the fields `ps` needs: `ustate` (the Unix state letter: R, S, D for an uninterruptible sleep, T, t for a tracing stop, Z), `start_ms` (start time, ms since boot), `cpu_ms` (CPU time including the current slice, `thread_cpu_ticks`), `vsz_kib` (sum of the VMAs), `tty` (`console` or `-`), `tpgid` (the terminal's foreground group), `psr` (the CPU it last ran on), and the memory fields `swap_kib`, `min_flt`, `maj_flt` and `cow` (pages copied on write).
@@ -624,7 +635,7 @@ Each request is one `p9_transact`: the message is built in a `kmalloc`ed buffer,
 
 ### efs outside the kernel: the boot loader
 
-The boot loader (`boot/eboot.c`, [01](01-boot-and-platform.md#0-the-boot-loader-bootebootc)) has its own read-only efs reader to load `/boot/kernel.elf`: superblock, path lookup through directory entries, direct, single- and double-indirect blocks, holes. It never writes. If the log header says a committed transaction is waiting to be installed (`n > 0`), it reads each block from its log copy when there is one, so it sees exactly what the kernel's recovery will install at mount. It reads the kernel from the `boot` partition (then `boot.old`), and on a bare image from the root volume, chosen by the same rule as `vfs_init` (named or labelled `root`, else the first efs volume that is not a boot slot, else the first).
+The boot loader (`boot/eboot.c`, [01](01-boot-and-platform.md#0-the-boot-loader-bootebootc)) has its own read-only efs reader to load `/boot/kernel.elf`: superblock, path lookup through directory entries, direct, single- and double-indirect blocks, holes. It never writes, and does not follow symbolic links: `/boot/kernel.elf` must be a regular file. If the log header says a committed transaction is waiting to be installed (`n > 0`), it reads each block from its log copy when there is one, so it sees exactly what the kernel's recovery will install at mount. It reads the kernel from the `boot` partition (then `boot.old`), and on a bare image from the root volume, chosen by the same rule as `vfs_init` (named or labelled `root`, else the first efs volume that is not a boot slot, else the first).
 
 ### Host mkfs and fsck (`tools/mkfs/mkfs.c`)
 
@@ -653,7 +664,7 @@ The Makefile no longer calls mkfs for the images: `tools/eudisk` makes them ([11
    - entries point to allocated, in-range inodes;
    - `.` and `..` are correct;
    - no directory has two parents;
-   - types are known.
+   - types are known (file, directory or symbolic link; a link's blocks are checked like a file's).
 
    It also counts references per inode.
 5. Every allocated inode, through `check_blocks`: each pointer is in range and not used twice (`owner[]`), and every used block is marked in the bitmap. The size must be ≤ `EFS_MAXFILE`. Inodes with no references are orphans; otherwise `nlink` must equal the number of references.
@@ -768,17 +779,22 @@ Numbers are Linux RISC-V (`lib/include/uapi/syscall.h`).
 | 25 | fcntl | `do_fcntl` | `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` |
 | 29 | ioctl | `do_ioctl` | `chr_ops.ioctl`, else `-ENOTTY` |
 | 34 / 35 | mkdirat / unlinkat | `do_mkdirat`, `do_unlinkat` | `AT_REMOVEDIR` |
-| 37 / 38 | linkat / renameat | `do_linkat`, `do_renameat` | `AT_FDCWD` only (an absolute path with another `dirfd` also works) |
+| 36 | symlinkat | `do_symlinkat` | `vfs_symlink`: an `I_LNK` inode, mode 0777, whose data is the target; efs only (`EPERM` elsewhere) |
+| 37 / 38 | linkat / renameat | `do_linkat`, `do_renameat` | `AT_FDCWD` only (an absolute path with another `dirfd` also works). `linkat` links a symbolic link itself unless `AT_SYMLINK_FOLLOW` |
+| 39 / 40 | umount2 / mount | `do_umount2`, `do_mount` | root only; see Boot and mounting |
+| 43 / 44 | statfs / fstatfs | `do_statfs`, `do_fstatfs` | `vfs_statfs`: Linux's `struct statfs`; the type's magic number, 4096-byte blocks, `f_fsid` = `st_dev`; blocks and inodes from `ops->statfs` (efs: data blocks and the in-memory free counts; zeros elsewhere) |
+| 45 / 46 | truncate / ftruncate | `do_truncate`, `do_ftruncate` | `vfs_truncate` |
+| 78 | readlinkat | `do_readlinkat` | the target without a NUL, cut to the buffer size; `EINVAL` for something that isn't a link |
 | 48 | faccessat | `cred.c: do_faccessat` | uses the effective ids |
 | 49 | chdir | `do_chdir` | |
 | 52 / 53 / 54 | fchmod / fchmodat / fchownat | `cred.c` | |
 | 88 | utimensat | `cred.c: do_utimensat` | see below |
-| 56 / 57 | openat / close | `do_openat`, `do_close` | |
+| 56 / 57 | openat / close | `do_openat`, `do_close` | `O_NOFOLLOW`: `ELOOP` if the last component is a link |
 | 59 | pipe2 | `do_pipe2` | `O_CLOEXEC` only |
 | 61 | getdents64 | `do_getdents64` | 64-byte `struct dirent` |
 | 62 / 63 / 64 | lseek / read / write | | |
 | 73 | ppoll | `do_ppoll` | sigmask ignored |
-| 79 / 80 | fstatat / fstat | | |
+| 79 / 80 | fstatat / fstat | | `AT_SYMLINK_NOFOLLOW`: about a link itself (`lstat`); `S_IFLNK`, `st_size` = the target's length |
 | 81 / 82 | sync / fsync | `do_sync`, `do_fsync` | wait for the next log commit (`log_sync`) of every filesystem / the file's |
 | 502 | debug(`DBG_FSCRASH`, point) | `kernel/proc/syscall.c` | arms a crash point; also `DBG_FILES` prints the caller's table |
 
@@ -786,7 +802,7 @@ Numbers are Linux RISC-V (`lib/include/uapi/syscall.h`).
 
 - **`/mnt/host`**: the Mac's directory under `make run` (9pfs).
 - **`/dev`**: `console`, `tty`, `tty0`, `null`, `zero`, `kmsg`, `disk0`, and `disk1` when a second disk is attached.
-- **`/proc`**: `meminfo`, `slabinfo`, `interrupts`, `threads`, `sched`, `procs`, `mounts`, `bcache`, `blk`, `icache`, `trace`, `virtio`, `uptime`, `pipes`, `tty`, `cpus`, `lockdep`, `profile`, `9p`, `vmstat`, `swaps`, `pagecache`, `asids`, `stat`, `drop_caches` (the only writable one).
+- **`/proc`**: `meminfo`, `slabinfo`, `interrupts`, `threads`, `sched`, `procs`, `mounts` (Linux's format: `disk0p4 /home efs rw 0 0`), `fsinfo` (per mount: the error count, space, and efs log statistics), `loadavg`, `bcache`, `blk`, `icache`, `trace`, `virtio`, `uptime`, `pipes`, `tty`, `cpus`, `lockdep`, `profile`, `9p`, `vmstat`, `swaps`, `pagecache`, `asids`, `stat`, `drop_caches` (the only writable one).
 - **`/proc/net`**: `dev`, `arp`, `tcp`, `udp`, `stats`.
 - **Per process**: `/proc/<pid>/{status,maps,fds,stack,ustack,cmdline}` and `/proc/self`.
 
@@ -813,7 +829,7 @@ Numbers are Linux RISC-V (`lib/include/uapi/syscall.h`).
 ## Debugging and observability
 
 **Space and log state:**
-- `mounts` (monitor) or `cat /proc/mounts` shows, per mount, the error count.
+- `mounts` (monitor) or `cat /proc/fsinfo` shows, per mount, the error count.
 - For efs it also shows:
   - blocks used and free, and inodes used and free (from the in-memory counters);
   - the log line: commits and `seq`, blocks logged and absorbed, the largest transaction, the average commit time in µs, operations in progress, pending blocks, blocks recovered at mount, and whether a crash point is armed.
@@ -891,10 +907,11 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 - `iget` scans a linear list, and directory lookup is a linear scan of the directory.
 
 **Missing features:**
-- No symlinks, no `ftruncate`/`truncate`, no `*at` system calls relative to a directory fd, no mount or unmount system call, no atime.
+- No `*at` system calls relative to a directory fd, no read-only or remount mounts (`mount(2)` ignores its flags), no forced or lazy unmount (`umount2` ignores `MNT_FORCE` and `MNT_DETACH`), no atime.
+- Symbolic links are efs only (9pfs shows the host's as regular files; devfs and procfs have none). `open(O_CREAT)` of a dangling link fails with `ENOENT` instead of creating the target. A link's own mode is always 0777 and `chmod`/`chown` follow it (there is no `lchown`).
 - `ctime` is set only when the inode is allocated and by `utimensat`: `chmod`, `chown` and `link` do not update it.
 - No access time: `utimensat` ignores `times[0]` and `stat` reports the modification time as `st_atime`.
-- `utimensat` accepts only `AT_FDCWD` (or a NULL path with an fd) and ignores its flags (there are no symlinks for `AT_SYMLINK_NOFOLLOW` to matter).
+- `utimensat` accepts only `AT_FDCWD` (or a NULL path with an fd) and ignores its flags, so `AT_SYMLINK_NOFOLLOW` sets the target's time, not the link's.
 - `st_dev` is a mount sequence number, not derived from the disk: it can change between boots if the set of mounts changes (for example `/home` attached or not), and a failed mount still uses up a number.
 - Ids are 16 bits; there are no supplementary groups and no sticky bit.
 - `faccessat` checks the effective ids, where POSIX uses the real ids.
@@ -922,7 +939,7 @@ Export them to Perfetto as described in `DEBUGGING.md`.
 - **No caching**: every path component is a `Twalk` and every `stat` and `open` a `Tgetattr`, so a long path costs one round trip per component. A file deleted on the Mac fails `open` with ENOENT (or ESTALE); `stat` keeps showing its last attributes. A directory's buffered `Treaddir` batch is dropped whenever a listing restarts at offset 0 and after every create, remove, link and rename in it.
 - **Host types and names**: symbolic links, devices, FIFOs and sockets appear as regular files (the type is only "directory or not"); names longer than 59 bytes are skipped in listings (and cannot be looked up through a listing's name); uids and gids above 65535 are truncated.
 - **No `Tfsync`**: 9pfs has no `sync` operation, so `fsync` on the share does nothing; writes reach the Mac's page cache, not necessarily its disk.
-- **No unmount or remount**, and only tags whose `/mnt/TAG` exists in the image (`host`) are mounted.
+- At boot, only tags whose `/mnt/TAG` exists in the image (`host`) are mounted; `mount -t 9p TAG DIR` mounts one elsewhere, and `umount` lets it go (its fids are not clunked).
 
 **procfs:**
 - Output is truncated at 64 KiB with no indication.

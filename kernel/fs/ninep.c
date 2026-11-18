@@ -876,7 +876,10 @@ static void p9_stat_fs(struct super_block *sb, int (*print)(const char *fmt, ...
           (unsigned long)fs->errors);
 }
 
+static void p9_unmount(struct super_block *sb);
+
 static const struct fs_ops p9_ops = {
+    .unmount = p9_unmount,
     .read_inode = p9_read_inode,
     .write_inode = p9_write_inode,
     .read = p9_read,
@@ -893,6 +896,12 @@ static const struct fs_ops p9_ops = {
 };
 
 /* sb->disk is the 9P device number. */
+static void p9_unmount(struct super_block *sb)
+{
+    kfree(sb->priv);                    /* the fids die with the session */
+    sb->priv = NULL;
+}
+
 static int p9_mount(struct super_block *sb)
 {
     struct p9fs *fs = kzalloc(sizeof(*fs));

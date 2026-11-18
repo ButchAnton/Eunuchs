@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -21,10 +23,22 @@ int fsync(int fd)
 
 int ftruncate(int fd, long length)
 {
-    (void)fd;
-    (void)length;
-    errno = ENOSYS;                     /* efs can't shorten files yet */
-    return -1;
+    long r = __syscall(SYS_ftruncate, fd, length, 0, 0, 0, 0);
+    if (r < 0) {
+        errno = -r;
+        return -1;
+    }
+    return 0;
+}
+
+int truncate(const char *path, long length)
+{
+    long r = __syscall(SYS_truncate, (long)path, length, 0, 0, 0, 0);
+    if (r < 0) {
+        errno = -r;
+        return -1;
+    }
+    return 0;
 }
 
 int usleep(unsigned long usec)
@@ -68,19 +82,22 @@ char *ttyname(int fd)
 
 int symlink(const char *target, const char *path)
 {
-    (void)target;
-    (void)path;
-    errno = ENOSYS;                     /* efs has no symbolic links */
-    return -1;
+    long r = __syscall(SYS_symlinkat, (long)target, AT_FDCWD, (long)path, 0, 0, 0);
+    if (r < 0) {
+        errno = -r;
+        return -1;
+    }
+    return 0;
 }
 
 long readlink(const char *path, char *buf, size_t size)
 {
-    (void)path;
-    (void)buf;
-    (void)size;
-    errno = EINVAL;                     /* nothing is a symbolic link */
-    return -1;
+    long r = __syscall(SYS_readlinkat, AT_FDCWD, (long)path, (long)buf, size, 0, 0);
+    if (r < 0) {
+        errno = -r;
+        return -1;
+    }
+    return r;
 }
 
 /* ---- execl and friends: the argument list becomes a vector ---- */
@@ -162,4 +179,26 @@ long ptrace(int request, pid_t pid, void *addr, void *data)
         return -1;
     }
     return peek ? word : r;
+}
+
+int getloadavg(double loadavg[], int nelem)
+{
+    char buf[128];
+    int fd = open("/proc/loadavg", O_RDONLY);
+    if (fd < 0)
+        return -1;
+    long n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = 0;
+    double v[3];
+    int got = sscanf(buf, "%lf %lf %lf", &v[0], &v[1], &v[2]);
+    if (got < 3)
+        return -1;
+    if (nelem > 3)
+        nelem = 3;
+    for (int i = 0; i < nelem; i++)
+        loadavg[i] = v[i];
+    return nelem < 0 ? -1 : nelem;
 }

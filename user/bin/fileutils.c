@@ -1,7 +1,8 @@
 /*
  * fileutils: file and scripting tools in one binary, chosen by argv[0] (the
  * disk image has /bin/<tool> as hard links to it):
- *   du dd basename dirname realpath mktemp chgrp file sync seq expr test [ printf
+ *   du df dd basename dirname realpath readlink mktemp chgrp file sync truncate mount umount
+ *   seq expr test [ printf
  */
 #include <ctype.h>
 #include <dirent.h>
@@ -15,7 +16,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <unistd.h>
 
 static const char *prog;
@@ -62,7 +65,7 @@ static void du_print(unsigned long long v, const char *path)
 static unsigned long long du_walk(const char *path, int depth, int *err)
 {
     struct stat st;
-    if (stat(path, &st) < 0) {
+    if ((depth ? lstat(path, &st) : stat(path, &st)) < 0) {   /* links inside: not followed */
         fail(path);
         *err = 1;
         return 0;
@@ -216,10 +219,15 @@ static int dd_main(int argc, char **argv)
     int in = 0, out = 1;
     if (ifile && (in = open(ifile, O_RDONLY)) < 0)
         return fail(ifile);
-    /* with seek (and without notrunc) the data before the seek point stays:
-       efs can't shorten a file, so it isn't truncated at all then */
+    /* with seek (and without notrunc) the data before the seek point stays,
+       and the file is cut there */
     if (ofile && (out = open(ofile, O_WRONLY | O_CREAT | (notrunc || seek ? 0 : O_TRUNC), 0666)) < 0)
         return fail(ofile);
+    if (ofile && seek && !notrunc) {
+        struct stat ost;
+        if (fstat(out, &ost) == 0 && S_ISREG(ost.st_mode) && ftruncate(out, seek * obs) < 0)
+            return fail(ofile);
+    }
     if (skip && lseek(in, skip * ibs, SEEK_CUR) < 0) {
         char *tmp = malloc(ibs);
         for (long long i = 0; i < skip; i++)
@@ -429,6 +437,10 @@ static int realpath_main(int argc, char **argv)
         die_usage("[-e | -m] [-q] PATH...");
     for (int i = optind; i < argc; i++) {
         char out[PATH_MAX];
+        if (realpath(argv[i], out)) {   /* exists: links resolved */
+            puts(out);
+            continue;
+        }
         normalize(argv[i], out, sizeof(out));
         struct stat st;
         if (!missing_ok && stat(out, &st) < 0) {
@@ -446,6 +458,62 @@ static int realpath_main(int argc, char **argv)
             }
         }
         puts(out);
+    }
+    return rc;
+}
+
+/* readlink [-f | -e | -m] [-n] FILE...: a link's target, or (-f -e -m) the canonical path */
+static int readlink_main(int argc, char **argv)
+{
+    int c, canon = 0, no_newline = 0, rc = 0;
+    while ((c = getopt(argc, argv, "femnqs")) != -1) {
+        switch (c) {
+        case 'f': case 'e': case 'm': canon = c; break;
+        case 'n': no_newline = 1; break;
+        case 'q': case 's': break;
+        default: die_usage("[-f | -e | -m] [-n] FILE...");
+        }
+    }
+    if (optind >= argc)
+        die_usage("[-f | -e | -m] [-n] FILE...");
+    for (int i = optind; i < argc; i++) {
+        char out[PATH_MAX];
+        if (canon) {
+            if (realpath(argv[i], out)) {
+                printf("%s%s", out, no_newline ? "" : "\n");
+                continue;
+            }
+            if (canon == 'e') {
+                rc = 1;
+                continue;
+            }
+            /* -f: the last component may be missing; -m: any may */
+            char dir[PATH_MAX], res[PATH_MAX];
+            snprintf(dir, sizeof(dir), "%s", argv[i]);
+            char *slash = strrchr(dir, '/');
+            const char *base = slash ? slash + 1 : argv[i];
+            if (slash)
+                *(slash == dir ? slash + 1 : slash) = 0;
+            else
+                strcpy(dir, ".");
+            if (realpath(dir, res)) {
+                size_t l = strlen(res);
+                printf("%s%s%s%s", res, l > 1 ? "/" : "", base, no_newline ? "" : "\n");
+            } else if (canon == 'm') {
+                normalize(argv[i], out, sizeof(out));
+                printf("%s%s", out, no_newline ? "" : "\n");
+            } else {
+                rc = 1;
+            }
+            continue;
+        }
+        long n = readlink(argv[i], out, sizeof(out) - 1);
+        if (n < 0) {
+            rc = 1;                     /* not a link: silently, as GNU readlink */
+            continue;
+        }
+        out[n] = 0;
+        printf("%s%s", out, no_newline ? "" : "\n");
     }
     return rc;
 }
@@ -652,6 +720,13 @@ static int file_one(const char *path)
 {
     printf("%s: ", path);
     struct stat st;
+    if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
+        char target[PATH_MAX];
+        long n = readlink(path, target, sizeof(target) - 1);
+        target[n > 0 ? n : 0] = 0;
+        printf("%ssymbolic link to %s\n", stat(path, &st) < 0 ? "broken " : "", target);
+        return 0;
+    }
     if (stat(path, &st) < 0) {
         printf("cannot open `%s' (%s)\n", path, strerror(errno));
         return 1;
@@ -744,6 +819,282 @@ static int file_main(int argc, char **argv)
     int rc = 0;
     for (int i = 1; i < argc; i++)
         rc |= file_one(argv[i]);
+    return rc;
+}
+
+/* ================================================================ df, mount, umount */
+
+struct mnt {
+    char source[64], dir[256], type[32];
+};
+
+/* /proc/mounts */
+static int read_mounts(struct mnt **out)
+{
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) {
+        fail("/proc/mounts");
+        return -1;
+    }
+    struct mnt *v = 0;
+    int n = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        v = realloc(v, (n + 1) * sizeof(*v));
+        if (sscanf(line, "%63s %255s %31s", v[n].source, v[n].dir, v[n].type) == 3)
+            n++;
+    }
+    fclose(f);
+    *out = v;
+    return n;
+}
+
+static void human(unsigned long long bytes, char *b, size_t n)
+{
+    static const char units[] = "BKMGT";
+    double x = bytes;
+    int u = 0;
+    while (x >= 1024 && u < 4)
+        x /= 1024, u++;
+    if (u == 0)
+        snprintf(b, n, "%llu", bytes);
+    else if (x < 10)
+        snprintf(b, n, "%.1f%c", x, units[u]);
+    else
+        snprintf(b, n, "%.0f%c", x, units[u]);
+}
+
+static int df_main(int argc, char **argv)
+{
+    int c, hum = 0, inodes = 0, types = 0, all = 0, rc = 0;
+    while ((c = getopt(argc, argv, "hikTa")) != -1) {
+        switch (c) {
+        case 'h': hum = 1; break;
+        case 'i': inodes = 1; break;
+        case 'k': hum = 0; break;
+        case 'T': types = 1; break;
+        case 'a': all = 1; break;
+        default: die_usage("[-ahikT] [FILE...]");
+        }
+    }
+    struct mnt *m;
+    int n = read_mounts(&m);
+    if (n < 0)
+        return 1;
+    /* which mounts: those named (the one each FILE is on), or all */
+    int *show = calloc(n + 1, sizeof(int));
+    if (optind < argc) {
+        for (int i = optind; i < argc; i++) {
+            char path[PATH_MAX];
+            if (!realpath(argv[i], path)) {
+                rc = fail(argv[i]);
+                continue;
+            }
+            int best = -1;
+            size_t blen = 0;
+            for (int k = 0; k < n; k++) {
+                size_t l = strlen(m[k].dir);
+                if (!strncmp(path, m[k].dir, l) && (path[l] == '/' || !path[l] || l == 1) && l >= blen)
+                    best = k, blen = l;
+            }
+            if (best >= 0)
+                show[best] = 1;
+        }
+    } else {
+        for (int k = 0; k < n; k++)
+            show[k] = 1;
+    }
+    if (inodes)
+        printf("%-14s%s %9s %9s %9s %5s %s\n", "Filesystem", types ? " Type " : "", "Inodes", "IUsed", "IFree",
+               "IUse%", "Mounted on");
+    else
+        printf("%-14s%s %9s %9s %9s %5s %s\n", "Filesystem", types ? " Type " : "", hum ? "Size" : "1K-blocks",
+               "Used", "Available", "Use%", "Mounted on");
+    for (int k = 0; k < n; k++) {
+        if (!show[k])
+            continue;
+        struct statfs st;
+        if (statfs(m[k].dir, &st) < 0) {
+            rc = fail(m[k].dir);
+            continue;
+        }
+        if (!st.f_blocks && !all && optind >= argc)
+            continue;                   /* devfs, proc, ... */
+        char tcol[16] = "";
+        if (types)
+            snprintf(tcol, sizeof(tcol), " %-5s", m[k].type);
+        if (inodes) {
+            unsigned long used = st.f_files - st.f_ffree;
+            char pct[8] = "-";
+            if (st.f_files)
+                snprintf(pct, sizeof(pct), "%lu%%", (used * 100 + st.f_files - 1) / st.f_files);
+            printf("%-14s%s %9lu %9lu %9lu %5s %s\n", m[k].source, tcol, st.f_files, used, st.f_ffree, pct,
+                   m[k].dir);
+            continue;
+        }
+        unsigned long long bs = st.f_frsize ? st.f_frsize : st.f_bsize;
+        unsigned long long total = st.f_blocks * bs, freeb = st.f_bavail * bs,
+                           used = (st.f_blocks - st.f_bfree) * bs;
+        char pct[8] = "-";
+        if (used + freeb)
+            snprintf(pct, sizeof(pct), "%llu%%", (used * 100 + used + freeb - 1) / (used + freeb));
+        if (hum) {
+            char a[16], b[16], d[16];
+            human(total, a, sizeof(a));
+            human(used, b, sizeof(b));
+            human(freeb, d, sizeof(d));
+            printf("%-14s%s %9s %9s %9s %5s %s\n", m[k].source, tcol, a, b, d, pct, m[k].dir);
+        } else {
+            printf("%-14s%s %9llu %9llu %9llu %5s %s\n", m[k].source, tcol, total / 1024, used / 1024,
+                   freeb / 1024, pct, m[k].dir);
+        }
+    }
+    free(show);
+    free(m);
+    return rc;
+}
+
+static int mount_main(int argc, char **argv)
+{
+    int c;
+    const char *type = 0;
+    while ((c = getopt(argc, argv, "t:o:")) != -1) {
+        if (c == 't')
+            type = optarg;
+        else if (c != 'o')
+            die_usage("[-t TYPE] SOURCE DIR  |  mount");
+    }
+    if (optind == argc) {
+        struct mnt *m;
+        int n = read_mounts(&m);
+        if (n < 0)
+            return 1;
+        for (int k = 0; k < n; k++)
+            printf("%s on %s type %s (rw)\n", m[k].source, m[k].dir, m[k].type);
+        free(m);
+        return 0;
+    }
+    if (argc - optind != 2)
+        die_usage("[-t TYPE] SOURCE DIR  |  mount");
+    const char *src = argv[optind], *dir = argv[optind + 1];
+    if (!type)
+        type = !strcmp(src, "proc") ? "proc" : !strcmp(src, "devfs") ? "devfs" : "efs";
+    if (mount(src, dir, type, 0, 0) < 0) {
+        eprintf("mount: %s on %s: %s\n", src, dir,
+                errno == ENODEV ? "no such volume or filesystem type" : strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
+static int umount_main(int argc, char **argv)
+{
+    if (argc < 2)
+        die_usage("DIR|SOURCE...");
+    int rc = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *target = argv[i];
+        char dir[256];
+        if (target[0] != '/') {
+            /* a source (disk0p4): where it is mounted */
+            struct mnt *m;
+            int n = read_mounts(&m);
+            for (int k = 0; k < n; k++)
+                if (!strcmp(m[k].source, target)) {
+                    snprintf(dir, sizeof(dir), "%s", m[k].dir);
+                    target = dir;
+                }
+            if (n >= 0)
+                free(m);
+        }
+        if (umount(target) < 0) {
+            eprintf("umount: %s: %s\n", argv[i],
+                    errno == EBUSY ? "target is busy" : errno == EINVAL ? "not mounted" : strerror(errno));
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+/* ================================================================ truncate */
+
+static int truncate_main(int argc, char **argv)
+{
+    int c, no_create = 0, rc = 0;
+    const char *size_arg = 0, *ref = 0;
+    while ((c = getopt(argc, argv, "cs:r:")) != -1) {
+        switch (c) {
+        case 'c': no_create = 1; break;
+        case 's': size_arg = optarg; break;
+        case 'r': ref = optarg; break;
+        default: die_usage("[-c] -s [+-<>/%]SIZE[KMG] | -r REFFILE FILE...");
+        }
+    }
+    if ((!size_arg == !ref) || optind >= argc)
+        die_usage("[-c] -s [+-<>/%]SIZE[KMG] | -r REFFILE FILE...");
+    char op = 0;
+    long long size = 0;
+    if (ref) {
+        struct stat st;
+        if (stat(ref, &st) < 0)
+            return fail(ref);
+        size = st.st_size;
+    } else {
+        const char *s = size_arg;
+        if (strchr("+-<>/%", *s))
+            op = *s++;
+        char *end;
+        size = strtoll(s, &end, 10);
+        if (end == s || size < 0) {
+            eprintf("truncate: invalid size '%s'\n", size_arg);
+            return 1;
+        }
+        long long unit = 1;
+        if (*end) {
+            int k = strchr("KMGT", toupper((unsigned char)*end)) ? (int)(strchr("KMGT", toupper((unsigned char)*end)) - "KMGT") + 1 : 0;
+            if (!k) {
+                eprintf("truncate: invalid size '%s'\n", size_arg);
+                return 1;
+            }
+            int si = end[1] == 'B';     /* KB, MB: powers of 1000 */
+            for (int i = 0; i < k; i++)
+                unit *= si ? 1000 : 1024;
+            if (end[1 + si] && !(end[1] == 'i' && end[2] == 'B' && !end[3])) {
+                eprintf("truncate: invalid size '%s'\n", size_arg);
+                return 1;
+            }
+        }
+        size *= unit;
+        if ((op == '/' || op == '%') && size == 0) {
+            eprintf("truncate: division by zero\n");
+            return 1;
+        }
+    }
+    for (int i = optind; i < argc; i++) {
+        struct stat st;
+        if (stat(argv[i], &st) < 0) {
+            if (errno != ENOENT || no_create)
+                continue;
+            int fd = open(argv[i], O_WRONLY | O_CREAT, 0666);
+            if (fd < 0) {
+                rc = fail(argv[i]);
+                continue;
+            }
+            close(fd);
+            st.st_size = 0;
+        }
+        long long cur = st.st_size, want = size;
+        switch (op) {
+        case '+': want = cur + size; break;
+        case '-': want = cur > size ? cur - size : 0; break;
+        case '<': want = cur < size ? cur : size; break;
+        case '>': want = cur > size ? cur : size; break;
+        case '/': want = cur / size * size; break;
+        case '%': want = (cur + size - 1) / size * size; break;
+        }
+        if (truncate(argv[i], want) < 0)
+            rc = fail(argv[i]);
+    }
     return rc;
 }
 
@@ -1070,7 +1421,7 @@ static int t_unary(char op, const char *a)
     if (op == 'r') return access(a, R_OK) == 0;
     if (op == 'w') return access(a, W_OK) == 0;
     if (op == 'x') return access(a, X_OK) == 0;
-    if (op == 'h' || op == 'L') return 0;           /* no symbolic links */
+    if (op == 'h' || op == 'L') return lstat(a, &st) == 0 && S_ISLNK(st.st_mode);
     if (stat(a, &st) < 0)
         return 0;
     switch (op) {
@@ -1462,15 +1813,21 @@ int main(int argc, char **argv)
     if (!strcmp(prog, "basename")) return basename_main(argc, argv);
     if (!strcmp(prog, "dirname")) return dirname_main(argc, argv);
     if (!strcmp(prog, "realpath")) return realpath_main(argc, argv);
+    if (!strcmp(prog, "readlink")) return readlink_main(argc, argv);
     if (!strcmp(prog, "mktemp")) return mktemp_main(argc, argv);
     if (!strcmp(prog, "chgrp")) return chgrp_main(argc, argv);
     if (!strcmp(prog, "file")) return file_main(argc, argv);
     if (!strcmp(prog, "sync")) { sync(); return 0; }
+    if (!strcmp(prog, "truncate")) return truncate_main(argc, argv);
+    if (!strcmp(prog, "df")) return df_main(argc, argv);
+    if (!strcmp(prog, "mount")) return mount_main(argc, argv);
+    if (!strcmp(prog, "umount")) return umount_main(argc, argv);
     if (!strcmp(prog, "seq")) return seq_main(argc, argv);
     if (!strcmp(prog, "expr")) return expr_main(argc, argv);
     if (!strcmp(prog, "test") || !strcmp(prog, "[")) return test_main(argc, argv);
     if (!strcmp(prog, "printf")) return printf_main(argc, argv);
-    eprintf("fileutils: run me as one of: du dd basename dirname realpath mktemp chgrp file sync "
+    eprintf("fileutils: run me as one of: du df dd basename dirname realpath readlink mktemp chgrp file sync truncate "
+            "mount umount "
             "seq expr test [ printf\n");
     return 2;
 }

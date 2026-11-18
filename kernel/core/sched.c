@@ -378,6 +378,10 @@ static void __schedule(bool preempt)
 
     u64 now = rdtime();
     prev->runtime += now - c->last_switch;
+    if (prev->state == T_SLEEPING)
+        prev->nvcsw++;
+    else if (prev != c->idle)
+        prev->nivcsw++;
     c->last_switch = now;
     trace(sched_switch, prev->tid, next->tid, prev->state);   /* recorded as prev */
     if (next->state == T_RUNNABLE)
@@ -584,6 +588,71 @@ struct thread *thread_find(int tid)
         if (t->tid == tid)
             return t;
     return NULL;
+}
+
+/* ---- load average ---- */
+
+/*
+ * The 1, 5 and 15 minute load averages, as Linux keeps them: every 5 s,
+ * load = load * e + active * (1 - e) with e = exp(-5 s / period), in 11-bit
+ * fixed point. Active threads are those running, runnable, or in an
+ * uninterruptible sleep (waiting for the disk), kernel threads included.
+ */
+#define FSHIFT   11
+#define FIXED_1  (1 << FSHIFT)
+static const unsigned long load_exp[3] = { 1884, 2014, 2037 };
+static unsigned long loadavg[3];
+
+static int threads_active(int *total)
+{
+    unsigned long flags = spin_lock_irqsave(&sched_lock);
+    int n = 0, all = 0;
+    struct thread *t;
+    list_for_each_entry(t, &all_threads, all_node) {
+        bool idle = false;
+        for (int i = 0; i < ncpus_online; i++)
+            if (cpus[i].idle == t)
+                idle = true;
+        if (idle || t->state == T_DEAD)
+            continue;
+        all++;
+        if (t == current)
+            continue;                   /* the sampler itself */
+        if (t->state == T_RUNNING || t->state == T_RUNNABLE ||
+            (t->state == T_SLEEPING && !t->interruptible && t->wait_what))
+            n++;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    if (total)
+        *total = all;
+    return n;
+}
+
+static void loadavg_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        sleep_ms(5000);
+        unsigned long active = (unsigned long)threads_active(NULL) * FIXED_1;
+        for (int i = 0; i < 3; i++)
+            loadavg[i] = (loadavg[i] * load_exp[i] + active * (FIXED_1 - load_exp[i])) >> FSHIFT;
+    }
+}
+
+void loadavg_init(void)
+{
+    kthread_create("loadavg", loadavg_thread, NULL);
+}
+
+/* /proc/loadavg, in Linux's format: three averages, running/total threads, the last pid */
+void loadavg_print(print_fn print, int last_pid)
+{
+    int total, running = threads_active(&total) + 1;   /* + the reader */
+    for (int i = 0; i < 3; i++) {
+        unsigned long v = loadavg[i] + FIXED_1 / 200;   /* rounded to 0.01 */
+        print("%lu.%02lu ", v >> FSHIFT, ((v & (FIXED_1 - 1)) * 100) >> FSHIFT);
+    }
+    print("%d/%d %d\n", running, total, last_pid);
 }
 
 /* ---- timed sleep and the tick ---- */

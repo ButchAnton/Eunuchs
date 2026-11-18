@@ -510,7 +510,7 @@ void *uvm_populate(struct mm *mm, uintptr_t va)
     if (!pg)
         return NULL;
     *pte = PA_TO_PTE(page_to_pa(pg)) | prot_to_pte(v->prot) | PTE_V;
-    mm->rss++;
+    mm_rss_inc(mm);
     return page_to_va(pg);
 }
 
@@ -581,7 +581,7 @@ static int swap_in(struct mm *mm, struct vma *v, pte_t *pte, uintptr_t va, int a
     /* our reference to pg becomes the PTE's; the PTE's slot reference goes */
     swap_free(slot);
     mm->swapped--;
-    mm->rss++;
+    mm_rss_inc(mm);
     pte_t perms = prot_to_pte(v->prot);
     if (pg->refcount == 2 + held && swap_count(slot) == 1) {
         pc_remove(pg);                  /* nobody else needs the slot: the page is ours */
@@ -617,7 +617,7 @@ static int file_fault(struct mm *mm, struct vma *v, pte_t *pte, uintptr_t va, in
         vmc.major_faults++;
     }
     pte_t perms = prot_to_pte(v->prot);
-    mm->rss++;
+    mm_rss_inc(mm);
     if (v->shared) {
         if ((access & FAULT_WRITE) && (v->prot & VM_WRITE)) {
             page_set_flag(pg, PG_DIRTY);
@@ -658,7 +658,7 @@ static int fault_locked(struct mm *mm, uintptr_t addr, int access, bool force, s
             if (!pg)
                 return -EAGAIN;
             *pte = PA_TO_PTE(page_to_pa(pg)) | prot_to_pte(v->prot) | PTE_V;
-            mm->rss++;
+            mm_rss_inc(mm);
         }
     } else if (PTE_IS_SWAP(*pte)) {
         r = swap_in(mm, v, pte, va, access, spare);
@@ -799,7 +799,7 @@ struct mm *mm_fork(struct mm *parent)
             *cpte = *ppte;
             if (pg)
                 page_get(pg);
-            mm->rss++;
+            mm_rss_inc(mm);
         }
     }
     tlb_changed(parent, 0);                         /* the parent lost write access */
